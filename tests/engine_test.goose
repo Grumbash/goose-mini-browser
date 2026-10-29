@@ -6,6 +6,7 @@ import os;
 import engine from "../engine";
 import engine.dom;
 import engine.html;
+import engine.css;
 
 var failures = 0;
 
@@ -65,6 +66,57 @@ fn test_html() {
           "#document\n  html\n    head\n    body\n      p\n        \"Intro\"\n      h2 class=\"c\"\n        \"Heading\"\n      \"after\"\n");
 }
 
+// The computed style of the first element called `name`, as text.
+fn style_of(src: const u8[:], name: const u8[:]) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, decls: decls, bytes: sbytes };
+    load_sheets(d, sh);
+    var styles: Style[>..] = [];
+    compute_styles(d, sh, styles);
+    var out: u8[>..] = [];
+    for n, i in nodes {
+        if n.kind == NODE_ELEMENT && node_name(d, i as i32) == name {
+            let st = styles[i];
+            format(out, "display=", st.display, " size=");
+            format_flt(out, st.font_size, 1);
+            format(out, " bold=", st.bold, " italic=", st.italic, " color=");
+            format_uint(out, st.color, 16, 8, '0');
+            out.append(" mt=");
+            format_flt(out, st.mt, 1);
+            out.append(" ml=");
+            format_flt(out, st.ml, 1);
+            format(out, " auto_ml=", st.auto_ml);
+            return out;
+        }
+    }
+    return out;
+}
+
+fn test_css() {
+    let page = """
+        <style>p.note { color: #c00; font-size: 2em } #x > em { font-weight: 700 } .a .b { margin: 4px 8px }
+        div:first-child { font-style: italic } p { color: blue !important }</style>
+        <div><p class=note>n <em>e</em></p></div><p id=x><em>direct</em></p><div class=a><span class=b>s</span></div>
+        <script>x</script><p style='color: red; margin-left: auto'>inline</p>
+        """;
+    check("a class rule and its em size; !important beats specificity",
+          style_of(page, "p"), "display=1 size=34.0 bold=0 italic=1 color=ff0000ff mt=0.0 ml=0.0 auto_ml=0");
+    check("a child selector", style_of(page, "em"), "display=2 size=34.0 bold=0 italic=1 color=ff0000ff mt=0.0 ml=0.0 auto_ml=0");
+    check("a descendant selector and the margin shorthand",
+          style_of(page, "span"), "display=2 size=17.0 bold=0 italic=0 color=ff1c1c1c mt=4.0 ml=8.0 auto_ml=0");
+    check("Tusk's sheet hides scripts", style_of(page, "script"), "display=0 size=17.0 bold=0 italic=0 color=ff1c1c1c mt=0.0 ml=0.0 auto_ml=0");
+    check("headings", style_of("<h2>T</h2>", "h2"), "display=1 size=24.7 bold=1 italic=0 color=ff1c1c1c mt=32.0 ml=0.0 auto_ml=0");
+}
+
 // The M1 page parses into the tree a browser would build: its title, and
 // thousands of nodes from Wikipedia's real markup.
 fn test_page() {
@@ -92,6 +144,7 @@ fn test_page() {
 
 fn main() {
     test_html();
+    test_css();
     test_page();
     if failures > 0 {
         print(failures, " check(s) failed");
