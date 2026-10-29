@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSEventMask,
@@ -132,8 +132,10 @@ thread_local! {
 }
 
 /// Runs `f`, turning a panic into ERR_PANIC so it never unwinds into Goose.
+/// What Cocoa autoreleases during the call is released when it returns:
+/// Tusk runs its own event loop, so no run loop drains a pool for it.
 pub(crate) fn guarded(f: impl FnOnce() -> Result<i32, i32>) -> i32 {
-    match catch_unwind(AssertUnwindSafe(f)) {
+    match catch_unwind(AssertUnwindSafe(|| autoreleasepool(|_| f()))) {
         Ok(Ok(code)) => code,
         Ok(Err(code)) => code,
         Err(_) => ERR_PANIC,
