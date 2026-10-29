@@ -98,8 +98,8 @@ fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[text
 "#;
 
 /// What frames have cost since the last reset, laid out as Goose's
-/// `struct FrameStats`. An interval over 1.5 refresh periods means the display
-/// showed a frame twice: a dropped frame.
+/// `struct FrameStats`. An interval of n refresh periods (n over 1.5) means the
+/// display showed the last frame n times: n - 1 dropped frames.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct GpFrameStats {
@@ -338,7 +338,9 @@ impl Compositor {
             s.interval_sum += interval;
             s.max_interval = s.max_interval.max(interval);
             if refresh_hz > 0.0 && interval > 1.5 / refresh_hz {
-                s.dropped += 1;
+                // Every refresh the interval spans after the first showed an
+                // old frame again.
+                s.dropped += ((interval * refresh_hz).round() as i32 - 1).max(1);
             }
         }
         // The frame before this one has finished on the GPU by now, almost
@@ -623,6 +625,7 @@ pub extern "C" fn tp_frame_stats(out: *mut GpFrameStats, reset: bool) -> i32 {
             unsafe { out.write_unaligned(stats) };
             if reset {
                 c.stats = Stats::default();
+                c.last_frame = None; // its GPU time belongs before the reset
             }
             Ok(0)
         })

@@ -375,10 +375,6 @@ fn check_window(p: &mut Platform) {
     if size != p.size || scale != p.scale {
         p.size = size;
         p.scale = scale;
-        p.refresh_hz = p
-            .window
-            .screen()
-            .map_or(p.refresh_hz, |s| s.maximumFramesPerSecond() as f64);
         unsafe {
             p.layer.setContentsScale(scale);
             p.layer
@@ -402,6 +398,11 @@ pub extern "C" fn tp_render(scroll: f32, background: u32) -> i32 {
     guarded(|| {
         with_platform(|p| {
             let drawable = unsafe { p.layer.nextDrawable() }.ok_or(ERR_METAL)?;
+            // Read for every frame: the window may have moved to another screen.
+            p.refresh_hz = p
+                .window
+                .screen()
+                .map_or(p.refresh_hz, |s| s.maximumFramesPerSecond() as f64);
             let (scale, refresh) = (p.scale, p.refresh_hz);
             with_compositor(|c| c.present(&drawable, scroll as f64 * scale, background, refresh))?;
             p.frames += 1;
