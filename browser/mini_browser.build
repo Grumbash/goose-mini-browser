@@ -1,0 +1,13 @@
+// Sidecar for mini_browser.goose (docs/packages.md §3-4): maps the
+// "goosenet" name an `extern "goosenet" { ... }` block opens to a file next
+// to the program itself, found through resource_dir() rather than the
+// bare-name form (which relies on the OS loader's default search path /
+// DYLD_LIBRARY_PATH / LD_LIBRARY_PATH / PATH). A name containing a slash
+// resolves relative to resource_dir(), and the usual lib-prefix/extension
+// convention is still applied to its last component -- "./goosenet" here
+// becomes "libgoosenet.dylib" on macOS, "libgoosenet.so" on Linux,
+// "goosenet.dll" on Windows -- which is exactly the file goosenet/
+// (../goosenet, the Rust cdylib crate) produces with `cargo build --release`.
+dylibs_macos = ["goosenet=./goosenet"];
+dylibs_linux = ["goosenet=./goosenet"];
+dylibs_windows = ["goosenet=./goosenet"];

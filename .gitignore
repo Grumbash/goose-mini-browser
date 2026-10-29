@@ -1,0 +1,15 @@
+# Rust
+/goosenet/target/
+/goosenet/Cargo.lock
+
+# Goose build artifacts
+/browser/mini_browser
+/browser/mini_browser.exe
+/browser/*.dylib
+/browser/*.so
+/browser/*.dll
+/browser/*.png
+!/screenshot.png
+
+# OS cruft
+.DS_Store

@@ -1,0 +1,16 @@
+<h1>Goose mini browser</h1>
+<p>This is a tiny local HTML renderer written in the Goose programming
+language, running inside an SDL3 + Nuklear window (the gfx/ui packages).</p>
+<p>There is no networking in Goose v1, so this only reads files from disk.
+Click the link below to move to another local page.</p>
+<a href="page2.html">Go to page two</a>
+<br>
+<p>It also understands headings, paragraphs and line breaks:</p>
+<h2>A subheading</h2>
+<p>Second paragraph of text, which should word-wrap once the window gets
+narrow enough, because it uses ui::label_wrap under the hood.</p>
+<br>
+<h2 style="color: #5A8CFF">A blue heading via inline style</h2>
+<p style="color: red">This paragraph is colored red by inline CSS.</p>
+<p><b>This whole line is bold</b> because of a &lt;b&gt; tag.</p>
+<p><em>And this one is emphasized</em> via &lt;em&gt;.</p>
