@@ -7,6 +7,7 @@ import engine from "../engine";
 import engine.dom;
 import engine.html;
 import engine.css;
+import engine.layout;
 
 var failures = 0;
 
@@ -137,6 +138,109 @@ fn test_css() {
     check("headings", style_of("<h2>T</h2>", "h2"), "display=1 size=24.7 bold=1 italic=0 color=ff1c1c1c mt=32.0 ml=0.0 auto_ml=0");
 }
 
+// ------------------------------------------------------------------ layout
+
+let PROBE_TEXT: i32 = 1;    // each text item: its text, its line, and where it starts: the
+                            // x of a line's first item, then left or right of that
+let PROBE_BOXES: i32 = 2;   // each element's box, top and height
+let PROBE_FIT: i32 = 3;     // whether every text item's ink stays in the column
+
+// Lays `src` out `width` points wide and describes the result as `probe` asks.
+fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, decls: decls, bytes: sbytes };
+    load_sheets(d, sh);
+    var styles: Style[>..] = [];
+    compute_styles(d, sh, styles);
+    var text: u8[>..] = [];
+    var carets: f32[>..] = [];
+    var runs: Run[>..] = [];
+    var run_of: i32[>..] = [];
+    var fonts: FontInfo[>..] = [];
+    var boxes: Rect[>..] = [];
+    var items: DItem[>..] = [];
+    let L = Layout { d: d, styles: styles, text: text, carets: carets, runs: runs, run_of: run_of,
+                     fonts: fonts, boxes: boxes, items: items };
+    measure(L);
+    layout_page(L, width);
+
+    var out: u8[>..] = [];
+    if probe == PROBE_TEXT {
+        // Widths depend on the system's fonts; where lines start doesn't.
+        var line = 0;
+        var last_y: f32 = -1.0;
+        var start: f32 = 0.0;
+        for it in items {
+            guard it.kind == ITEM_TEXT else { continue; }
+            format(out, "\"", text[it.text..it.text + it.text_len], "\" line ");
+            if it.y != last_y {
+                line += 1;
+                last_y = it.y;
+                start = it.x;
+                format(out, line, " x ");
+                format_flt(out, it.x, 0);
+            } else {
+                format(out, line, if it.x > start { " right" } else { " left" });
+            }
+            out.push('\n');
+        }
+    } else if probe == PROBE_BOXES {
+        for n, i in nodes {
+            guard n.kind == NODE_ELEMENT && boxes[i].h > 0.0 else { continue; }
+            format(out, node_name(d, i as i32), " y ");
+            format_flt(out, boxes[i].y, 1);
+            out.append(" h ");
+            format_flt(out, boxes[i].h, 1);
+            out.push('\n');
+        }
+    } else if probe == PROBE_FIT {
+        // The body's column: from its padding to the right edge of its content.
+        let right = width - 32.0;
+        for it in items {
+            guard it.kind == ITEM_TEXT else { continue; }
+            var ink = it.text + it.text_len;
+            while ink > it.text && text[ink - 1] == ' ' { ink -= 1; }
+            let r = runs[run_of[it.node]];
+            let w = carets[r.caret + ink - r.start] - carets[r.caret + it.text - r.start];
+            if it.x < 31.99 || it.x + w > right + 0.01 { format(out, "outside: \"", text[it.text..it.text + it.text_len], "\"\n"); }
+        }
+        if out.len == 0 { out.append("fits"); }
+    }
+    return out;
+}
+
+fn test_layout() {
+    check("a paragraph sits on the body's padding",
+          layout_probe("<p>Hello world</p>", 400.0, PROBE_TEXT), "\"Hello world\" line 1 x 32\n");
+    check("a hidden paragraph paints nothing; inline elements share a line",
+          layout_probe("<p hidden>gone</p><p>kept <b>bold</b> and <i>it</i></p>", 400.0, PROBE_TEXT),
+          "\"kept \" line 1 x 32\n\"bold\" line 1 right\n\" and \" line 1 right\n\"it\" line 1 right\n");
+    let words = "<p>Focaccia is a flat leavened oven-baked Italian bread, similar in style, texture and height to pizza dough. It may be topped with herbs or other ingredients.</p>";
+    check("lines break at spaces and stay in the column", layout_probe(words, 300.0, PROBE_FIT), "fits");
+    check("a word longer than the line breaks between characters",
+          layout_probe("<p>Pneumonoultramicroscopicsilicovolcanoconiosis</p>", 140.0, PROBE_FIT), "fits");
+    check("pre keeps spaces and line breaks",
+          layout_probe("<pre>a  b\nc</pre>", 400.0, PROBE_TEXT), "\"a  b\" line 1 x 46\n\"c\" line 2 x 46\n");
+    // The heading's top margin (1.3em of 24.65px) collapses through the div
+    // with the paragraph's 1em rather than adding to it: 67.2 + 32.0 = 99.2.
+    // Line heights come from CSS, so these numbers don't depend on fonts.
+    check("margins collapse between siblings and through a parent",
+          layout_probe("<p>a</p><div><h2>b</h2></div>", 400.0, PROBE_BOXES),
+          "html y 0.0 h 267.1\nbody y 0.0 h 267.1\np y 40.0 h 27.2\ndiv y 99.2 h 35.5\nh2 y 99.2 h 35.5\n");
+    check("list items get markers left of their content",
+          layout_probe("<ul><li>one<li>two</ul><ol start=3><li>three</ol>", 400.0, PROBE_TEXT),
+          "\"one\" line 1 x 59\n\"•\" line 1 left\n\"two\" line 2 x 59\n\"•\" line 2 left\n\"three\" line 3 x 59\n\"3.\" line 3 left\n");
+}
+
 // The M1 page parses into the tree a browser would build: its title, and
 // thousands of nodes from Wikipedia's real markup.
 fn test_page() {
@@ -165,6 +269,7 @@ fn test_page() {
 fn main() {
     test_html();
     test_css();
+    test_layout();
     test_page();
     if failures > 0 {
         print(failures, " check(s) failed");
