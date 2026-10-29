@@ -16,4 +16,4 @@ fi
 cp ../platform/target/release/libtusk_platform.dylib .
 "$GOOSE_BIN" build tusk.goose
 
-echo "built app/tusk; run ./app/tusk, or ./app/tusk --wake-test"
+echo "built app/tusk; run ./app/tusk, or ./app/tusk --scroll-test"

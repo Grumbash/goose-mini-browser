@@ -24,6 +24,26 @@ for the modules Goose doesn't have, for Apple silicon only. Smooth first, idle
 means zero, memory is a budget, and AI tools are users too. The decisions behind
 it are in [docs/adr/](docs/adr/README.md).
 
+M1 is one article, shown by Tusk's own engine: HTML parsing, the DOM, a CSS
+subset and the cascade, block and inline layout in Goose; text shaped by Core
+Text and drawn from a glyph atlas by a Metal compositor in Rust.
+
+```bash
+GOOSE_BIN=/path/to/goose ./app/build.sh   # the platform layer (cargo), then the app (goose build)
+./app/tusk                                # the saved Focaccia article (tests/pages/)
+./app/tusk --scroll-test                  # scrolls it for 10 s and prints what the frames cost
+./app/tusk --screenshot out.png           # draws the window offscreen into a PNG, no window
+goose tests/engine_test.goose             # the engine's checks (after ./app/build.sh)
+```
+
+The bar along the bottom shows the page's weight: its size, its nodes, what
+parsing, styling, text, layout and paint took, and the process's memory.
+Space, Page Up/Down, the arrows, Home and End scroll; ⌘Q quits.
+
+Not yet: images and video, the network (local files only), JavaScript, links
+that can be clicked, selection, floats, positioning, tables as grids, flex,
+inline backgrounds, right-to-left text and colour emoji.
+
 ## Why this exists
 
 Goose v1 ships no sockets, no TLS, and no subprocess support by design (see
