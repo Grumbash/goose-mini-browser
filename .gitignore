@@ -2,7 +2,11 @@
 /goosenet/target/
 /goosenet/Cargo.lock
 
+/platform/target/
+
 # Goose build artifacts
+/app/main
+/app/*.dylib
 /browser/mini_browser
 /browser/mini_browser.exe
 /browser/*.dylib

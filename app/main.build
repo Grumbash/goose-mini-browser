@@ -1,0 +1,4 @@
+// Sidecar for main.goose (Goose docs, packages.md §3-4): the platform layer is
+// the Rust cdylib in ../platform, copied beside the program as
+// libgoose_platform.dylib and found through resource_dir().
+dylibs_macos = ["goose_platform=./goose_platform"];
