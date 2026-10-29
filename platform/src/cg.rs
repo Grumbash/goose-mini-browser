@@ -31,6 +31,17 @@ pub struct CGRect {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CGAffineTransform {
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub d: f64,
+    pub tx: f64,
+    pub ty: f64,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CFRange {
     pub location: CFIndex,
@@ -124,7 +135,7 @@ unsafe extern "C" {
     pub fn CTFontCreateCopyWithAttributes(
         font: CFTypeRef,
         size: f64,
-        matrix: *const c_void,
+        matrix: *const CGAffineTransform,
         attributes: CFTypeRef,
     ) -> CFTypeRef;
     pub fn CTFontGetSize(font: CFTypeRef) -> f64;

@@ -333,14 +333,10 @@ impl Atlas {
     }
 
     fn rasterize(&mut self, fonts: &Fonts, font: u32, id: u16, phase: u8) -> Option<AtlasEntry> {
-        let scale = self.scale;
         let raster = match self.raster_fonts.get(&font) {
             Some(f) => f.get(),
             None => {
-                let ct = fonts.ct(font);
-                let size = unsafe { CTFontGetSize(ct) } * scale;
-                let f =
-                    Cf::take(unsafe { CTFontCreateCopyWithAttributes(ct, size, null(), null()) })?;
+                let f = raster_font(fonts.ct(font), self.scale)?;
                 let p = f.get();
                 self.raster_fonts.insert(font, f);
                 p
@@ -445,6 +441,23 @@ impl Atlas {
         });
         Some((0, y))
     }
+}
+
+/// `font` scaled to device pixels. The scale goes through the font's matrix,
+/// not its size: the system font is variable, and at twice the size it would
+/// switch to its larger optical design, with thinner, differently spaced
+/// glyphs than the ones Goose measured.
+fn raster_font(font: CFTypeRef, scale: f64) -> Option<Cf> {
+    let m = CGAffineTransform {
+        a: scale,
+        b: 0.0,
+        c: 0.0,
+        d: scale,
+        tx: 0.0,
+        ty: 0.0,
+    };
+    // A size of 0 keeps the font's size.
+    Cf::take(unsafe { CTFontCreateCopyWithAttributes(font, 0.0, &m, null()) })
 }
 
 /// Everything text keeps between calls. AppKit's thread calls in, so it lives
@@ -639,6 +652,27 @@ mod tests {
             let third = e.h / 3;
             assert!(ink(0..third) > 2 * ink(e.h - third..e.h));
             assert_eq!(t.atlas.glyph(&t.fonts, f, glyphs[0].id, 0), e);
+        });
+    }
+
+    #[test]
+    fn glyphs_keep_their_design_at_twice_the_size() {
+        with_text(|t| {
+            let f = t.fonts.get(FAMILY_SANS, 17.0).unwrap();
+            let mut glyphs = Vec::new();
+            t.shaper.shape(&mut t.fonts, f, b"r", &mut glyphs).unwrap();
+            let id = glyphs[0].id;
+            let width = |font: CFTypeRef| {
+                let mut r = CGRect::default();
+                unsafe {
+                    CTFontGetBoundingRectsForGlyphs(font, kCTFontOrientationDefault, &id, &mut r, 1)
+                };
+                r.size.width
+            };
+            let at_1x = width(t.fonts.ct(f));
+            let raster = raster_font(t.fonts.ct(f), 2.0).unwrap();
+            let at_2x = width(raster.get());
+            assert!((at_2x - 2.0 * at_1x).abs() < 0.01, "1x {at_1x}, 2x {at_2x}");
         });
     }
 
