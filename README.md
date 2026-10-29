@@ -28,6 +28,15 @@ M1 is one article, shown by Tusk's own engine: HTML parsing, the DOM, a CSS
 subset and the cascade, block and inline layout in Goose; text shaped by Core
 Text and drawn from a glyph atlas by a Metal compositor in Rust.
 
+It builds with the Goose commit that docs/adr/0001 pins, `cce94b9`:
+
+```bash
+git init goose && cd goose
+git fetch --depth 1 https://github.com/aardappel/goose.git cce94b919d27458856ae2685974049eac78debcf
+git checkout --detach FETCH_HEAD
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
+```
+
 ```bash
 GOOSE_BIN=/path/to/goose ./app/build.sh   # the platform layer (cargo), then the app (goose build)
 ./app/tusk                                # the saved Focaccia article (tests/pages/)
@@ -37,7 +46,8 @@ goose tests/engine_test.goose             # the engine's checks (after ./app/bui
 ```
 
 The bar along the bottom shows the page's weight: its size, its nodes, what
-parsing, styling, text, layout and paint took, and the process's memory.
+parsing, styling, text, layout and paint took, and the process's memory,
+weighed again 5 s after the last frame.
 Space, Page Up/Down, the arrows, Home and End scroll; ⌘Q quits.
 
 Not yet: images and video, the network (local files only), JavaScript, links
