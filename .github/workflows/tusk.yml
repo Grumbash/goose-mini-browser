@@ -14,27 +14,34 @@ jobs:
     timeout-minutes: 40
     env:
       GOOSE_PIN: cce94b919d27458856ae2685974049eac78debcf  # docs/adr/0001
-      GOOSE_BIN: ${{ github.workspace }}/../goose/build/goose
+      RUST_TOOLCHAIN: "1.99.1"  # pinned, so a new release's lints can't fail a run
     steps:
       - uses: actions/checkout@v4
+
+      - name: Where Goose lives
+        run: echo "GOOSE_BIN=$HOME/goose/build/goose" >> "$GITHUB_ENV"
 
       - name: Cache the Goose compiler
         id: goose
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/../goose
+          path: ~/goose
           key: goose-${{ env.GOOSE_PIN }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Build Goose at the pinned commit
         if: steps.goose.outputs.cache-hit != 'true'
         run: |
-          git init ../goose
-          cd ../goose
-          git remote add origin https://github.com/aardappel/goose.git
-          git fetch --depth 1 origin "$GOOSE_PIN"
+          git init ~/goose
+          cd ~/goose
+          git fetch --depth 1 https://github.com/aardappel/goose.git "$GOOSE_PIN"
           git checkout --detach FETCH_HEAD
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j "$(sysctl -n hw.ncpu)"
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --component rustfmt
+          rustup default "$RUST_TOOLCHAIN"
 
       - name: Cache Rust builds
         uses: actions/cache@v4
@@ -42,12 +49,11 @@ jobs:
           path: |
             ~/.cargo/registry
             platform/target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('platform/Cargo.lock') }}
+          key: cargo-${{ env.RUST_TOOLCHAIN }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('platform/Cargo.lock') }}
 
       - name: Platform layer (fmt, clippy, tests)
         working-directory: platform
         run: |
-          rustup update stable
           cargo fmt --check
           cargo clippy --release --all-targets -- -D warnings
           cargo test --release
@@ -64,20 +70,15 @@ jobs:
           ./app/tusk snapshot tests/pages/focaccia.html > snapshot.txt
           grep -q 'heading "Etymology" \[level=2\]' snapshot.txt
 
-      - name: Look for a Metal device
-        id: metal
-        run: |
-          if system_profiler SPDisplaysDataType | grep -q "Metal"; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No Metal device on this runner: the screenshot is skipped."
-          fi
-
       - name: Screenshot of the M1 page, drawn offscreen
-        if: steps.metal.outputs.found == 'true'
         run: |
-          ./app/tusk --screenshot focaccia.png
+          rc=0
+          ./app/tusk --screenshot focaccia.png || rc=$?
+          if [ "$rc" = 3 ]; then
+            echo "::notice::No Metal device on this runner: the screenshot is skipped."
+            exit 0
+          fi
+          test "$rc" = 0
           # A blank window compresses to a few KB; the article is hundreds.
           test "$(stat -f %z focaccia.png)" -gt 100000
 
