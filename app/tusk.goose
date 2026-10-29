@@ -10,7 +10,7 @@ struct Event { kind: i32, code: i32, x: f64, y: f64, w: f64, h: f64 }
 extern "tusk_platform" {
     fn tp_open(width: f64, height: f64, title: const u8&, title_len: i64) -> i32;
     fn tp_next_event(timeout_ms: i64, out: Event&) -> i32;
-    fn tp_present(r: f64, g: f64, b: f64) -> i32;
+    fn tp_render(scroll: f32, background: u32) -> i32;
     fn tp_frames() -> i64;
     fn tp_close() -> i32;
     fn tp_wake(token: i64) -> i32;
@@ -24,7 +24,7 @@ let EV_KEY: i32 = 3;
 let EV_WAKE: i32 = 6;
 let KEY_ESCAPE: i32 = 53;
 
-fn paint() -> i32 { return tp_present(0.96, 0.96, 0.97); }
+fn paint() -> i32 { return tp_render(0.0, 0xFFF5F5F7); }
 
 // Stands in for a tab worker that has finished a frame: it wakes the sleeping
 // main thread through the platform layer, the path every frame will take.
@@ -51,7 +51,6 @@ fn main() {
         write_stderr("platform: could not open a window\n");
         return;
     }
-    paint();
 
     var worker: i64 = -1;
     if wake_test { worker = thread_spawn_contained(wake_after, 300, 42); }
