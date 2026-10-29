@@ -130,9 +130,21 @@ fn start_tag(p: Parser&) {
     if is_raw_text(name) {
         read_raw_text(p, id, name_start, name_len);
     } else if !is_void(name) {
-        if parent != p.head { p.open.push(id); }
+        // Past MAX_OPEN open elements a new one is added but not opened, so
+        // what follows becomes its sibling: deep enough for any real page,
+        // and every recursive pass over the tree stays within the stack.
+        if parent != p.head && p.open.len < MAX_OPEN { p.open.push(id); }
+        if name == "pre" || name == "listing" {
+            // A newline right after the tag isn't content.
+            let s = p.src;
+            if p.pos < s.len && s[p.pos] == '\n' { p.pos += 1; }
+            else if p.pos + 1 < s.len && s[p.pos] == '\r' && s[p.pos + 1] == '\n' { p.pos += 2; }
+        }
     }
 }
+
+// The deepest the open elements go; Blink's parser stops at the same depth.
+let MAX_OPEN: i64 = 512;
 
 // Reads attributes up to and past the closing '>'. A '/' before it is ignored:
 // HTML elements are void or not by name, whatever the tag says.
@@ -219,8 +231,18 @@ fn end_tag(p: Parser&) {
         let br = make_element(p.d, "br", current_parent(p));
         return;
     }
-    let k = if is_table_part(name[..]) { find_open_in_table(p, name[..]) } else { find_open(p, name[..], "") };
+    let k = if name[..] == "template" { find_open_any(p, name[..]) }
+            else if is_table_part(name[..]) { find_open_in_table(p, name[..]) }
+            else { find_open(p, name[..], "") };
     if k >= 0 { pop_to(p, k); }
+}
+
+// The nearest open element called `name`, however deep: </template> closes
+// whatever its content left open.
+fn find_open_any(p: Parser&, name: const u8[:]) -> i64 {
+    var k = p.open.len - 1;
+    while k >= 0 && node_name(p.d, p.open[k]) != name { k -= 1; }
+    return k;
 }
 
 fn is_table_part(n: const u8[:]) -> bool {
@@ -268,15 +290,9 @@ fn close_implied(p: Parser&, name: const u8[:]) {
         if k >= 0 { pop_to(p, k); }
     }
     if name == "li" {
-        let k = find_open(p, "li", "ul");
-        if k >= 0 { pop_to(p, k); } else {
-            let j = find_open(p, "li", "ol");
-            if j >= 0 { pop_to(p, j); }
-        }
+        close_item(p, "li", "li");
     } else if name == "dd" || name == "dt" {
-        var k = find_open(p, "dd", "dl");
-        if k < 0 { k = find_open(p, "dt", "dl"); }
-        if k >= 0 { pop_to(p, k); }
+        close_item(p, "dd", "dt");
     } else if is_heading(name) {
         if p.open.len > 0 && is_heading(node_name(p.d, p.open[p.open.len - 1])) { p.open.pop(); }
     } else if name == "tr" {
@@ -291,6 +307,31 @@ fn close_implied(p: Parser&, name: const u8[:]) {
         let k = find_open(p, "a", "");
         if k >= 0 { pop_to(p, k); }
     }
+}
+
+// An <li> closes the open <li>, and a <dd> or <dt> the open <dd> or <dt>,
+// unless an element that structures content is open inside it, such as a
+// nested list or a cell (WHATWG: a special element other than address, div
+// and p ends the search).
+fn close_item(p: Parser&, a: const u8[:], b: const u8[:]) {
+    var k = p.open.len - 1;
+    while k >= 0 {
+        let n = node_name(p.d, p.open[k]);
+        if n == a || n == b { pop_to(p, k); return; }
+        if is_special(n) && n != "address" && n != "div" && n != "p" { return; }
+        k -= 1;
+    }
+}
+
+// The WHATWG algorithm's special elements, those that can be open in a body.
+fn is_special(n: const u8[:]) -> bool {
+    return n == "address" || n == "applet" || n == "article" || n == "aside" || n == "blockquote" || n == "button"
+        || n == "caption" || n == "center" || n == "dd" || n == "details" || n == "dir" || n == "div" || n == "dl"
+        || n == "dt" || n == "fieldset" || n == "figcaption" || n == "figure" || n == "footer" || n == "form"
+        || is_heading(n) || n == "header" || n == "hgroup" || n == "li" || n == "listing" || n == "main"
+        || n == "marquee" || n == "menu" || n == "nav" || n == "object" || n == "ol" || n == "p" || n == "pre"
+        || n == "search" || n == "section" || n == "select" || n == "summary" || n == "table" || n == "tbody"
+        || n == "td" || n == "template" || n == "tfoot" || n == "th" || n == "thead" || n == "tr" || n == "ul";
 }
 
 fn close_cells(p: Parser&) {

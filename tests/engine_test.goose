@@ -30,6 +30,24 @@ fn test_html() {
     check("implied structure and an unclosed p",
           tree_of("<title>T</title><p>One<p>Two &amp; <b>three</b>"),
           "#document\n  html\n    head\n      title\n        \"T\"\n    body\n      p\n        \"One\"\n      p\n        \"Two & \"\n        b\n          \"three\"\n");
+    check("a nested list stays nested",
+          tree_of("<ul><li>a<ul><li>b</li></ul></li><li>c</li></ul>"),
+          "#document\n  html\n    head\n    body\n      ul\n        li\n          \"a\"\n          ul\n            li\n              \"b\"\n        li\n          \"c\"\n");
+    check("a newline right after <pre> isn't content; </template> closes its open cells",
+          tree_of("<pre>\nx</pre><template><table><tr><td>row</template><p>after"),
+          "#document\n  html\n    head\n    body\n      pre\n        \"x\"\n      template\n        table\n          tr\n            td\n              \"row\"\n      p\n        \"after\"\n");
+    var deep: u8[>..] = [];
+    for k in 600 { deep.append("<div>"); }
+    deep.append("x");
+    var dn: Node[>..] = [];
+    var da: Attr[>..] = [];
+    var db: u8[>..] = [];
+    let dd = Doc { nodes: dn, attrs: da, bytes: db };
+    parse_html(deep[..], dd);
+    var depth = 0;
+    var at: i32 = (dn.len - 1) as i32;       // the text, made last
+    while at >= 0 { depth += 1; at = dn[at].parent; }
+    check("nesting stops at 512 open elements", if depth == 516 { "512 deep" } else { "not capped" }, "512 deep");
     check("list items close each other; void elements don't nest",
           tree_of("<ul><li>a<li>b<br>c</ul>"),
           "#document\n  html\n    head\n    body\n      ul\n        li\n          \"a\"\n        li\n          \"b\"\n          br\n          \"c\"\n");
@@ -51,7 +69,8 @@ fn test_html() {
 // thousands of nodes from Wikipedia's real markup.
 fn test_page() {
     var src: u8[>..] = [];
-    guard read_file("tests/pages/focaccia.html", src) else { check("read tests/pages/focaccia.html", "missing", "present"); return; }
+    let path = str(resource_dir(), "pages/focaccia.html");
+    guard read_file(path[..], src) else { check("read tests/pages/focaccia.html", "missing", "present"); return; }
     var nodes: Node[>..] = [];
     var attrs: Attr[>..] = [];
     var bytes: u8[>..] = [];
