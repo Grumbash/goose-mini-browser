@@ -8,10 +8,13 @@
 //! never cross into Goose, where it would abort the whole process
 //! (docs/adr/0001).
 #![allow(unused_unsafe)]
+// The entry points are C functions that Goose calls with pointers into its own
+// memory; marking them `unsafe` would change nothing for that caller.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -186,7 +189,8 @@ pub extern "C" fn tp_next_event(timeout_ms: i64, out: *mut GpEvent) -> i32 {
             };
             loop {
                 if let Some(e) = p.pending.pop_front() {
-                    unsafe { *out = e };
+                    // Goose packs its values without alignment (spec §3.2).
+                    unsafe { out.write_unaligned(e) };
                     return Ok(0);
                 }
                 let next = unsafe {
@@ -198,7 +202,12 @@ pub extern "C" fn tp_next_event(timeout_ms: i64, out: *mut GpEvent) -> i32 {
                     )
                 };
                 let Some(ev) = next else {
-                    unsafe { *out = GpEvent { kind: EV_NONE, ..Default::default() } };
+                    unsafe {
+                        out.write_unaligned(GpEvent {
+                            kind: EV_NONE,
+                            ..Default::default()
+                        })
+                    };
                     return Ok(0);
                 };
                 let translated = translate(p, &ev);
@@ -220,18 +229,41 @@ pub extern "C" fn tp_next_event(timeout_ms: i64, out: *mut GpEvent) -> i32 {
 fn translate(p: &Platform, ev: &NSEvent) -> Option<GpEvent> {
     let kind = ev.r#type();
     if kind == NSEventType::ApplicationDefined {
-        return Some(GpEvent { kind: EV_WAKE, code: ev.data1() as i32, ..Default::default() });
+        return Some(GpEvent {
+            kind: EV_WAKE,
+            code: ev.data1() as i32,
+            ..Default::default()
+        });
     }
     if kind == NSEventType::KeyDown {
-        return Some(GpEvent { kind: EV_KEY, code: ev.keyCode() as i32, ..Default::default() });
+        return Some(GpEvent {
+            kind: EV_KEY,
+            code: ev.keyCode() as i32,
+            ..Default::default()
+        });
     }
     if kind == NSEventType::LeftMouseDown || kind == NSEventType::RightMouseDown {
         let at = ev.locationInWindow();
-        let button = if kind == NSEventType::LeftMouseDown { 0 } else { 1 };
-        return Some(GpEvent { kind: EV_MOUSE, code: button, x: at.x, y: p.size.1 - at.y, ..Default::default() });
+        let button = if kind == NSEventType::LeftMouseDown {
+            0
+        } else {
+            1
+        };
+        return Some(GpEvent {
+            kind: EV_MOUSE,
+            code: button,
+            x: at.x,
+            y: p.size.1 - at.y,
+            ..Default::default()
+        });
     }
     if kind == NSEventType::ScrollWheel {
-        return Some(GpEvent { kind: EV_SCROLL, x: ev.scrollingDeltaX(), y: ev.scrollingDeltaY(), ..Default::default() });
+        return Some(GpEvent {
+            kind: EV_SCROLL,
+            x: ev.scrollingDeltaX(),
+            y: ev.scrollingDeltaY(),
+            ..Default::default()
+        });
     }
     None
 }
@@ -240,10 +272,15 @@ fn translate(p: &Platform, ev: &NSEvent) -> Option<GpEvent> {
 fn check_window(p: &mut Platform) {
     if p.open && !p.window.isVisible() {
         p.open = false;
-        p.pending.push_back(GpEvent { kind: EV_CLOSE, ..Default::default() });
+        p.pending.push_back(GpEvent {
+            kind: EV_CLOSE,
+            ..Default::default()
+        });
         return;
     }
-    let Some(view) = p.window.contentView() else { return };
+    let Some(view) = p.window.contentView() else {
+        return;
+    };
     let frame = view.frame();
     let scale = p.window.backingScaleFactor();
     let size = (frame.size.width, frame.size.height);
@@ -252,9 +289,16 @@ fn check_window(p: &mut Platform) {
         p.scale = scale;
         unsafe {
             p.layer.setContentsScale(scale);
-            p.layer.setDrawableSize(CGSize::new(size.0 * scale, size.1 * scale));
+            p.layer
+                .setDrawableSize(CGSize::new(size.0 * scale, size.1 * scale));
         }
-        p.pending.push_back(GpEvent { kind: EV_RESIZE, x: scale, w: size.0, h: size.1, ..Default::default() });
+        p.pending.push_back(GpEvent {
+            kind: EV_RESIZE,
+            x: scale,
+            w: size.0,
+            h: size.1,
+            ..Default::default()
+        });
     }
 }
 
@@ -271,11 +315,17 @@ pub extern "C" fn tp_present(r: f64, g: f64, b: f64) -> i32 {
                 let color = pass.colorAttachments().objectAtIndexedSubscript(0);
                 color.setTexture(Some(&*texture));
                 color.setLoadAction(MTLLoadAction::Clear);
-                color.setClearColor(MTLClearColor { red: r, green: g, blue: b, alpha: 1.0 });
+                color.setClearColor(MTLClearColor {
+                    red: r,
+                    green: g,
+                    blue: b,
+                    alpha: 1.0,
+                });
                 color.setStoreAction(MTLStoreAction::Store);
             }
             let commands = p.queue.commandBuffer().ok_or(ERR_METAL)?;
-            let encoder = unsafe { commands.renderCommandEncoderWithDescriptor(&pass) }.ok_or(ERR_METAL)?;
+            let encoder =
+                unsafe { commands.renderCommandEncoderWithDescriptor(&pass) }.ok_or(ERR_METAL)?;
             encoder.endEncoding();
             commands.presentDrawable(ProtocolObject::from_ref(&*drawable));
             commands.commit();
@@ -352,7 +402,10 @@ mod tests {
         // Test threads are not the main thread: every AppKit entry point must
         // refuse with an error code instead of crashing.
         let title = b"Tusk";
-        assert_eq!(tp_open(800.0, 600.0, title.as_ptr(), title.len() as i64), ERR_NOT_MAIN_THREAD);
+        assert_eq!(
+            tp_open(800.0, 600.0, title.as_ptr(), title.len() as i64),
+            ERR_NOT_MAIN_THREAD
+        );
         let mut e = GpEvent::default();
         assert_eq!(tp_next_event(0, &mut e), ERR_NOT_MAIN_THREAD);
         assert_eq!(tp_present(0.0, 0.0, 0.0), ERR_NOT_MAIN_THREAD);
