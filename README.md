@@ -9,9 +9,9 @@ doesn't have: networking.
 
 It fetches real pages over `http://` and `https://`, follows redirects,
 decodes chunked transfer-encoding, renders basic HTML (headings, paragraphs,
-links, line breaks, a handful of inline styles) in a resizable SDL3/Nuklear
-window, and lets you click between pages — all without blocking the UI
-thread while a request is in flight.
+links, line breaks, images, a handful of inline styles) in a resizable
+SDL3/Nuklear window, and lets you click between pages — all without
+blocking the UI thread while a request or an image decode is in flight.
 
 This is a demo/learning project, not a production browser. See
 [Limitations](#limitations) for exactly where it stops.
@@ -42,26 +42,41 @@ the Goose compiler itself.
         libgoosenet.{dylib,so,dll}
 ```
 
-- **`goosenet/`** — the Rust side. One exported entry point,
-  `goosenet_fetch(url) -> (status, body)`, that resolves scheme, opens a raw
-  TCP socket or a `rustls` TLS connection, follows up to 8 redirects, and
-  undoes `Transfer-Encoding: chunked`. Everything crosses the FFI boundary
-  as scalars and raw pointers (see `docs/` link below for the exact rules);
-  an owned buffer is handed back as a `u64` + length and freed by the Goose
-  side calling `goosenet_free` after copying it out.
+- **`goosenet/`** — the Rust side. Two exported entry points:
+  `goosenet_fetch(url) -> (status, body)`, which resolves scheme, opens a
+  raw TCP socket or a `rustls` TLS connection, follows up to 8 redirects,
+  and undoes `Transfer-Encoding: chunked`; and `goosenet_fetch_image(url)`,
+  which does the same fetch and then decodes the body as PNG/JPEG/GIF/WebP
+  (the `image` crate) and downsamples it to at most 480px on its longest
+  side before handing back raw RGBA8 pixels — so decode time, the copy
+  across Goose's thread queue, and the GPU texture upload all stay cheap
+  regardless of how large the source image actually was. Everything
+  crosses the FFI boundary as scalars and raw pointers (see `docs/` link
+  below for the exact rules); an owned buffer is handed back as a `u64` +
+  length and freed by the Goose side calling `goosenet_free` after copying
+  it out.
 - **`browser/net.goose`** — a thin Goose wrapper: `extern "goosenet" { ... }`
-  binds the two functions dynamically (no C compiler involved on the Goose
-  side), and `http_get_page` does the FFI call and copies the result into
-  Goose-owned memory.
+  binds the functions dynamically (no C compiler involved on the Goose
+  side), and `http_get_page`/`fetch_image_rgba` do the FFI call and copy
+  the result into Goose-owned memory.
 - **`browser/mini_browser.goose`** — the browser itself:
   - a hand-rolled HTML scanner (not a real parser) for `<h1-h3>`, `<p>`,
-    `<a href>`, `<br>`, `<b>/<strong>/<i>/<em>`, and inline `style="color: ..."`
+    `<a href>`, `<br>`, `<img src>`, `<video poster>`,
+    `<b>/<strong>/<i>/<em>`, and inline `style="color: ..."`
   - HTML entity decoding (`&amp;`, `&lt;`, numeric `&#NN;`/`&#xHH;`, …)
-  - a `thread_fn` worker consuming jobs off a typed queue
-    (`qget`/`qput`/`qpoll` — Goose has no shared memory between threads) so
-    a slow fetch never freezes the window
+  - **two** `thread_fn` workers, each consuming jobs off its own typed
+    queue (`qget`/`qput`/`qpoll` — Goose has no shared memory between
+    threads): one fetches pages, the other fetches+decodes images, so a
+    slow network call or a big image never freezes the window or blocks
+    the other kind of work. Each image result carries the generation
+    counter of the page it was requested for, so a result that arrives
+    after the user has already navigated away is dropped instead of
+    painting onto the wrong page.
   - a Nuklear UI: address bar, back button, scrollable page view, clickable
-    links
+    links, and images drawn from a GPU texture uploaded the first frame
+    each `<img>`/`<video poster>` is laid out (there is no lazy-load by
+    scroll position — every image on the page starts fetching as soon as
+    the page does)
 - **`browser/mini_browser.build`** — the sidecar that maps `goosenet` to
   `./goosenet` next to the built executable (resolved through
   `resource_dir()`), so the shipped binary needs no `DYLD_LIBRARY_PATH` /
@@ -133,7 +148,14 @@ shim can go, not a spec-compliant browser. Known, intentional gaps:
   modern web apps, social feeds, SPAs) show nothing meaningful.
 - **No cookies/sessions.** Every request is anonymous; anything requiring
   login won't show authenticated content.
-- **No images.** `<img>` is ignored.
+- **No real video.** `<video poster="...">` shows the poster frame as a
+  still image; without a poster it's a `[video, no poster]` text line.
+  There is no decoder, no playback, no audio.
+- **Images are capped at 480px** on their longest side (deliberately, for
+  decode/memory/GPU-upload cost) and fetched eagerly, all at once, with no
+  lazy-loading by scroll position and no local-file image support (`goosenet`
+  only speaks HTTP(S); a local page's `<img src="./cat.png">` will show
+  "failed to load").
 - **gzip/deflate aren't decoded** — pages that insist on compression
   despite no `Accept-Encoding` header may render as binary noise.
 - **The HTML scanner is not a real parser**: no error recovery beyond
