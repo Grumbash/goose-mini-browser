@@ -262,15 +262,33 @@ pub extern "C" fn tp_next_event(timeout_ms: i64, out: *mut GpEvent) -> i32 {
                     unsafe { out.write_unaligned(e) };
                     return Ok(0);
                 }
-                let next = unsafe {
-                    p.app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                        NSEventMask::Any,
-                        Some(&until),
-                        NSDefaultRunLoopMode,
-                        true,
-                    )
-                };
-                let Some(ev) = next else {
+                // Events Tusk doesn't translate (mouse-ups, drags, gestures) are
+                // consumed here too: release what each one autoreleases before
+                // the next, rather than when the whole wait ends.
+                let got = autoreleasepool(|_| {
+                    let next = unsafe {
+                        p.app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                            NSEventMask::Any,
+                            Some(&until),
+                            NSDefaultRunLoopMode,
+                            true,
+                        )
+                    };
+                    let Some(ev) = next else { return false };
+                    let translated = translate(p, &ev);
+                    // Our own wake events and key presses stop here: AppKit would
+                    // beep at keys no responder handles.
+                    let kind = ev.r#type();
+                    if kind != NSEventType::ApplicationDefined && kind != NSEventType::KeyDown {
+                        p.app.sendEvent(&ev);
+                    }
+                    check_window(p);
+                    if let Some(e) = translated {
+                        p.pending.push_back(e);
+                    }
+                    true
+                });
+                if !got {
                     unsafe {
                         out.write_unaligned(GpEvent {
                             kind: EV_NONE,
@@ -278,17 +296,6 @@ pub extern "C" fn tp_next_event(timeout_ms: i64, out: *mut GpEvent) -> i32 {
                         })
                     };
                     return Ok(0);
-                };
-                let translated = translate(p, &ev);
-                // Our own wake events and key presses stop here: AppKit would
-                // beep at keys no responder handles.
-                let kind = ev.r#type();
-                if kind != NSEventType::ApplicationDefined && kind != NSEventType::KeyDown {
-                    p.app.sendEvent(&ev);
-                }
-                check_window(p);
-                if let Some(e) = translated {
-                    p.pending.push_back(e);
                 }
             }
         })
