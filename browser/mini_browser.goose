@@ -9,6 +9,7 @@ import std;
 import os;
 import gfx;
 import ui;
+import math;
 import .net;
 
 struct Item { kind: i64, text: u8[varint], href: u8[varint], color: u32 }
@@ -322,12 +323,33 @@ fn main() {
     let argv = args();
     if argv.len >= 2 { path.append(argv[1]); } else { path.append("page1.html"); }
 
-    guard gfx::open("Goose mini browser", 820, 600, gfx::WINDOW_RESIZABLE) else {
+    let WIN_W = 820.0;
+    let WIN_H = 600.0;
+    guard gfx::open("Goose mini browser", WIN_W as i64, WIN_H as i64, gfx::WINDOW_RESIZABLE) else {
         write_stderr(str("gfx: ", gfx::error(), "\n"));
         return;
     }
     defer gfx::close();
-    var ctx = ui::create(15.0);
+
+    // `render`/`input_from_gfx` work in the screen's raw pixels
+    // (docs/stdlib.md "Text rendering and game HUDs"): on a high-density
+    // (Retina/HiDPI) display there are more of those per point than the
+    // window's requested size implies, so without a scale the UI draws at
+    // 1 pixel per unit and ends up tiny. The ratio between what the
+    // display actually gave us and what we asked for is the display's
+    // fixed pixel density, which stays constant across a resize, so it is
+    // computed once, here, rather than every frame.
+    let initial_px = gfx::screen_size();
+    let ui_scale = max(round((initial_px.x as f32) / WIN_W), 1.0);
+
+    // Nuklear's built-in font (no asset file needed) is a bitmap font, not
+    // a scalable one: docs/stdlib.md says 13 is its native size, and it
+    // "scales well only by whole numbers." 15 wasn't that native size to
+    // begin with, so baking it and then multiplying by an integer ui_scale
+    // compounds two resampling errors into visibly blurry text. 13 bakes
+    // pixel-perfect, and ui_scale (the display's own pixel density) stays
+    // a clean integer on every display that matters here.
+    var ctx = ui::create(13.0, ui_scale);
     guard ctx.id != 0 else {
         write_stderr(str("ui: ", ui::error(), "\n"));
         return;
@@ -424,6 +446,8 @@ fn main() {
         if gfx::key_pressed("Escape") { break; }
         ui::input_from_gfx(ctx);
         let size = gfx::screen_size();
+        let win_w = (size.x as f32) / ui_scale;
+        let win_h = (size.y as f32) / ui_scale;
 
         if loading {
             let r, got = qpoll<FetchResult>();
@@ -470,7 +494,7 @@ fn main() {
             if drained >= 4 { break; }
         }
 
-        if ui::begin(ctx, "browser", ui::rect(0, 0, size.x as f32, size.y as f32), window) {
+        if ui::begin(ctx, "browser", ui::rect(0, 0, win_w, win_h), window) {
             let back_ratio: f32[3] = [0.08, 0.72, 0.20];
             ui::layout_row(ctx, ui::DYNAMIC, 28.0, back_ratio);
             let back = ui::button_label(ctx, "<-");
@@ -501,7 +525,7 @@ fn main() {
             ui::layout_row_dynamic(ctx, 18.0, 1);
             ui::label_colored(ctx, status[..], ui::TEXT_LEFT, ui::rgb(150, 150, 150));
 
-            ui::layout_row_dynamic(ctx, (size.y as f32) - 120.0, 1);
+            ui::layout_row_dynamic(ctx, win_h - 120.0, 1);
             if ui::group_begin(ctx, "page", ui::WINDOW_BORDER) {
                 var clicked: u8[..200] = [];
                 var did_click = false;
@@ -529,7 +553,14 @@ fn main() {
                             img_state[idx] = 1;
                         }
                         if img_state[idx] == 2 {
-                            ui::layout_row_static(ctx, img_h[idx] as f32, img_w[idx], 1);
+                            // img_w/img_h are decoded pixel dimensions, not
+                            // ui units; divide by the same display density
+                            // used everywhere else so a Retina screen
+                            // doesn't draw the image at twice its intended
+                            // on-screen size.
+                            let disp_w = max((img_w[idx] as f32) / ui_scale, 1.0);
+                            let disp_h = max((img_h[idx] as f32) / ui_scale, 1.0);
+                            ui::layout_row_static(ctx, disp_h, disp_w as i64, 1);
                             ui::image(ctx, ui::texture_image(img_tex[idx]));
                         } else if img_state[idx] == 1 {
                             ui::layout_row_dynamic(ctx, 20.0, 1);
