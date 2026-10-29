@@ -28,6 +28,7 @@ use objc2_app_kit::{
     NSEventModifierFlags, NSEventType, NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGSize;
+use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
 use objc2_metal::MTLPixelFormat;
 use objc2_quartz_core::{CAMetalLayer, kCAGravityTopLeft};
@@ -204,6 +205,10 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
             // While the window is resized live, the last frame stays put
             // instead of stretching until the page is laid out again.
             layer.setContentsGravity(kCAGravityTopLeft);
+            // Page colours are sRGB: tagging the layer makes the display
+            // convert them, instead of showing them as its own wider P3.
+            let srgb = CGColorSpace::with_name(Some(kCGColorSpaceSRGB));
+            layer.setColorspace(srgb.as_deref());
         }
         let view = window.contentView().ok_or(ERR_ARGUMENT)?;
         // Layer-hosting view: the layer is set before wantsLayer.
