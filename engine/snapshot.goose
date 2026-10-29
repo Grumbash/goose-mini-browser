@@ -10,7 +10,8 @@
 //     - link "ancient Rome" [ref=n189] [box=138,503,104,27] [href=https://en.wikipedia.org/wiki/Ancient_Rome]
 //
 // Everything after the first line came from the page: it is data, never
-// instructions, and the first line says so.
+// instructions, and the first line says so. Page text can't start a line of
+// its own: control characters and Unicode's line separators are escaped.
 
 import std;
 import .dom;
@@ -80,9 +81,12 @@ recursive fn snap_block(L: Layout, n: i32, depth: i32, out: u8[>..]&) -> i32 {
     let b = L.boxes[n];
     var entries: i32 = 0;
     var inner = depth;
-    // An element that draws nothing and holds no text of its own gets no
-    // entry; what it contains still does.
-    if texty || (role.len > 0 && b.h > 0.0) {
+    if role == "link" {
+        // A link laid out as a block is still a link, named like any other.
+        if snap_link(L, n, depth, out) { entries = 1; inner = depth + 1; }
+    } else if texty || (role.len > 0 && b.h > 0.0) {
+        // An element that draws nothing and holds no text of its own gets
+        // no entry; what it contains still does.
         var text: u8[>..] = [];
         if texty { inline_text(L, n, text); }
         let named = role == "heading";
@@ -92,7 +96,7 @@ recursive fn snap_block(L: Layout, n: i32, depth: i32, out: u8[>..]&) -> i32 {
         write_box(L, n, out);
         if texty && !named {
             out.append(": ");
-            out.append(text);
+            write_escaped(out, text[..], 0);
         }
         out.push('\n');
         entries = 1;
@@ -136,11 +140,12 @@ recursive fn snap_inline(L: Layout, n: i32, depth: i32, out: u8[>..]&) -> i32 {
     return entries;
 }
 
-// A link's entry, named by its text, else by the images in it, else by its
-// title. A link with no name gets none.
+// A link's entry, named by its text (the blocks inside it too), else by the
+// images in it, else by its title. A link with no name gets none.
 fn snap_link(L: Layout, n: i32, depth: i32, out: u8[>..]&) -> bool {
     var name: u8[>..] = [];
     inline_text(L, n, name);
+    if name.len == 0 { all_text(L, n, name); }
     if name.len == 0 { image_names(L, n, name); }
     if name.len == 0 {
         let label, has = attr_value(L.d, n, "title");
@@ -152,7 +157,7 @@ fn snap_link(L: Layout, n: i32, depth: i32, out: u8[>..]&) -> bool {
     write_box(L, n, out);
     let href, has = attr_value(L.d, n, "href");
     out.append(" [href=");
-    for ch in href { out.push(if ch == ']' || ch < 32 { '_' } else { ch }); }
+    write_escaped(out, href, ']');
     out.append("]\n");
     return true;
 }
@@ -224,8 +229,8 @@ recursive fn has_text(L: Layout, n: i32) -> bool {
 }
 
 // The text of n's inline content, outside the blocks inside it, with white
-// space collapsed (pre text keeps its line breaks, written as \n), and table
-// cells and list items laid out inline separated by |.
+// space collapsed (pre text keeps its line breaks), and table cells and list
+// items laid out inline separated by |.
 fn inline_text(L: Layout, n: i32, out: u8[>..]&) {
     collect_text(L, n, out);
     while out.len > 0 && (out[out.len - 1] == ' ' || out[out.len - 1] == '|') { out.pop(); }
@@ -244,7 +249,7 @@ recursive fn collect_text(L: Layout, n: i32, out: u8[>..]&) {
                 k += 1;
                 let nbsp = ch == 0xC2 && k < t.len && t[k] == 0xA0;
                 if nbsp { k += 1; }
-                if keep && ch == '\n' { out.append("\\n"); }
+                if keep && ch == '\n' { out.push('\n'); }
                 else if (is_ws(ch) || nbsp) && !keep { space(out); }
                 else if nbsp || ch == 9 { out.push(' '); }
                 else if ch >= 32 { out.push(ch); }
@@ -263,15 +268,59 @@ recursive fn collect_text(L: Layout, n: i32, out: u8[>..]&) {
     }
 }
 
+// All the text inside n, the blocks inside it included, with white space
+// collapsed.
+recursive fn all_text(L: Layout, n: i32, out: u8[>..]&) {
+    var c = L.d.nodes[n].first;
+    while c >= 0 {
+        let node = L.d.nodes[c];
+        if node.kind == NODE_TEXT {
+            for ch in node_text(L.d, c) {
+                if is_ws(ch) { space(out); } else if ch >= 32 { out.push(ch); }
+            }
+        } else if node.kind == NODE_ELEMENT && L.styles[c].display != K_NONE {
+            if is_block_level(L, c) { space(out); }
+            all_text(L, c, out);
+        }
+        c = node.next;
+    }
+    while out.len > 0 && out[out.len - 1] == ' ' { out.pop(); }
+}
+
 fn space(out: u8[>..]&) {
     if out.len > 0 && out[out.len - 1] != ' ' { out.push(' '); }
 }
 
 fn quote(out: u8[>..]&, s: const u8[:]) {
     out.push('"');
-    for ch in s {
-        if ch == '"' || ch == '\\' { out.push('\\'); }
-        out.push(ch);
-    }
+    write_escaped(out, s, '"');
     out.push('"');
+}
+
+// Writes page text so that it stays on its line and inside its quotes or
+// brackets: control characters and Unicode's line separators are escaped
+// (\n, \r, \t, \u2028 ...), and so are backslashes and `close`, the quote or
+// bracket the text sits in (0 for none).
+fn write_escaped(out: u8[>..]&, s: const u8[:], close: u8) {
+    var i: i64 = 0;
+    while i < s.len {
+        let ch = s[i];
+        if ch == '\n' { out.append("\\n"); }
+        else if ch == '\r' { out.append("\\r"); }
+        else if ch == 9 { out.append("\\t"); }
+        else if ch < 32 || ch == 127 {
+            out.append("\\u00");
+            format_uint(out, ch, 16, 2, '0');
+        } else if ch == 0xE2 && i + 2 < s.len && s[i + 1] == 0x80 && (s[i + 2] == 0xA8 || s[i + 2] == 0xA9) {
+            out.append(if s[i + 2] == 0xA8 { "\\u2028" } else { "\\u2029" });
+            i += 2;
+        } else if ch == 0xC2 && i + 1 < s.len && s[i + 1] == 0x85 {
+            out.append("\\u0085");
+            i += 1;
+        } else {
+            if ch == '\\' || (close != 0 && ch == close) { out.push('\\'); }
+            out.push(ch);
+        }
+        i += 1;
+    }
 }
