@@ -9,6 +9,9 @@
 //   tusk --scroll-test [page.html]       scroll the page for 10 s and print frame times
 //   tusk --idle-exit MS [page.html]      quit after MS of quiet (the idle test)
 //   tusk --wake-test                     a worker wakes the sleeping main thread (the M0 test)
+//
+// It exits 0 when done, 1 when something failed, 2 for wrong arguments, and 3
+// when --screenshot finds no Metal device (a CI runner without a GPU).
 
 import std;
 import os;
@@ -36,7 +39,7 @@ extern "tusk_platform" {
     fn tp_memory_footprint() -> i64;
     fn tp_frames() -> i64;
     fn tp_close() -> i32;
-    fn tp_wake(token: i64) -> i32;
+    fn tp_wake(token: i32) -> i32;
 }
 
 // Event kinds, as numbered in platform/src/lib.rs.
@@ -68,9 +71,11 @@ let MODE_WAKE_TEST: i32 = 4;
 let WINDOW_W: f32 = 960.0;
 let WINDOW_H: f32 = 720.0;
 let BAR_H: f32 = 26.0;           // the weight bar along the bottom
+let SETTLE_MS: i64 = 5000;       // how long after a frame the bar weighs the page again
 let WHEEL_LINE: f32 = 40.0;      // points one line of a mouse wheel scrolls
 let LAYER_PAGE: i32 = 0;
 let LAYER_BAR: i32 = 1;
+let ERR_NO_DEVICE: i32 = -5;     // platform/src/lib.rs
 
 // The page once parsed, styled and measured: what layout at any width needs.
 struct Page {
@@ -156,11 +161,18 @@ recursive fn group(out: u8[>..]&, n: i64) {
     }
 }
 
-// The canvas takes the root element's background (CSS 2.2 §14.2), white if none.
+// The canvas takes the root element's background, or else the body's (CSS
+// 2.2 §14.2); white if neither has one.
 fn background_of(P: Page) -> u32 {
     let html = P.d.nodes[0].first;
-    guard html >= 0 && (P.styles[html].bg >> 24) != 0 else { return 0xFFFFFFFF; }
-    return P.styles[html].bg;
+    guard html >= 0 else { return 0xFFFFFFFF; }
+    if (P.styles[html].bg >> 24) != 0 { return P.styles[html].bg; }
+    var c = P.d.nodes[html].first;
+    while c >= 0 {
+        if is_element(P.d, c, "body") && (P.styles[c].bg >> 24) != 0 { return P.styles[c].bg; }
+        c = P.d.nodes[c].next;
+    }
+    return 0xFFFFFFFF;
 }
 
 fn clamp_scroll(y: f32, page_h: f32, view_h: f32) -> f32 {
@@ -169,7 +181,7 @@ fn clamp_scroll(y: f32, page_h: f32, view_h: f32) -> f32 {
 
 // Stands in for a tab worker that has finished a frame: it wakes the sleeping
 // main thread through the platform layer, the path every frame will take.
-thread_fn wake_after(ms: i64, token: i64) {
+thread_fn wake_after(ms: i64, token: i32) {
     sleep_ms(ms);
     tp_wake(token);
 }
@@ -184,26 +196,35 @@ fn main() {
     var path: u8[>..] = [];
     var shot: u8[>..] = [];
     var at: f32 = 0.0;
+    var has_at = false;
     var idle_exit_ms: i64 = -1;
     let argv = args();
     var i: i64 = 1;
     while i < argv.len {
         let a = argv[i];
-        if a == "--scroll-test" { mode = MODE_SCROLL_TEST; }
-        else if a == "--wake-test" { mode = MODE_WAKE_TEST; idle_exit_ms = 5000; }
-        else if (a == "--screenshot" || a == "--at" || a == "--idle-exit") && i + 1 < argv.len {
+        let valued = i + 1 < argv.len;
+        if a == "--scroll-test" || a == "--wake-test" || (a == "--screenshot" && valued) {
+            guard mode == MODE_WINDOW else { usage(); return; }   // one mode a run
+            if a == "--scroll-test" { mode = MODE_SCROLL_TEST; }
+            else if a == "--wake-test" { mode = MODE_WAKE_TEST; idle_exit_ms = 5000; }
+            else { mode = MODE_SCREENSHOT; i += 1; shot.append(argv[i]); }
+        } else if a == "--at" && valued {
             i += 1;
-            if a == "--screenshot" { mode = MODE_SCREENSHOT; shot.append(argv[i]); }
-            else {
-                let n, ok = parse_int(argv[i]);
-                guard ok else { usage(); return; }
-                if a == "--at" { at = n; } else { idle_exit_ms = n; }
-            }
+            let n, ok = parse_flt(argv[i]);
+            guard ok else { usage(); return; }
+            at = n as f32;
+            has_at = true;
+        } else if a == "--idle-exit" && valued {
+            i += 1;
+            let n, ok = parse_int(argv[i]);
+            guard ok && n >= 0 else { usage(); return; }
+            idle_exit_ms = n;
         }
         else if path.len == 0 && a.len > 0 && a[0] != '-' { path.append(a); }
         else { usage(); return; }
         i += 1;
     }
+    guard !has_at || mode == MODE_SCREENSHOT else { usage(); return; }
     if path.len == 0 { path.append(str(resource_dir(), "../tests/pages/focaccia.html")); }
     var name_start: i64 = 0;
     for ch, k in path { if ch == '/' { name_start = k + 1; } }
@@ -250,8 +271,13 @@ fn main() {
         let page_h = show_page(P, WINDOW_W, scale, cost);
         show_bar(P, path[name_start..], cost, WINDOW_W, WINDOW_H, scale);
         let y = clamp_scroll(at, page_h, WINDOW_H - BAR_H);
-        guard tp_screenshot(shot, WINDOW_W, WINDOW_H, scale, y, bg) == 0 else {
-            write_stderr("tusk: no screenshot (no Metal device, or the file can't be written)\n");
+        let rc = tp_screenshot(shot, WINDOW_W, WINDOW_H, scale, y, bg);
+        guard rc == 0 else {
+            if rc == ERR_NO_DEVICE {
+                write_stderr("tusk: no screenshot: there is no Metal device\n");
+                exit(3);
+            }
+            write_stderr("tusk: no screenshot: the file can't be written\n");
             exit(1);
             return;
         }
@@ -281,15 +307,30 @@ fn main() {
     var scale: f32 = 0.0;
     var page_h: f32 = 0.0;
     var scroll: f32 = 0.0;
-    var weighed = false;     // the bar's memory figure includes the first frame
+    var settle = false;      // a frame has been drawn since the bar last weighed the page
+    var woken = false;
     var e = Event { kind: 0, code: 0, x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
     var quit = false;
     while !quit {
-        guard tp_next_event(idle_exit_ms, e) == 0 else { break; }
-        if e.kind == EV_NONE { break; }      // only with --idle-exit
-        // This event and every one already waiting, then one frame.
+        // Drawing allocates memory the system only settles later, so a while
+        // after the last frame the bar weighs the page again, once.
+        let wait = if idle_exit_ms >= 0 { idle_exit_ms } else if settle { SETTLE_MS } else { -1 };
+        guard tp_next_event(wait, e) == 0 else {
+            write_stderr("tusk: the window's events failed\n");
+            exit(1);
+            return;
+        }
+        if e.kind == EV_NONE {
+            guard idle_exit_ms < 0 else { break; }
+            settle = false;
+            show_bar(P, path[name_start..], cost, width, height, scale);
+            tp_render(scroll, bg);
+            continue;
+        }
+        // This event and every one already waiting, then at most one frame.
+        let before = scroll;
         var relayout = false;
-        var redraw = false;
+        var resized = false;
         loop {
             if e.kind == EV_CLOSE { quit = true; }
             else if e.kind == EV_RESIZE {
@@ -299,11 +340,10 @@ fn main() {
                 width = w;
                 height = e.h as f32;
                 scale = s;
-                redraw = true;
+                resized = true;
             } else if e.kind == EV_SCROLL {
                 let dy = e.y as f32;
                 scroll -= if e.code == 1 { dy } else { dy * WHEEL_LINE };
-                redraw = true;
             } else if e.kind == EV_KEY {
                 let mods = e.x as i64;
                 let page = height - BAR_H - 40.0;
@@ -315,37 +355,38 @@ fn main() {
                 else if e.code == KEY_UP { scroll -= WHEEL_LINE; }
                 else if e.code == KEY_HOME { scroll = 0.0; }
                 else if e.code == KEY_END { scroll = page_h; }
-                redraw = true;
             } else if e.kind == EV_WAKE {
                 print("woken by a worker, token ", e.code);
+                woken = true;
                 if mode == MODE_WAKE_TEST { quit = true; }
             }
             guard tp_next_event(0, e) == 0 && e.kind != EV_NONE else { break; }
         }
         if quit { break; }
-        if relayout {
-            page_h = show_page(P, width, scale, cost);
-            show_bar(P, path[name_start..], cost, width, height, scale);
-        }
+        if relayout { page_h = show_page(P, width, scale, cost); }
+        // The bar sits at the window's bottom edge: it moves with any resize.
+        if resized { show_bar(P, path[name_start..], cost, width, height, scale); }
         scroll = clamp_scroll(scroll, page_h, height - BAR_H);
-        if redraw { tp_render(scroll, bg); }
-        if !weighed && tp_frames() > 0 {
-            // The first frame allocated the window's drawables: weigh again.
-            weighed = true;
-            show_bar(P, path[name_start..], cost, width, height, scale);
+        // A frame only when what is on screen changed.
+        if resized || scroll != before {
             tp_render(scroll, bg);
+            settle = true;
         }
         if mode == MODE_SCROLL_TEST {
             scroll_test(page_h, height, bg);
             quit = true;
         }
     }
-    if worker >= 0 { thread_wait(worker); }
+    let worker_ok = worker < 0 || thread_wait(worker);
     var line: u8[>..] = [];
     weight(P, path[name_start..], cost, line);
     print(line);
     print("frames presented: ", tp_frames());
     tp_close();
+    if mode == MODE_WAKE_TEST && !(woken && worker_ok) {
+        write_stderr("tusk: the worker's wake never arrived\n");
+        exit(1);
+    }
 }
 
 // Scrolls down the page and back for 10 s at a brisk flick's speed, a frame
@@ -362,6 +403,7 @@ fn scroll_test(page_h: f32, height: f32, bg: u32) {
         // Keep AppKit's queue moving, as a real session would.
         while tp_next_event(0, e) == 0 && e.kind != EV_NONE {
             if e.kind == EV_CLOSE { return; }
+            if e.kind == EV_KEY && ((e.x as i64) & MOD_COMMAND) != 0 && e.code == KEY_Q { return; }
         }
         let t = ms(start, clock_ns()) / 1000.0;
         if t >= 10.0 { break; }
