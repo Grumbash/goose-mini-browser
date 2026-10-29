@@ -12,6 +12,9 @@
 // memory; marking them `unsafe` would change nothing for that caller.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod cg;
+pub mod text;
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -33,11 +36,11 @@ use objc2_metal::{
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
 // Error codes returned to Goose. Zero or positive means success.
-const ERR_NOT_MAIN_THREAD: i32 = -1;
-const ERR_NOT_OPEN: i32 = -2;
-const ERR_METAL: i32 = -3;
-const ERR_ARGUMENT: i32 = -4;
-const ERR_PANIC: i32 = -100;
+pub(crate) const ERR_NOT_MAIN_THREAD: i32 = -1;
+pub(crate) const ERR_NOT_OPEN: i32 = -2;
+pub(crate) const ERR_METAL: i32 = -3;
+pub(crate) const ERR_ARGUMENT: i32 = -4;
+pub(crate) const ERR_PANIC: i32 = -100;
 
 // Event kinds; the Goose side mirrors these numbers.
 const EV_NONE: i32 = 0; // the wait timed out
@@ -61,6 +64,57 @@ pub struct GpEvent {
     pub h: f64,
 }
 
+/// A Goose slice as it crosses into C: `{ data, len }` (Goose spec, appendix
+/// C.2). Goose packs its values without alignment (spec §3.2), so elements may
+/// sit at any address and are read and written unaligned.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GSlice<T> {
+    pub data: *mut T,
+    pub len: i64,
+}
+
+impl<T: Copy> GSlice<T> {
+    /// The number of elements, or `None` for a malformed slice.
+    pub fn count(&self) -> Option<usize> {
+        if self.len < 0 || (self.data.is_null() && self.len > 0) {
+            None
+        } else {
+            Some(self.len as usize)
+        }
+    }
+
+    /// Element `i`.
+    ///
+    /// # Safety
+    /// `i` is below `count()` and Goose's slice is valid for this call.
+    pub unsafe fn get(&self, i: usize) -> T {
+        unsafe { self.data.add(i).read_unaligned() }
+    }
+
+    /// Writes element `i`.
+    ///
+    /// # Safety
+    /// `i` is below `count()` and Goose's slice is valid and writable for this call.
+    pub unsafe fn set(&self, i: usize, v: T) {
+        unsafe { self.data.add(i).write_unaligned(v) }
+    }
+
+    /// Borrows the elements of a type with alignment 1: bytes, and the packed
+    /// structs that cross the boundary.
+    ///
+    /// # Safety
+    /// Goose's slice is valid for this call; the borrow must not outlive it.
+    pub unsafe fn as_slice<'a>(&self) -> Option<&'a [T]> {
+        const { assert!(std::mem::align_of::<T>() == 1) };
+        let n = self.count()?;
+        if n == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { std::slice::from_raw_parts(self.data, n) })
+    }
+}
+
 struct Platform {
     app: Retained<NSApplication>,
     window: Retained<NSWindow>,
@@ -79,7 +133,7 @@ thread_local! {
 }
 
 /// Runs `f`, turning a panic into ERR_PANIC so it never unwinds into Goose.
-fn guarded(f: impl FnOnce() -> Result<i32, i32>) -> i32 {
+pub(crate) fn guarded(f: impl FnOnce() -> Result<i32, i32>) -> i32 {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(code)) => code,
         Ok(Err(code)) => code,
