@@ -17,11 +17,30 @@ let K_PARA = 0;
 let K_HEADING = 1;
 let K_LINK = 2;
 let K_BREAK = 3;
+let K_IMAGE = 4;
 
 fn extract_href(tag: u8[:]) -> u8[:] {
     let k = find(tag, "href=\"");
     if k < 0 { return tag[0..0]; }
     let start = k + 6;
+    var j = start;
+    while j < tag.len && tag[j] != '"' { j += 1; }
+    return tag[start..j];
+}
+
+fn extract_src(tag: u8[:]) -> u8[:] {
+    let k = find(tag, "src=\"");
+    if k < 0 { return tag[0..0]; }
+    let start = k + 5;
+    var j = start;
+    while j < tag.len && tag[j] != '"' { j += 1; }
+    return tag[start..j];
+}
+
+fn extract_poster(tag: u8[:]) -> u8[:] {
+    let k = find(tag, "poster=\"");
+    if k < 0 { return tag[0..0]; }
+    let start = k + 8;
     var j = start;
     while j < tag.len && tag[j] != '"' { j += 1; }
     return tag[start..j];
@@ -153,6 +172,24 @@ fn parse_html(src: u8[:]) -> Item[>..] {
                 skip_tag = name;
             } else if name == "b" || name == "strong" || name == "i" || name == "em" {
                 emphasized = true;
+            } else if name == "img" {
+                let t = decode_entities(trim(buf[..]));
+                if t.len > 0 { items.push(Item { kind: kind, text: t[..], href: "", color: block_color(cur_color, emphasized) }); }
+                buf.resize(0);
+                let src = extract_src(tag);
+                if src.len > 0 { items.push(Item { kind: K_IMAGE, text: "", href: src, color: 0 }); }
+            } else if name == "video" {
+                let t = decode_entities(trim(buf[..]));
+                if t.len > 0 { items.push(Item { kind: kind, text: t[..], href: "", color: block_color(cur_color, emphasized) }); }
+                buf.resize(0);
+                let poster = extract_poster(tag);
+                if poster.len > 0 {
+                    items.push(Item { kind: K_IMAGE, text: "", href: poster, color: 0 });
+                } else {
+                    // no poster to show a frame of, and this scanner does not
+                    // decode video -- say so rather than silently drop it
+                    items.push(Item { kind: K_PARA, text: "[video, no poster]", href: "", color: 0xA0A0A0 });
+                }
             } else if name == "h1" || name == "h2" || name == "h3" {
                 let t = decode_entities(trim(buf[..]));
                 if t.len > 0 { items.push(Item { kind: kind, text: t[..], href: "", color: block_color(cur_color, emphasized) }); }
@@ -257,6 +294,29 @@ thread_fn fetch_worker() {
     }
 }
 
+// A second queue/worker pair, parallel to the page-fetch one above and
+// running on its own thread: an image decode (network + PNG/JPEG/GIF/WebP
+// decode + downsample, all in goosenet/Rust) is its own potentially-slow
+// job and must not make page navigation wait on it, or vice versa.
+// `item_index` + `gen` let the main loop drop a result that arrived after
+// the user navigated to a different page (the array of items the index
+// pointed into no longer exists).
+struct ImageJob { id: i64, item_index: i64, gen: i64, url: u8[varint] }
+struct ImageResult { id: i64, item_index: i64, gen: i64, ok: bool, w: i32, h: i32, pixels: u8[varint] }
+
+thread_fn image_worker() {
+    loop {
+        let job = qget<ImageJob>();
+        guard job.id >= 0 else { break; }
+        var pixels: u8[>..] = [];
+        var w: i32 = 0;
+        var h: i32 = 0;
+        let ok = fetch_image_rgba(job.url[..], pixels, w, h);
+        qput(ImageResult { id: job.id, item_index: job.item_index, gen: job.gen,
+                            ok: ok, w: w, h: h, pixels: pixels[..] });
+    }
+}
+
 fn main() {
     var path: u8[..200] = [];
     let argv = args();
@@ -276,6 +336,8 @@ fn main() {
 
     let worker_id = thread_spawn(fetch_worker);
     defer { qput(FetchJob { id: -1, url: "" }); thread_wait(worker_id); };
+    let img_worker_id = thread_spawn(image_worker);
+    defer { qput(ImageJob { id: -1, item_index: 0, gen: 0, url: "" }); thread_wait(img_worker_id); };
 
     var addr: u8[..200] = [];
     addr.append(path[..]);
@@ -286,15 +348,41 @@ fn main() {
     var pending_id: i64 = -1;
     var loading = false;
 
+    // Per-item image state, parallel to `items` and rebuilt every time it
+    // changes. 0 = not yet requested, 1 = loading, 2 = loaded (img_tex/
+    // img_w/img_h valid), 3 = failed.
+    var img_state: i64[>..] = [];
+    var img_tex: gfx::Texture[>..] = [];
+    var img_w: i64[>..] = [];
+    var img_h: i64[>..] = [];
+    var page_gen: i64 = 0;
+    var next_img_id: i64 = 0;
+
+    fn reset_img_state() {
+        page_gen += 1;      // orphans any ImageResult already in flight
+        img_state = [];
+        img_tex = [];
+        img_w = [];
+        img_h = [];
+        for it in items {
+            img_state.push(0);
+            img_tex.push(gfx::Texture { id: 0 });
+            img_w.push(0);
+            img_h.push(0);
+        }
+    }
+
     fn load_local(p: u8[:]) -> bool {
         var data: u8[>..] = [];
         if !read_file(p, data) {
             status.resize(0);
             format(status, "cannot read ", p);
             items = [];
+            reset_img_state();
             return false;
         }
         items = parse_html(data[..]);
+        reset_img_state();
         status.resize(0);
         format(status, p, " (", items.len, " blocks)");
         return true;
@@ -313,6 +401,7 @@ fn main() {
             next_id += 1;
             loading = true;
             items = [];
+            reset_img_state();
             status.resize(0);
             format(status, "loading ", p, " ...");
         } else {
@@ -344,14 +433,41 @@ fn main() {
                     status.resize(0);
                     format(status, "fetch failed: ", path[..]);
                     items = [];
+                    reset_img_state();
                 } else {
                     items = parse_html(r.body[..]);
+                    reset_img_state();
                     status.resize(0);
                     format(status, path[..], " -> HTTP ", r.status);
                 }
             }
             // a got-but-mismatched id is a stale result from a superseded
             // request: silently dropped, the current one is still pending
+        }
+
+        // Drain whatever image decodes finished, capped per frame so a
+        // page with many images can't stall a frame uploading all of them
+        // to the GPU at once.
+        var drained = 0;
+        loop {
+            let r, got = qpoll<ImageResult>();
+            if !got { break; }
+            drained += 1;
+            if r.gen == page_gen && r.item_index >= 0 && r.item_index < img_state.len {
+                if r.ok && r.w > 0 && r.h > 0 {
+                    var tex = gfx::texture2d(r.w as i64, r.h as i64);
+                    gfx::update_texture(tex, r.pixels[..]);
+                    img_tex[r.item_index] = tex;
+                    img_w[r.item_index] = r.w as i64;
+                    img_h[r.item_index] = r.h as i64;
+                    img_state[r.item_index] = 2;
+                } else {
+                    img_state[r.item_index] = 3;
+                }
+            }
+            // a gen mismatch is a result for a page the user already left:
+            // the item_index it refers to may not even exist any more
+            if drained >= 4 { break; }
         }
 
         if ui::begin(ctx, "browser", ui::rect(0, 0, size.x as f32, size.y as f32), window) {
@@ -389,6 +505,7 @@ fn main() {
             if ui::group_begin(ctx, "page", ui::WINDOW_BORDER) {
                 var clicked: u8[..200] = [];
                 var did_click = false;
+                var idx = 0;
                 for it in items {
                     if it.kind == K_HEADING {
                         ui::layout_row_dynamic(ctx, 30.0, 1);
@@ -404,6 +521,23 @@ fn main() {
                     } else if it.kind == K_BREAK {
                         ui::layout_row_dynamic(ctx, 10.0, 1);
                         ui::spacer(ctx);
+                    } else if it.kind == K_IMAGE {
+                        if img_state[idx] == 0 {
+                            let img_url = resolve(path[..], it.href);
+                            qput(ImageJob { id: next_img_id, item_index: idx, gen: page_gen, url: img_url[..] });
+                            next_img_id += 1;
+                            img_state[idx] = 1;
+                        }
+                        if img_state[idx] == 2 {
+                            ui::layout_row_static(ctx, img_h[idx] as f32, img_w[idx], 1);
+                            ui::image(ctx, ui::texture_image(img_tex[idx]));
+                        } else if img_state[idx] == 1 {
+                            ui::layout_row_dynamic(ctx, 20.0, 1);
+                            ui::label_colored(ctx, "[loading image...]", ui::TEXT_LEFT, ui::rgb(140, 140, 140));
+                        } else {
+                            ui::layout_row_dynamic(ctx, 20.0, 1);
+                            ui::label_colored(ctx, "[image failed to load]", ui::TEXT_LEFT, ui::rgb(200, 90, 90));
+                        }
                     } else if it.color != 0 {
                         // a colored paragraph draws on one line (no colored
                         // wrap exists in ui) -- a real tradeoff, not a bug
@@ -414,6 +548,7 @@ fn main() {
                         ui::layout_row_dynamic(ctx, 20.0, 1);
                         ui::label_wrap(ctx, it.text);
                     }
+                    idx += 1;
                 }
                 ui::group_end(ctx);
 

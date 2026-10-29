@@ -12,6 +12,8 @@ import ffi;
 extern "goosenet" {
     fn goosenet_fetch(url: const u8&, url_len: i64, out_ptr: u64&, out_len: i64&,
                        out_status: i32&) -> i32;
+    fn goosenet_fetch_image(url: const u8&, url_len: i64, out_ptr: u64&, out_len: i64&,
+                             out_w: i32&, out_h: i32&) -> i32;
     fn goosenet_free(ptr: u64, len: i64);
 }
 
@@ -29,4 +31,24 @@ fn http_get_page(url: u8[:], body: u8[>..]&) -> i64 {
     ffi::bytes(ptr, len, body);
     goosenet_free(ptr, len);
     return status as i64;
+}
+
+// Fetches `url`, decodes it as PNG/JPEG/GIF/WebP, downsamples it to at
+// most 480px on its longest side (decode time, the copy across the thread
+// queue, and the GPU upload all stay cheap no matter how big the original
+// was), and appends raw RGBA8 pixels (width*height*4 bytes, row-major) to
+// `pixels`. Returns true and sets `w`/`h` on success; false (and appends
+// nothing) on a transport failure or an unsupported/corrupt image format.
+fn fetch_image_rgba(url: u8[:], pixels: u8[>..]&, w: i32&, h: i32&) -> bool {
+    var ptr: u64 = 0;
+    var len: i64 = 0;
+    var width: i32 = 0;
+    var height: i32 = 0;
+    let rc = goosenet_fetch_image(url[0], url.len, ptr, len, width, height);
+    if rc != 0 { return false; }
+    ffi::bytes(ptr, len, pixels);
+    goosenet_free(ptr, len);
+    w = width;
+    h = height;
+    return true;
 }

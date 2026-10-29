@@ -65,6 +65,64 @@ pub extern "C" fn goosenet_free(ptr: u64, len: i64) {
     }
 }
 
+// A display image never needs to be bigger than this on either side: it
+// keeps decode time, the memcpy across the thread queue, and the GPU
+// texture upload all cheap regardless of what the server actually sent
+// (a phone photo can be 4000px wide for a 400px-wide `<img>`). Aspect
+// ratio is preserved; only images already smaller are left alone.
+const MAX_IMAGE_SIDE: u32 = 480;
+
+/// Fetches `url`, decodes it as an image (PNG/JPEG/GIF/WebP), downsamples
+/// it to at most `MAX_IMAGE_SIDE` on its longest side, and writes RGBA8
+/// pixels into `out_ptr`/`out_len` (`width*height*4` bytes, row-major, no
+/// padding) plus `out_w`/`out_h`. Returns 0 on success, a negative code on
+/// failure (fetch failed, or the bytes don't decode as a supported image
+/// format) -- on failure the out parameters are left untouched.
+#[no_mangle]
+pub extern "C" fn goosenet_fetch_image(
+    url_ptr: *const u8,
+    url_len: i64,
+    out_ptr: *mut u64,
+    out_len: *mut i64,
+    out_w: *mut i32,
+    out_h: *mut i32,
+) -> i32 {
+    let url = match read_str(url_ptr, url_len) {
+        Some(s) => s,
+        None => return -1,
+    };
+    let (status, body) = match fetch_follow(&url) {
+        Ok(r) => r,
+        Err(_) => return -2,
+    };
+    if !(200..300).contains(&status) {
+        return -3;
+    }
+    let img = match image::load_from_memory(&body) {
+        Ok(i) => i,
+        Err(_) => return -4,
+    };
+    let (w0, h0) = (img.width(), img.height());
+    let img = if w0 > MAX_IMAGE_SIDE || h0 > MAX_IMAGE_SIDE {
+        img.resize(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let raw = rgba.into_raw();
+    let len = raw.len() as i64;
+    let boxed = raw.into_boxed_slice();
+    let ptr = Box::into_raw(boxed) as *mut u8 as u64;
+    unsafe {
+        *out_ptr = ptr;
+        *out_len = len;
+        *out_w = w as i32;
+        *out_h = h as i32;
+    }
+    0
+}
+
 fn read_str(ptr: *const u8, len: i64) -> Option<String> {
     if ptr.is_null() || len < 0 {
         return None;

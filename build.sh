@@ -15,9 +15,18 @@ case "$(uname -s)" in
 esac
 
 if [ "$EXT" = "dll" ]; then
+  rm -f browser/goosenet.dll
   cp goosenet/target/release/goosenet.dll browser/
 else
+  # rm then cp, not cp -f: overwriting a mapped dylib's bytes in place while
+  # keeping its inode makes the kernel's code-signing cache compare the new
+  # content against a signature taken for the old one and SIGKILL any
+  # process that maps it (cs_invalid_page). A fresh inode avoids that.
+  rm -f "browser/libgoosenet.$EXT"
   cp "goosenet/target/release/libgoosenet.$EXT" browser/
+  if [ "$EXT" = "dylib" ] && command -v codesign >/dev/null 2>&1; then
+    codesign --force --sign - "browser/libgoosenet.$EXT" 2>/dev/null || true
+  fi
 fi
 
 GOOSE_BIN="${GOOSE_BIN:-goose}"

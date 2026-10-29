@@ -1,0 +1,9 @@
+<h1>Images and video</h1>
+<p>A real PNG from httpbin:</p>
+<img src="https://httpbin.org/image/png">
+<p>A real JPEG, bigger than our 480px cap, so it should be downscaled:</p>
+<img src="https://upload.wikimedia.org/wikipedia/commons/8/8c/JPEG_example_JPG_RIP_025.jpg">
+<p>A video with no poster (should show a text placeholder, no network call):</p>
+<video src="movie.mp4"></video>
+<p>An image that will fail to decode (not an image at all):</p>
+<img src="https://example.com/">
