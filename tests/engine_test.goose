@@ -140,6 +140,8 @@ fn test_css() {
 
 // ------------------------------------------------------------------ layout
 
+let PROBE_GLUE: i32 = 5;    // "ok", or the first text that starts a line with , . [ or ]
+let PROBE_RAISE: i32 = 6;   // each text item and its height over the first one's baseline
 let PROBE_TEXT: i32 = 1;    // each text item: its text, its line, and where it starts: the
                             // x of a line's first item, then left or right of that
 let PROBE_BOXES: i32 = 2;   // each element's box, top and height
@@ -193,6 +195,26 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             }
             out.push('\n');
         }
+    } else if probe == PROBE_GLUE {
+        var prev_x: f32 = 1000000.0;
+        for it in items {
+            guard it.kind == ITEM_TEXT && it.text_len > 0 else { continue; }
+            let first = text[it.text];
+            if it.x < prev_x + 0.01 && out.len == 0 && (first == ',' || first == '.' || first == '[' || first == ']') {
+                format(out, "starts a line: \"", text[it.text..it.text + it.text_len], "\"");
+            }
+            prev_x = it.x;
+        }
+        if out.len == 0 { out.append("ok"); }
+    } else if probe == PROBE_RAISE {
+        var base: f32 = 0.0;
+        for it, k in items {
+            guard it.kind == ITEM_TEXT else { continue; }
+            if out.len == 0 { base = it.y; }
+            format(out, "\"", text[it.text..it.text + it.text_len], "\" ");
+            format_flt(out, it.y - base, 1);
+            out.push('\n');
+        }
     } else if probe == PROBE_BOXES {
         for n, i in nodes {
             guard n.kind == NODE_ELEMENT && boxes[i].h > 0.0 else { continue; }
@@ -221,6 +243,31 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
 fn test_layout() {
     check("a paragraph sits on the body's padding",
           layout_probe("<p>Hello world</p>", 400.0, PROBE_TEXT), "\"Hello world\" line 1 x 32\n");
+    check("a block whose font no text uses", layout_probe("<p><b>x</b></p>", 400.0, PROBE_TEXT), "\"x\" line 1 x 32\n");
+    check("the root's margins don't collapse, so the body's top margin is placed",
+          layout_probe("<style>body { margin: 40px auto; padding: 0 }</style><h1>Title</h1>", 400.0, PROBE_BOXES),
+          "html y 0.0 h 120.8\nbody y 40.0 h 40.8\nh1 y 40.0 h 40.8\n");
+    check("an empty paragraph's margins collapse through it",
+          layout_probe("<p>one</p><p></p><p>two</p>", 400.0, PROBE_BOXES),
+          "html y 0.0 h 248.4\nbody y 0.0 h 248.4\np y 40.0 h 27.2\np y 84.2 h 27.2\n");
+    check("a link inside a superscript is raised with it",
+          layout_probe("<p>bread<sup><a href=/c>[1]</a></sup></p>", 400.0, PROBE_RAISE), "\"bread\" 0.0\n\"[1]\" -5.7\n");
+    // At every width: no line starts with the comma or citation glued to the
+    // word before it, and text that mustn't wrap moves down whole.
+    var glued = true;
+    var fits = true;
+    var w: f32 = 240.0;
+    while w < 520.0 {
+        let a = layout_probe("<p>aaaa bbbb cccc dddd eeee <a href=/r>Rome</a>, then more words follow here.<sup>[1]</sup> End</p>", w, PROBE_GLUE);
+        if a[..] != "ok" { glued = false; }
+        if (w as i64) % 7 == 0 {
+            let b = layout_probe("<p>aaaa bbbb cccc dddd <span style='white-space: nowrap'>nowrap phrase here</span> tail</p>", w, PROBE_FIT);
+            if b[..] != "fits" { fits = false; }
+        }
+        w += 1.0;
+    }
+    check("no line starts with what is glued to the word before it", if glued { "ok" } else { "broken" }, "ok");
+    check("text that mustn't wrap moves to the next line whole", if fits { "fits" } else { "overflows" }, "fits");
     check("a hidden paragraph paints nothing; inline elements share a line",
           layout_probe("<p hidden>gone</p><p>kept <b>bold</b> and <i>it</i></p>", 400.0, PROBE_TEXT),
           "\"kept \" line 1 x 32\n\"bold\" line 1 right\n\" and \" line 1 right\n\"it\" line 1 right\n");

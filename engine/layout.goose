@@ -119,7 +119,7 @@ recursive fn measure_children(L: Layout, n: i32) {
         let v, has = attr_value(L.d, n, "start");
         if has {
             let k, ok = parse_int(trim(v));
-            if ok { ordinal = k as i32; }
+            if ok && k > -1000000000 && k < 1000000000 { ordinal = k as i32; }
         }
     }
     var c = L.d.nodes[n].first;
@@ -232,7 +232,7 @@ fn roman_char(out: u8[>..]&, ch: u8, upper: bool) { out.push(if upper { ch - 32 
 // Returns the page's height.
 fn layout_page(L: Layout, width: f32) -> f32 {
     while L.boxes.len < L.d.nodes.len { L.boxes.push(Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }); }
-    let h, first, trailing = layout_children(L, 0, 0.0, 0.0, width, true);
+    let h, first, trailing = layout_children(L, 0, 0.0, 0.0, width, false);
     inline_boxes(L, 0);
     return h + trailing;
 }
@@ -243,10 +243,20 @@ fn is_block_level(L: Layout, n: i32) -> bool {
     return d == K_BLOCK || d == K_LIST_ITEM;
 }
 
-// Whether n draws nothing: white space between blocks, or a hidden element.
-fn is_blank(L: Layout, n: i32) -> bool {
+// Whether n draws nothing: white space between blocks, a hidden element, or
+// an inline element with only such things in it.
+recursive fn is_blank(L: Layout, n: i32) -> bool {
     let node = L.d.nodes[n];
-    if node.kind == NODE_ELEMENT { return L.styles[n].display == K_NONE; }
+    if node.kind == NODE_ELEMENT {
+        if L.styles[n].display == K_NONE { return true; }
+        if is_block_level(L, n) || node_name(L.d, n) == "br" { return false; }
+        var c = node.first;
+        while c >= 0 {
+            if !is_blank(L, c) { return false; }
+            c = L.d.nodes[c].next;
+        }
+        return true;
+    }
     guard node.kind == NODE_TEXT else { return true; }
     let r = L.run_of[n];
     return r < 0 || (L.runs[r].len == 1 && L.text[L.runs[r].start] == ' ');
@@ -260,14 +270,42 @@ fn collapse(a: f32, b: f32) -> f32 {
 }
 
 // n's top margin after collapsing with its first child's, and that child's
-// with its own, while no border, padding or line comes between them.
+// with its own, while no border, padding or line comes between them. Empty
+// blocks on the way let the margins through. The root's margins don't
+// collapse with anything.
 recursive fn top_margin(L: Layout, n: i32) -> f32 {
     let s = L.styles[n];
-    guard s.bt == 0.0 && s.pt == 0.0 else { return s.mt; }
+    guard L.d.nodes[n].parent > 0 && s.bt == 0.0 && s.pt == 0.0 else { return s.mt; }
+    var m = s.mt;
     var c = L.d.nodes[n].first;
-    while c >= 0 && !is_block_level(L, c) && is_blank(L, c) { c = L.d.nodes[c].next; }
-    guard c >= 0 && is_block_level(L, c) else { return s.mt; }
-    return collapse(s.mt, top_margin(L, c));
+    while c >= 0 {
+        if is_block_level(L, c) {
+            guard is_empty_block(L, c) else { return collapse(m, top_margin(L, c)); }
+            m = collapse(m, collapse(L.styles[c].mt, L.styles[c].mb));
+        } else if !is_blank(L, c) {
+            return m;
+        }
+        c = L.d.nodes[c].next;
+    }
+    return m;
+}
+
+// A block with nothing in it: no border or padding, and only blank content
+// or empty blocks. Its margins collapse through it (CSS 2.2 §8.3.1). A list
+// item isn't one: it still shows its marker.
+recursive fn is_empty_block(L: Layout, n: i32) -> bool {
+    let s = L.styles[n];
+    guard s.display == K_BLOCK && s.bt == 0.0 && s.pt == 0.0 && s.pb == 0.0 && s.bb == 0.0 else { return false; }
+    var c = L.d.nodes[n].first;
+    while c >= 0 {
+        if is_block_level(L, c) {
+            if !is_empty_block(L, c) { return false; }
+        } else if !is_blank(L, c) {
+            return false;
+        }
+        c = L.d.nodes[c].next;
+    }
+    return true;
 }
 
 // Lays out block-level element n, its top border edge at y, in a containing
@@ -296,22 +334,25 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
         bg = L.items.len;
         L.items.push(rect_item(n, bx, y, bw, 0.0, s.bg));
     }
-    let absorb_bottom = s.bb == 0.0 && s.pb == 0.0;
-    let inner, first, trailing = layout_children(L, n, bx + s.pl, y + s.bt + s.pt, w, s.bt == 0.0 && s.pt == 0.0);
+    let root = L.d.nodes[n].parent == 0;
+    let absorb_bottom = !root && s.bb == 0.0 && s.pb == 0.0;
+    let inner, first, trailing = layout_children(L, n, bx + s.pl, y + s.bt + s.pt, w, !root && s.bt == 0.0 && s.pt == 0.0);
     var ch = inner;
     var mb = s.mb;
     if absorb_bottom { mb = collapse(mb, trailing); } else { ch += trailing; }
     let h = s.bt + s.pt + ch + s.pb + s.bb;
     if bg >= 0 { L.items[bg].h = h; }
-    if s.bt > 0.0 { L.items.push(rect_item(n, bx, y, bw, s.bt, border_color(s.bt_color, s))); }
-    if s.bb > 0.0 { L.items.push(rect_item(n, bx, y + h - s.bb, bw, s.bb, border_color(s.bb_color, s))); }
+    let top = border_color(s.bt_color, s);
+    let bottom = border_color(s.bb_color, s);
+    if s.bt > 0.0 && (top >> 24) != 0 { L.items.push(rect_item(n, bx, y, bw, s.bt, top)); }
+    if s.bb > 0.0 && (bottom >> 24) != 0 { L.items.push(rect_item(n, bx, y + h - s.bb, bw, s.bb, bottom)); }
     if s.display == K_LIST_ITEM { paint_marker(L, n, bx + s.pl, first); }
     L.boxes[n] = Rect { x: bx, y: y, w: bw, h: h };
     return h, first, mb;
 }
 
-// A border without a colour of its own takes the text's (currentColor).
-fn border_color(c: u32, s: Style) -> u32 { return if (c >> 24) != 0 { c } else { s.color }; }
+// currentColor, a border's colour unless it has its own, is the text's.
+fn border_color(c: u32, s: Style) -> u32 { return if c == CURRENT_COLOR { s.color } else { c }; }
 
 fn rect_item(n: i32, x: f32, y: f32, w: f32, h: f32, color: u32) -> DItem {
     return DItem { kind: ITEM_RECT, x: x, y: y, w: w, h: h, color: color, font: 0, size: 0.0, text: 0, text_len: 0, node: n };
@@ -330,6 +371,13 @@ recursive fn layout_children(L: Layout, n: i32, x: f32, y: f32, w: f32, absorbed
     var first: f32 = -1.0;
     var c = L.d.nodes[n].first;
     while c >= 0 {
+        if is_block_level(L, c) && is_empty_block(L, c) {
+            // Its margins collapse through it into the ones around it; at the
+            // top, top_margin has already passed them up to n.
+            if !at_top { margin = collapse(margin, collapse(L.styles[c].mt, L.styles[c].mb)); }
+            c = L.d.nodes[c].next;
+            continue;
+        }
         if is_block_level(L, c) {
             if at_top { at_top = false; }
             else { cy += collapse(margin, top_margin(L, c)); }
@@ -368,7 +416,9 @@ recursive fn layout_children(L: Layout, n: i32, x: f32, y: f32, w: f32, absorbed
 // first baseline.
 fn layout_lines(L: Layout, parent: i32, from: i32, to: i32, x: f32, y: f32, w: f32) -> f32, f32 {
     let s = L.styles[parent];
-    let f = L.fonts[font_index(L, font_of(s), s.font_size)];
+    // font_index may add a font: take its index before indexing L.fonts.
+    let fi = font_index(L, font_of(s), s.font_size);
+    let f = L.fonts[fi];
     let half = (line_height(s) - (f.m.ascent + f.m.descent)) / 2.0;
     var line = Line { left: x, width: w, y: y, x: 0.0, first_item: L.items.len,
                       ascent: f.m.ascent + half, descent: f.m.descent + half,
@@ -394,6 +444,7 @@ recursive fn flow_node(L: Layout, line: Line&, n: i32) {
     // markers wait for block-in-inline splitting.
     let own_lines = is_block_level(L, n);
     if own_lines { close_line(L, line, false); }
+    let top = line.y;
     line.x += s.ml + s.pl;
     var c = node.first;
     while c >= 0 {
@@ -401,11 +452,17 @@ recursive fn flow_node(L: Layout, line: Line&, n: i32) {
         c = L.d.nodes[c].next;
     }
     line.x += s.mr + s.pr;
-    if own_lines { close_line(L, line, false); }
+    if own_lines {
+        close_line(L, line, false);
+        L.boxes[n] = Rect { x: line.left, y: top, w: line.width, h: line.y - top };
+    }
 }
 
 // Breaks text node n's run into the current line and the lines after it, at
-// spaces; a word longer than a whole line breaks between characters.
+// spaces; a word longer than a whole line breaks between characters. A word
+// that runs on into the next text without a space (a link and its comma, a
+// word and its citation) moves to the next line whole, and so does text
+// that mustn't wrap.
 fn flow_text(L: Layout, line: Line&, n: i32) {
     let r = L.run_of[n];
     guard r >= 0;
@@ -415,9 +472,7 @@ fn flow_text(L: Layout, line: Line&, n: i32) {
     let wraps = s.ws == K_NORMAL || s.ws == K_PRE_WRAP;
     let collapsible = s.ws == K_NORMAL || s.ws == K_NOWRAP;
     let half = (line_height(s) - (f.m.ascent + f.m.descent)) / 2.0;
-    var raise: f32 = 0.0;
-    if s.valign == K_SUPER { raise = s.font_size * 0.45; }
-    else if s.valign == K_SUB { raise = -s.font_size * 0.2; }
+    let raise = raise_of(L, n);
     let above = f.m.ascent + half + raise;
     let below = f.m.descent + half - raise;
     let t = run.start;
@@ -437,37 +492,106 @@ fn flow_text(L: Layout, line: Line&, n: i32) {
             i += 1;
             continue;
         }
+        // The next unit: a word and the spaces after it, or, where lines
+        // don't wrap, all of it up to a line break.
         var j = i;
-        while j < run.len && L.text[t + j] != ' ' && L.text[t + j] != '\n' { j += 1; }
-        let word_end = j;
-        while j < run.len && L.text[t + j] == ' ' { j += 1; }
-        let word_w = L.carets[c + word_end] - L.carets[c + i];
-        if wraps && line.x + word_w > line.width + 0.01 {
-            if line.content {
-                if piece >= 0 { emit_text(L, line, run, s, piece, i, piece_x, raise); piece = -1; }
-                close_line(L, line, false);
-                continue;
+        if wraps { while j < run.len && L.text[t + j] != ' ' && L.text[t + j] != '\n' { j += 1; } }
+        else { while j < run.len && L.text[t + j] != '\n' { j += 1; } }
+        var word_end = j;
+        if wraps { while j < run.len && L.text[t + j] == ' ' { j += 1; } }
+        else { while word_end > i && L.text[t + word_end - 1] == ' ' { word_end -= 1; } }
+        let own_w = L.carets[c + word_end] - L.carets[c + i];
+        let unit_w = own_w + (if word_end == run.len { glued_after(L, n) } else { 0.0 });
+        // No break between this run and the text before it without a space.
+        let glued = i == 0 && line.content && !line.space;
+        if line.content && !glued && line.x + unit_w > line.width + 0.01 {
+            if piece >= 0 { emit_text(L, line, run, s, piece, i, piece_x, raise); piece = -1; }
+            close_line(L, line, false);
+            continue;
+        }
+        if wraps && !line.content && word_end > i && line.x + own_w > line.width + 0.01 {
+            // Longer than the line: as many characters as fit, at least one.
+            var k = next_char(L, t, i, word_end);
+            while k < word_end {
+                let after = next_char(L, t, k, word_end);
+                if line.x + L.carets[c + after] - L.carets[c + i] > line.width { break; }
+                k = after;
             }
-            if word_end > i {
-                // Longer than the line: as many characters as fit, at least one.
-                var k = next_char(L, t, i, word_end);
-                while k < word_end {
-                    let after = next_char(L, t, k, word_end);
-                    if line.x + L.carets[c + after] - L.carets[c + i] > line.width { break; }
-                    k = after;
-                }
-                place(line, L.carets[c + k] - L.carets[c + i], false, 0.0, above, below);
-                emit_text(L, line, run, s, i, k, line.x - (L.carets[c + k] - L.carets[c + i]), raise);
-                close_line(L, line, false);
-                i = k;
-                continue;
-            }
+            place(line, L.carets[c + k] - L.carets[c + i], false, 0.0, above, below);
+            emit_text(L, line, run, s, i, k, line.x - (L.carets[c + k] - L.carets[c + i]), raise);
+            close_line(L, line, false);
+            i = k;
+            continue;
         }
         if piece < 0 { piece = i; piece_x = line.x; }
         place(line, L.carets[c + j] - L.carets[c + i], j > word_end, L.carets[c + j] - L.carets[c + word_end], above, below);
         i = j;
     }
     if piece >= 0 { emit_text(L, line, run, s, piece, run.len, piece_x, raise); }
+}
+
+// How far above its line's baseline text node n sits: the shifts of the
+// superscripts and subscripts it is in, up to its block.
+fn raise_of(L: Layout, n: i32) -> f32 {
+    var raise: f32 = 0.0;
+    var e = L.d.nodes[n].parent;
+    while e >= 0 && L.d.nodes[e].kind == NODE_ELEMENT && !is_block_level(L, e) {
+        let s = L.styles[e];
+        if s.valign == K_SUPER { raise += s.font_size * 0.45; }
+        else if s.valign == K_SUB { raise -= s.font_size * 0.2; }
+        e = L.d.nodes[e].parent;
+    }
+    return raise;
+}
+
+// The width of what follows text node n with no break opportunity between:
+// the next text up to its first space, and on through texts with none.
+fn glued_after(L: Layout, n: i32) -> f32 {
+    var w: f32 = 0.0;
+    var m = next_inline_text(L, n);
+    while m >= 0 {
+        let r = L.run_of[m];
+        if r >= 0 {
+            let run = L.runs[r];
+            let ws = L.styles[m].ws;
+            let wraps = ws == K_NORMAL || ws == K_PRE_WRAP;
+            var k: i32 = 0;
+            while k < run.len && L.text[run.start + k] != '\n' && (!wraps || L.text[run.start + k] != ' ') { k += 1; }
+            w += L.carets[run.caret + k] - L.carets[run.caret];
+            if k < run.len { return w; }
+        }
+        m = next_inline_text(L, m);
+    }
+    return w;
+}
+
+// The next text node after n on the same lines, or -1 where a block, a <br>
+// or a table cell or list item comes first: those end the line or allow a
+// break.
+fn next_inline_text(L: Layout, n: i32) -> i32 {
+    var at = n;
+    var enter = false;
+    loop {
+        if enter && L.d.nodes[at].first >= 0 {
+            at = L.d.nodes[at].first;
+        } else {
+            while L.d.nodes[at].next < 0 {
+                at = L.d.nodes[at].parent;
+                guard at >= 0 && L.d.nodes[at].kind == NODE_ELEMENT && !is_block_level(L, at) && !ends_unit(L, at) else { return -1; }
+            }
+            at = L.d.nodes[at].next;
+        }
+        let node = L.d.nodes[at];
+        if node.kind == NODE_TEXT { return at; }
+        enter = node.kind == NODE_ELEMENT && L.styles[at].display != K_NONE;
+        guard !enter || (!is_block_level(L, at) && !ends_unit(L, at) && node_name(L.d, at) != "br") else { return -1; }
+    }
+}
+
+// Cells and list items laid out inline: their edges allow a break.
+fn ends_unit(L: Layout, e: i32) -> bool {
+    let t = node_name(L.d, e);
+    return t == "td" || t == "th" || t == "li";
 }
 
 // The index after the character that starts at byte i of a run's text.
@@ -552,16 +676,28 @@ fn union(a: Rect, b: Rect) -> Rect {
     return Rect { x: x0, y: y0, w: max(a.x + a.w, b.x + b.w) - x0, h: max(a.y + a.h, b.y + b.h) - y0 };
 }
 
-fn grow_box(L: Layout, n: i32, r: Rect) { L.boxes[n] = union(L.boxes[n], r); }
+// The union of two boxes on the first line either is on. A text or inline
+// element that wraps is given the box of its first line only: the box of
+// all its lines would also cover other text, and its middle could be on
+// another link.
+fn first_line(a: Rect, b: Rect) -> Rect {
+    if a.w == 0.0 && a.h == 0.0 { return b; }
+    if b.w == 0.0 && b.h == 0.0 { return a; }
+    if b.y > a.y + 0.01 { return a; }
+    if a.y > b.y + 0.01 { return b; }
+    return union(a, b);
+}
 
-// An inline element's box is the union of what it contains.
+fn grow_box(L: Layout, n: i32, r: Rect) { L.boxes[n] = first_line(L.boxes[n], r); }
+
+// An inline element's box is the first line of what it contains.
 recursive fn inline_boxes(L: Layout, n: i32) -> Rect {
     var b = L.boxes[n];
     let inline = L.d.nodes[n].kind == NODE_ELEMENT && !is_block_level(L, n) && L.styles[n].display != K_NONE;
     var c = L.d.nodes[n].first;
     while c >= 0 {
         let cb = inline_boxes(L, c);
-        if inline { b = union(b, cb); }
+        if inline { b = first_line(b, cb); }
         c = L.d.nodes[c].next;
     }
     L.boxes[n] = b;
