@@ -103,6 +103,7 @@ struct Compound {
     id: i32, id_len: i32,
     cls: i32, cls_count: i32,          // classes, in Sheet.classes
     first_child: i32, last_child: i32,
+    link: i32,                         // 1 for :link and :any-link, 2 for :visited
 }
 
 struct Span { start: i32, len: i32 }
@@ -139,12 +140,17 @@ struct Style {
     pt: f32, pr: f32, pb: f32, pl: f32,
     width: f32, width_pct: f32,          // -1 when not set
     max_width: f32, max_width_pct: f32,  // -1 when not set
-    bt: f32, bb: f32, bt_color: u32, bb_color: u32,
+    bt: f32, bb: f32, bt_color: u32, bb_color: u32,   // a colour of CURRENT_COLOR is the text's
     indent: f32,
+    root_size: f32,                      // the root element's font size, which rem counts in
 }
 
+// currentColor until layout paints with the text's colour. Its alpha is 0 and
+// no colour name or #rrggbb parses to it.
+let CURRENT_COLOR: u32 = 2;
+
 fn line_height(s: Style) -> f32 {
-    return if s.lh_mult > 0.0 { s.lh_mult * s.font_size } else { s.lh_px };
+    return if s.lh_mult >= 0.0 { s.lh_mult * s.font_size } else { s.lh_px };
 }
 
 fn root_style() -> Style {
@@ -152,7 +158,7 @@ fn root_style() -> Style {
                    lh_mult: 1.2, lh_px: 0.0, align: K_LEFT, ws: K_NORMAL, list: K_DISC, deco: K_NONE, valign: K_BASELINE,
                    mt: 0.0, mr: 0.0, mb: 0.0, ml: 0.0, auto_ml: 0, auto_mr: 0, pt: 0.0, pr: 0.0, pb: 0.0, pl: 0.0,
                    width: -1.0, width_pct: -1.0, max_width: -1.0, max_width_pct: -1.0,
-                   bt: 0.0, bb: 0.0, bt_color: 0, bb_color: 0, indent: 0.0 };
+                   bt: 0.0, bb: 0.0, bt_color: CURRENT_COLOR, bb_color: CURRENT_COLOR, indent: 0.0, root_size: 16.0 };
 }
 
 // ------------------------------------------------------------------ parsing
@@ -181,7 +187,33 @@ fn skip_block(l: Lexer&) {
         if c == '{' { depth += 1; }
         else if c == '}' { depth -= 1; if depth == 0 { l.pos += 1; return; } }
         else if c == '"' || c == '\'' { l.pos = skip_string(s, l.pos); continue; }
+        else if at_comment(s, l.pos) { l.pos = skip_comment(s, l.pos); continue; }
         l.pos += 1;
+    }
+}
+
+fn at_comment(s: const u8[:], i: i64) -> bool { return i + 1 < s.len && s[i] == '/' && s[i + 1] == '*'; }
+
+// The index after the comment that starts at i.
+fn skip_comment(s: const u8[:], i: i64) -> i64 {
+    let k = find(s[i + 2..], "*/");
+    return if k < 0 { s.len } else { i + 2 + k + 2 };
+}
+
+// s without its comments, each replaced by a space, appended to `out`;
+// strings are copied whole.
+fn without_comments(s: const u8[:], out: u8[>..]&) {
+    var i: i64 = 0;
+    while i < s.len {
+        if at_comment(s, i) { i = skip_comment(s, i); out.push(' '); continue; }
+        if s[i] == '"' || s[i] == '\'' {
+            let end = skip_string(s, i);
+            out.append(s[i..end]);
+            i = end;
+            continue;
+        }
+        out.push(s[i]);
+        i += 1;
     }
 }
 
@@ -200,6 +232,9 @@ fn parse_sheet(src: const u8[:], sh: Sheet, origin: i32, order: i32) -> i32 {
     loop {
         skip_ws_comments(l);
         guard l.pos < src.len else { break; }
+        // The <!-- and --> that old pages wrap style sheets in are skipped.
+        if starts_with(src[l.pos..], "<!--") { l.pos += 4; continue; }
+        if starts_with(src[l.pos..], "-->") { l.pos += 3; continue; }
         if src[l.pos] == '@' {                  // at-rules: skipped, with any block they open
             while l.pos < src.len && src[l.pos] != ';' && src[l.pos] != '{' { l.pos += 1; }
             if l.pos < src.len && src[l.pos] == '{' { skip_block(l); } else { l.pos += 1; }
@@ -207,19 +242,24 @@ fn parse_sheet(src: const u8[:], sh: Sheet, origin: i32, order: i32) -> i32 {
         }
         if src[l.pos] == '}' { l.pos += 1; continue; }
         let pstart = l.pos;
-        while l.pos < src.len && src[l.pos] != '{' { l.pos += 1; }
+        while l.pos < src.len && src[l.pos] != '{' {
+            if at_comment(src, l.pos) { l.pos = skip_comment(src, l.pos); continue; }
+            l.pos += 1;
+        }
         guard l.pos < src.len else { break; }
         let prelude = src[pstart..l.pos];
         l.pos += 1;
         let bstart = l.pos;
         while l.pos < src.len && src[l.pos] != '}' {
             if src[l.pos] == '"' || src[l.pos] == '\'' { l.pos = skip_string(src, l.pos); continue; }
+            if at_comment(src, l.pos) { l.pos = skip_comment(src, l.pos); continue; }
             l.pos += 1;
         }
-        let body = src[bstart..min(l.pos, src.len)];
+        var body_text: u8[>..] = [];
+        without_comments(src[bstart..min(l.pos, src.len)], body_text);
         l.pos = min(l.pos + 1, src.len);
         let decl_start = sh.decls.len as i32;
-        parse_declarations(body, sh.decls);
+        parse_declarations(body_text[..], sh.decls);
         let decl_count = sh.decls.len as i32 - decl_start;
         guard decl_count > 0 else { continue; }
         each_split(prelude, ',') {
@@ -242,7 +282,7 @@ fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origi
     var ok = true;
     while i < sel.len && ok {
         var c = Compound { join: join, tag: 0, tag_len: 0, id: 0, id_len: 0, cls: sh.classes.len as i32, cls_count: 0,
-                           first_child: 0, last_child: 0 };
+                           first_child: 0, last_child: 0, link: 0 };
         var any = false;
         while i < sel.len && !is_ws(sel[i]) && sel[i] != '>' {
             let ch = sel[i];
@@ -266,7 +306,8 @@ fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origi
                 let pc = sel[st..i];
                 if pc == "first-child" { c.first_child = 1; classes += 1; }
                 else if pc == "last-child" { c.last_child = 1; classes += 1; }
-                else if pc == "link" || pc == "visited" || pc == "any-link" { classes += 1; }
+                else if pc == "link" || pc == "any-link" { c.link = 1; classes += 1; }
+                else if pc == "visited" { c.link = 2; classes += 1; }
                 else { ok = false; break; }
                 any = true;
                 continue;
@@ -396,7 +437,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
     if name == "border-top" || name == "border-bottom" || name == "border" {
         // width, style and colour in any order; a style of none removes the line.
         var width: f32 = 0.0;
-        var color: u32 = 0xFF000000;
+        var color: u32 = CURRENT_COLOR;
         var none = false;
         each_word(value) {
             let w = it;
@@ -485,7 +526,7 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
         let scale: f32 = if value == "xx-small" { 0.6 } else if value == "x-small" { 0.75 } else if value == "small" { 0.89 }
             else if value == "medium" { 1.0 } else if value == "large" { 1.2 } else if value == "x-large" { 1.5 }
             else if value == "xx-large" { 2.0 } else { 0.0 };
-        if scale > 0.0 { d.kind = V_LENGTH; d.num = scale; d.unit = U_REM; push_decl(out, d); return; }
+        if scale > 0.0 { d.kind = V_LENGTH; d.num = 16.0 * scale; d.unit = U_PX; push_decl(out, d); return; }
         if value == "smaller" || value == "larger" {
             d.kind = V_LENGTH; d.num = if value == "smaller" { 0.83 } else { 1.2 }; d.unit = U_EM; push_decl(out, d); return;
         }
@@ -577,7 +618,7 @@ fn parse_length(v: const u8[:]) -> f32, i32, bool {
     while i < v.len && (v[i] == '-' || v[i] == '+' || v[i] == '.' || (v[i] >= '0' && v[i] <= '9')) { i += 1; }
     guard i > 0 else { return 0.0, 0, false; }
     let n, ok = parse_flt(v[..i]);
-    guard ok else { return 0.0, 0, false; }
+    guard ok && n > -100000.0 && n < 100000.0 else { return 0.0, 0, false; }
     let unit = v[i..];
     let x = n as f32;
     if unit == "px" { return x, U_PX, true; }
@@ -656,6 +697,7 @@ fn named_color(n: const u8[:]) -> u32 {
     if n == "orange" { return 0xFFFFA500; } if n == "brown" { return 0xFFA52A2A; } if n == "pink" { return 0xFFFFC0CB; }
     if n == "darkgray" || n == "darkgrey" { return 0xFFA9A9A9; } if n == "lightgray" || n == "lightgrey" { return 0xFFD3D3D3; }
     if n == "whitesmoke" { return 0xFFF5F5F5; } if n == "gainsboro" { return 0xFFDCDCDC; } if n == "transparent" { return 0; }
+    if n == "currentcolor" { return CURRENT_COLOR; }
     if n == "darkred" { return 0xFF8B0000; } if n == "darkgreen" { return 0xFF006400; } if n == "darkblue" { return 0xFF00008B; }
     return 1;
 }
@@ -664,24 +706,23 @@ fn named_color(n: const u8[:]) -> u32 {
 
 // Whether element `e` matches rule `r`, compounds checked right to left.
 fn rule_matches(sh: Sheet, d: Doc, r: Rule, e: i32) -> bool {
-    var i = r.comp + r.comp_count - 1;
-    guard compound_matches(sh, d, sh.comps[i], e) else { return false; }
-    var at = e;
-    while i > r.comp {
-        let join = sh.comps[i].join;
-        i -= 1;
-        if join == 2 {
-            at = d.nodes[at].parent;
-            guard at >= 0 && d.nodes[at].kind == NODE_ELEMENT && compound_matches(sh, d, sh.comps[i], at) else { return false; }
-        } else {
-            loop {
-                at = d.nodes[at].parent;
-                guard at >= 0 && d.nodes[at].kind == NODE_ELEMENT else { return false; }
-                if compound_matches(sh, d, sh.comps[i], at) { break; }
-            }
-        }
+    return matches_from(sh, d, r, r.comp + r.comp_count - 1, e);
+}
+
+// Whether compound k of rule r matches element e, and the compounds to its
+// left match e's ancestors as their combinators say. A descendant combinator
+// tries every ancestor in turn, not just the nearest that matches.
+recursive fn matches_from(sh: Sheet, d: Doc, r: Rule, k: i32, e: i32) -> bool {
+    guard compound_matches(sh, d, sh.comps[k], e) else { return false; }
+    guard k > r.comp else { return true; }
+    let join = sh.comps[k].join;
+    var at = d.nodes[e].parent;
+    while at >= 0 && d.nodes[at].kind == NODE_ELEMENT {
+        if matches_from(sh, d, r, k - 1, at) { return true; }
+        if join == 2 { return false; }      // a child combinator allows the parent only
+        at = d.nodes[at].parent;
     }
-    return true;
+    return false;
 }
 
 fn compound_matches(sh: Sheet, d: Doc, c: Compound, e: i32) -> bool {
@@ -697,6 +738,13 @@ fn compound_matches(sh: Sheet, d: Doc, c: Compound, e: i32) -> bool {
     }
     if c.first_child == 1 && first_element_child(d, n.parent) != e { return false; }
     if c.last_child == 1 && last_element_child(d, n.parent) != e { return false; }
+    // Tusk keeps no history, and :visited mustn't reveal it anyway.
+    if c.link == 2 { return false; }
+    if c.link == 1 {
+        let name = node_name(d, e);
+        let href, has = attr_value(d, e, "href");
+        guard has && (name == "a" || name == "area") else { return false; }
+    }
     return true;
 }
 
@@ -761,7 +809,9 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style) -> Style {
     let style_attr, has_style = attr_value(d, e, "style");
     if has_style {
         var inline: Decl[>..] = [];
-        parse_declarations(style_attr, inline);
+        var text: u8[>..] = [];
+        without_comments(style_attr, text);
+        parse_declarations(text[..], inline);
         for dc in inline {
             let prio = (dc.important as i64) << 62 | (ORIGIN_INLINE as i64) << 56;
             if prio >= win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
@@ -777,6 +827,9 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style) -> Style {
     }
     let hidden, is_hidden = attr_value(d, e, "hidden");
     if is_hidden { s.display = K_NONE; }
+    // rem counts in the root element's font size, from its children on.
+    let up = d.nodes[e].parent;
+    if up >= 0 && d.nodes[up].kind == NODE_DOCUMENT { s.root_size = s.font_size; }
     return s;
 }
 
@@ -786,13 +839,14 @@ fn inherit(p: Style) -> Style {
     var s = root_style();
     s.color = p.color; s.font_size = p.font_size; s.bold = p.bold; s.italic = p.italic; s.family = p.family;
     s.lh_mult = p.lh_mult; s.lh_px = p.lh_px; s.align = p.align; s.ws = p.ws; s.list = p.list; s.deco = p.deco;
+    s.indent = p.indent; s.root_size = p.root_size;
     s.display = K_INLINE;
     return s;
 }
 
 fn px(dc: Decl, s: Style, parent: Style) -> f32 {
     if dc.unit == U_EM { return dc.num * s.font_size; }
-    if dc.unit == U_REM { return dc.num * 16.0; }
+    if dc.unit == U_REM { return dc.num * s.root_size; }
     if dc.unit == U_PCT { return 0.0; }       // percentages of margins and padding aren't supported yet
     return dc.num;
 }
@@ -806,28 +860,31 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
     }
     let k = dc.num as i32;
     if p == P_DISPLAY { if dc.kind == V_KEYWORD && (k == K_NONE || k == K_BLOCK || k == K_INLINE || k == K_LIST_ITEM) { s.display = k; } }
-    else if p == P_COLOR { s.color = dc.color; }
-    else if p == P_BG { s.bg = dc.color; }
+    else if p == P_COLOR { s.color = if dc.color == CURRENT_COLOR { parent.color } else { dc.color }; }
+    else if p == P_BG { s.bg = if dc.color == CURRENT_COLOR { s.color } else { dc.color }; }
     else if p == P_FONT_SIZE {
         if dc.kind == V_LENGTH {
             s.font_size = if dc.unit == U_EM { dc.num * parent.font_size } else if dc.unit == U_PCT { dc.num / 100.0 * parent.font_size }
-                          else if dc.unit == U_REM { dc.num * 16.0 } else { dc.num };
+                          else if dc.unit == U_REM { dc.num * s.root_size } else { dc.num };
         }
     }
     else if p == P_FONT_WEIGHT { s.bold = if k == K_BOLD { 1 } else { 0 }; }
     else if p == P_FONT_STYLE { s.italic = if k == K_ITALIC { 1 } else { 0 }; }
     else if p == P_FONT_FAMILY { s.family = k; }
     else if p == P_LINE_HEIGHT {
-        if dc.kind == V_NUMBER { s.lh_mult = dc.num; }
+        // A number is inherited as a number; a length or percentage as the
+        // length it comes to here (lh_mult -1).
+        if dc.kind == V_NUMBER { s.lh_mult = max(dc.num, 0.0); }
         else if dc.kind == V_LENGTH {
-            if dc.unit == U_PCT { s.lh_mult = dc.num / 100.0; } else { s.lh_mult = 0.0; s.lh_px = px(dc, s, parent); }
+            s.lh_mult = -1.0;
+            s.lh_px = max(if dc.unit == U_PCT { dc.num / 100.0 * s.font_size } else { px(dc, s, parent) }, 0.0);
         }
     }
     else if p == P_TEXT_ALIGN { if k == K_LEFT || k == K_RIGHT || k == K_CENTER { s.align = k; } }
     else if p == P_WHITE_SPACE { s.ws = k; }
     else if p == P_LIST { s.list = k; }
     else if p == P_DECO { s.deco = k; }
-    else if p == P_VALIGN { s.valign = if k == K_SUPER || k == K_SUB { k } else { K_BASELINE }; }
+    else if p == P_VALIGN { s.valign = if dc.kind == V_KEYWORD && (k == K_SUPER || k == K_SUB) { k } else { K_BASELINE }; }
     else if p >= P_MT && p <= P_ML {
         let auto = dc.kind == V_KEYWORD && k == K_AUTO;
         let v = if dc.kind == V_LENGTH { px(dc, s, parent) } else { 0.0 };
@@ -847,8 +904,8 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
     }
     else if p == P_BT_WIDTH { s.bt = if dc.kind == V_LENGTH { px(dc, s, parent) } else { 0.0 }; }
     else if p == P_BB_WIDTH { s.bb = if dc.kind == V_LENGTH { px(dc, s, parent) } else { 0.0 }; }
-    else if p == P_BT_COLOR { s.bt_color = dc.color; }
-    else if p == P_BB_COLOR { s.bb_color = dc.color; }
+    else if p == P_BT_COLOR { s.bt_color = if dc.color == CURRENT_COLOR { s.color } else { dc.color }; }
+    else if p == P_BB_COLOR { s.bb_color = if dc.color == CURRENT_COLOR { s.color } else { dc.color }; }
     else if p == P_TEXT_INDENT { if dc.kind == V_LENGTH { s.indent = px(dc, s, parent); } }
 }
 
@@ -864,7 +921,7 @@ let UA_CSS = """
     li { display: list-item }
     head, title, style, script, link, meta, base, noscript, template, iframe, object, embed, video, audio, img, svg,
     math, input, button, select, textarea, map, area, canvas, picture, source, track, param { display: none }
-    html { color: #1c1c1c; background-color: #ffffff; font-family: sans-serif; font-size: 17px; line-height: 1.6 }
+    html { color: #1c1c1c; font-family: sans-serif; font-size: 17px; line-height: 1.6 }
     body { max-width: 720px; margin: 0 auto; padding: 40px 32px 120px }
     h1 { font-size: 2em; font-weight: bold; line-height: 1.2; margin: 0.4em 0 0.6em }
     h2 { font-size: 1.45em; font-weight: bold; line-height: 1.25; margin: 1.3em 0 0.5em; padding-bottom: 0.15em;
@@ -903,8 +960,20 @@ let UA_CSS = """
 fn load_sheets(d: Doc, sh: Sheet) {
     var order = parse_sheet(UA_CSS, sh, ORIGIN_UA, 0);
     for n, i in d.nodes {
-        if n.kind == NODE_ELEMENT && n.first >= 0 && node_name(d, i as i32) == "style" {
-            order = parse_sheet(node_text(d, n.first), sh, ORIGIN_AUTHOR, order);
-        }
+        guard n.kind == NODE_ELEMENT && n.first >= 0 && node_name(d, i as i32) == "style" else { continue; }
+        // A sheet for print or speech only isn't for the screen.
+        let media, has = attr_value(d, i as i32, "media");
+        if has && !for_screen(media) { continue; }
+        order = parse_sheet(node_text(d, n.first), sh, ORIGIN_AUTHOR, order);
     }
+}
+
+// Whether a media attribute includes the screen: "screen", "all", or a
+// query that doesn't name another type.
+fn for_screen(media: const u8[:]) -> bool {
+    var m: u8[>..] = [];
+    m.append(media);
+    to_lower(m[..]);
+    let t = trim(m[..]);
+    return t.len == 0 || find(t, "screen") >= 0 || find(t, "all") >= 0 || (find(t, "print") < 0 && find(t, "speech") < 0);
 }
