@@ -1,0 +1,836 @@
+<title>Goose Browser Draft</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600;700&family=Atkinson+Hyperlegible+Next:wght@400;600;700&family=Spline+Sans+Mono:wght@400;500&family=Signika:wght@500;600;700&family=Archivo:wdth,wght@75..100,500..800&family=Martian+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  /* Layout: one reading column for the argument, wide stages for evidence and mocks. */
+  --bg:#f4f5f7; --surface:#ffffff; --surface-2:#eaedf2; --ink:#121419; --ink-2:#4a5161; --ink-3:#646b7b;
+  --rule:#d9dde5; --accent:#2445f2; --on-accent:#ffffff;
+  --crit:#c42f29; --high:#a65900; --med:#7a6300; --low:#5a6272; --ok:#0d7a51;
+  --chart-a:#2445f2; --chart-b:#8d94a3;
+  --f-display:"Familjen Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --f-body:"Atkinson Hyperlegible Next", ui-sans-serif, system-ui, sans-serif;
+  --f-mono:"Spline Sans Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --f-ui:-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#0d0f13; --surface:#15181e; --surface-2:#1d2129; --ink:#eceef3; --ink-2:#a8afbc; --ink-3:#8d95a3;
+  --rule:#282d37; --accent:#8d9dff; --on-accent:#0d0f13;
+  --crit:#ff6b62; --high:#f2a33a; --med:#e1c24a; --low:#a8afbc; --ok:#43c98d;
+  --chart-a:#8d9dff; --chart-b:#5d6575; color-scheme:dark } }
+:root[data-theme="dark"]{
+  --bg:#0d0f13; --surface:#15181e; --surface-2:#1d2129; --ink:#eceef3; --ink-2:#a8afbc; --ink-3:#8d95a3;
+  --rule:#282d37; --accent:#8d9dff; --on-accent:#0d0f13;
+  --crit:#ff6b62; --high:#f2a33a; --med:#e1c24a; --low:#a8afbc; --ok:#43c98d;
+  --chart-a:#8d9dff; --chart-b:#5d6575; color-scheme:dark }
+html{ -webkit-text-size-adjust:100%; scroll-behavior:smooth }
+body{ background:var(--bg); color:var(--ink); font:400 17px/1.62 var(--f-body); font-feature-settings:"kern" }
+::selection{ background:color-mix(in srgb, var(--accent) 26%, transparent) }
+a{ color:var(--accent); text-underline-offset:.2em; text-decoration-thickness:1px }
+a:hover{ text-decoration-thickness:2px }
+:focus-visible{ outline:2px solid var(--accent); outline-offset:3px; border-radius:4px }
+.sprite{ position:absolute; width:0; height:0; overflow:hidden }
+.i{ width:1em; height:1em; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; flex:none }
+.wrap{ max-width:1180px; margin:0 auto; padding-left:max(16px, env(safe-area-inset-left, 0px)); padding-right:max(16px, env(safe-area-inset-right, 0px)) }
+section{ padding-block:96px 0 }
+h1,h2,h3,h4{ font-family:var(--f-display); text-wrap:balance; margin:0; color:var(--ink) }
+h1{ font-size:clamp(38px, 5.6vw, 66px); line-height:1.02; letter-spacing:-.03em; font-weight:700; max-width:15ch }
+h2{ font-size:clamp(28px, 3.3vw, 38px); line-height:1.08; letter-spacing:-.02em; font-weight:650; margin-bottom:18px }
+h3{ font-size:20px; line-height:1.25; letter-spacing:-.01em; font-weight:650 }
+p{ margin:0 0 14px }
+.prose{ max-width:68ch }
+.lede{ font-size:clamp(18px, 2vw, 21px); line-height:1.5; color:var(--ink-2); max-width:60ch; margin-top:22px }
+code{ font-family:var(--f-mono); font-size:.84em; background:var(--surface-2); padding:.1em .38em; border-radius:6px; overflow-wrap:anywhere }
+.num{ font-variant-numeric:tabular-nums }
+
+/* header */
+.top{ padding-block:56px 0 }
+.brandrow{ display:flex; flex-wrap:wrap; align-items:baseline; gap:10px 18px; margin-bottom:44px }
+.word{ font:700 26px/1 var(--f-display); letter-spacing:-.04em }
+.word small{ font:500 13px/1 var(--f-body); letter-spacing:0; color:var(--ink-3); margin-left:8px }
+.meta{ color:var(--ink-3); font-size:15px }
+.settled{ list-style:none; padding:0; margin:30px 0 0; display:flex; flex-wrap:wrap; gap:8px }
+.settled li{ display:inline-flex; align-items:center; gap:8px; padding:8px 14px 8px 11px; border-radius:999px; background:var(--surface); box-shadow:0 1px 2px rgba(10,14,30,.06), 0 0 0 1px var(--rule); font-size:15px }
+.settled li .i{ color:var(--ok); width:16px; height:16px }
+.settled li.open{ background:transparent; box-shadow:inset 0 0 0 1.5px var(--rule); color:var(--ink-2) }
+.settled li.open .i{ color:var(--ink-3) }
+.toc{ display:flex; flex-wrap:wrap; gap:4px 22px; margin-top:34px; font-size:15px }
+.toc a{ color:var(--ink-2); text-decoration:none } .toc a:hover{ color:var(--accent) }
+
+/* review */
+.facts{ display:flex; flex-wrap:wrap; gap:10px 28px; margin:22px 0 34px; padding:0; list-style:none; color:var(--ink-2); font-size:15.5px }
+.facts b{ color:var(--ink); font-family:var(--f-display); font-size:22px; font-weight:650; margin-right:6px; font-variant-numeric:tabular-nums }
+.findings{ list-style:none; margin:0; padding:0; display:grid; gap:26px }
+.find{ display:grid; grid-template-columns:96px minmax(0,1fr); gap:6px 22px }
+.sev{ align-self:start; justify-self:start; font:700 12px/1 var(--f-body); letter-spacing:.06em; text-transform:uppercase; padding:6px 9px; border-radius:6px; margin-top:3px; color:var(--surface); background:var(--low) }
+.crit .sev{ background:var(--crit) } .high .sev{ background:var(--high) } .med .sev{ background:var(--med) }
+.find h3{ margin-bottom:6px }
+.find p{ color:var(--ink-2); margin:0 0 6px; max-width:72ch }
+.ev{ font-size:14.5px; color:var(--ink-3) }
+.tag{ display:inline-block; font:600 12px/1 var(--f-body); color:var(--ink); background:var(--surface-2); padding:4px 7px; border-radius:5px; margin-right:8px; vertical-align:1px }
+.two{ display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:28px 56px; margin-top:52px }
+.two ul{ margin:10px 0 0; padding-left:20px; color:var(--ink-2) } .two li{ margin-bottom:8px }
+.note{ margin-top:30px; padding:16px 18px; background:var(--surface); border-radius:12px; box-shadow:0 0 0 1px var(--rule); color:var(--ink-2); max-width:78ch; font-size:16px }
+.note b{ color:var(--ink) }
+
+/* charts */
+.chart{ margin:34px 0 0; background:var(--surface); border-radius:18px; padding:26px 26px 22px; box-shadow:0 1px 2px rgba(10,14,30,.05), 0 0 0 1px var(--rule) }
+.chart h3{ font-size:17px; margin-bottom:16px }
+.grp + .grp{ margin-top:20px }
+.gl{ font-size:14.5px; color:var(--ink-3); margin-bottom:8px }
+.row{ display:grid; grid-template-columns:120px minmax(0,1fr) 128px; align-items:center; gap:14px; min-height:30px }
+.rl{ font-size:15px } .rv{ font:500 14px/1 var(--f-mono); text-align:right; font-variant-numeric:tabular-nums; color:var(--ink) }
+.track{ position:relative; height:22px; background-image:linear-gradient(to right, var(--rule) 1px, transparent 1px); background-size:calc(200 / 650 * 100%) 100%; background-repeat:repeat-x }
+.bar-min,.bar-rng{ position:absolute; top:3px; bottom:3px; border-radius:4px }
+.bar-min{ left:0 } .bar-rng{ opacity:.38; border-radius:0 4px 4px 0 }
+.a .bar-min,.a .bar-rng{ background:var(--chart-a) } .b .bar-min,.b .bar-rng{ background:var(--chart-b) }
+.axis{ display:grid; grid-template-columns:120px minmax(0,1fr) 128px; gap:14px; margin-top:10px }
+.ticks{ position:relative; height:16px; font:400 12px/1 var(--f-mono); color:var(--ink-3) }
+.ticks span{ position:absolute; transform:translateX(-50%) } .ticks span:first-child{ transform:none }
+.stack{ display:flex; height:30px; border-radius:6px; overflow:hidden }
+.stack i{ display:block; height:100% }
+.stack .pg{ background:var(--chart-a) } .stack .ov{ background:repeating-linear-gradient(135deg, var(--chart-a) 0 3px, color-mix(in srgb, var(--chart-a) 45%, transparent) 3px 7px) }
+.b .stack .pg{ background:var(--chart-b) } .b .stack .ov{ background:repeating-linear-gradient(135deg, var(--chart-b) 0 3px, color-mix(in srgb, var(--chart-b) 45%, transparent) 3px 7px) }
+.legend{ display:flex; flex-wrap:wrap; gap:6px 22px; font-size:14px; color:var(--ink-2); margin-top:8px }
+.legend span{ display:inline-flex; align-items:center; gap:8px }
+.legend i{ width:14px; height:14px; border-radius:3px; display:inline-block }
+.chart figcaption{ margin-top:16px; font-size:14px; color:var(--ink-3) }
+.reads{ display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:22px 36px; margin-top:34px }
+.reads p{ margin:0; color:var(--ink-2) } .reads b{ display:block; color:var(--ink); font-family:var(--f-display); font-size:19px; line-height:1.25; margin-bottom:6px }
+.so{ margin-top:30px; font:600 clamp(20px, 2.4vw, 25px)/1.3 var(--f-display); letter-spacing:-.01em; max-width:40ch }
+.method{ margin-top:18px; font-size:14.5px; color:var(--ink-3); max-width:86ch }
+
+/* recipe */
+.recipe{ list-style:none; padding:0; margin:30px 0 0; display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:30px 48px }
+.recipe h3{ margin-bottom:6px } .recipe p{ color:var(--ink-2); margin:0 }
+.src-l{ font-size:14px; color:var(--ink-3); margin-top:6px !important }
+.side-by{ display:grid; grid-template-columns:minmax(0,1.1fr) minmax(0,1fr); gap:28px; margin-top:52px; align-items:start }
+.ios{ background:var(--ink); color:var(--bg); border-radius:18px; padding:26px 26px 22px }
+.ios h3{ color:var(--bg); margin-bottom:10px } .ios p{ color:color-mix(in srgb, var(--bg) 80%, var(--ink)); margin-bottom:10px; font-size:16px }
+.ios a{ color:inherit }
+.ios .src-l{ color:color-mix(in srgb, var(--bg) 72%, var(--ink)) }
+.when{ list-style:none; padding:0; margin:0; display:grid; gap:12px }
+.when li{ display:grid; grid-template-columns:96px minmax(0,1fr); gap:14px; font-size:15.5px; color:var(--ink-2) }
+.when time{ font:500 13.5px/1.6 var(--f-mono); color:var(--ink); font-variant-numeric:tabular-nums }
+.engines{ width:100%; border-collapse:collapse; font-size:15px; margin-top:6px; min-width:620px }
+.tablewrap{ overflow-x:auto; margin-top:34px }
+.engines th,.engines td{ text-align:left; padding:11px 14px 11px 0; vertical-align:top; border-bottom:1px solid var(--rule) }
+.engines th{ font-weight:600; color:var(--ink-3); font-size:13.5px }
+.engines td:first-child{ font-weight:600; white-space:nowrap }
+.engines tr.pick td{ color:var(--ink) } .engines td{ color:var(--ink-2) }
+.yes{ color:var(--ok); font-weight:700 }
+
+/* design */
+.principles{ list-style:none; padding:0; margin:26px 0 0; display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:22px 30px }
+@media (max-width: 1000px){ .principles{ grid-template-columns:repeat(2, minmax(0,1fr)) } .principles li:first-child{ grid-column:1 / -1 } }
+@media (max-width: 560px){ .principles{ grid-template-columns:minmax(0,1fr) } }
+.principles b{ display:block; font:650 18px/1.25 var(--f-display); margin-bottom:6px }
+.principles p{ margin:0; color:var(--ink-2); font-size:16px }
+.budget{ width:100%; border-collapse:collapse; font-size:15.5px; min-width:640px }
+.budget th,.budget td{ text-align:left; vertical-align:top; padding:13px 18px 13px 0; border-bottom:1px solid var(--rule) }
+.budget th{ font-size:13.5px; color:var(--ink-3); font-weight:600 }
+.budget td:nth-child(2){ font-weight:600; color:var(--ink) } .budget td{ color:var(--ink-2) }
+.flow{ list-style:none; padding:0; margin:30px 0 0; display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:14px }
+.flow li{ background:var(--surface); border-radius:14px; padding:16px 16px 14px; box-shadow:0 0 0 1px var(--rule); position:relative }
+.flow li + li::before{ content:""; position:absolute; left:-12px; top:26px; width:10px; height:2px; background:var(--ink-3) }
+.flow b{ display:block; font:650 17px/1.2 var(--f-display); margin-bottom:6px }
+.flow p{ margin:0; font-size:15px; color:var(--ink-2) } .flow .m{ display:block; margin-top:10px; font:500 13.5px/1.3 var(--f-mono); color:var(--ink) }
+.arch{ display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:10px; margin-top:30px }
+.arch div{ border-radius:14px; padding:15px 18px; background:var(--surface); box-shadow:0 0 0 1px var(--rule) }
+.arch b{ display:block; font:650 16.5px/1.25 var(--f-display) } .arch span{ font-size:15px; color:var(--ink-2) }
+.arch .full{ grid-column:1 / -1 }
+.arch .os{ background:var(--ink); box-shadow:none } .arch .os b{ color:var(--bg) } .arch .os span{ color:color-mix(in srgb, var(--bg) 78%, var(--ink)) }
+.arch .os code{ background:color-mix(in srgb, var(--bg) 16%, transparent); color:inherit }
+.arch .later{ background:transparent; box-shadow:inset 0 0 0 1.5px var(--rule) }
+.arch .core{ box-shadow:inset 0 0 0 1.5px var(--accent) }
+.devmode{ margin-top:46px }
+.devmode ul{ margin:12px 0 0; padding-left:20px; color:var(--ink-2); max-width:76ch } .devmode li{ margin-bottom:7px }
+
+/* directions */
+.dirs-intro{ max-width:72ch; color:var(--ink-2) }
+.dirx{ margin-top:46px; border-radius:30px; padding:34px 34px 30px; background:var(--m-stage); color:var(--m-ink) }
+.dhead{ display:grid; grid-template-columns:auto 1fr; gap:4px 16px; align-items:baseline; margin-bottom:26px }
+.dhead .dl{ grid-row:span 2; font:700 54px/0.9 var(--f-display); color:var(--m-mark); letter-spacing:-.04em }
+.dhead h3{ font-size:30px; color:var(--m-ink); letter-spacing:-.02em }
+.dhead p{ margin:0; color:var(--m-ink2); font-size:18px; max-width:62ch }
+.dgrid{ display:grid; grid-template-columns:minmax(0,1fr) 324px; grid-template-areas:"every phone" "dev spec"; gap:30px 34px; align-items:start }
+.c-every{ grid-area:every } .c-phone{ grid-area:phone } .c-dev{ grid-area:dev } .c-spec{ grid-area:spec }
+@media (max-width: 1240px){ .dgrid{ grid-template-columns:324px minmax(0,1fr); grid-template-areas:"every every" "dev dev" "phone spec" } }
+.cell{ margin:0; min-width:0 }
+.cell figcaption{ margin-top:12px; font-size:14.5px; color:var(--m-ink2) }
+.scroll{ overflow-x:auto; padding:10px 16px 40px; margin:-10px -16px -32px }
+.spec h4{ font:650 13px/1.2 var(--f-body); letter-spacing:.05em; text-transform:uppercase; color:var(--m-ink2); margin:0 0 6px }
+.spec p{ font-size:15.5px; color:var(--m-ink); margin-bottom:18px }
+.chips{ list-style:none; padding:0; margin:0 0 18px; display:grid; gap:7px }
+.chips li{ display:grid; grid-template-columns:26px 1fr; gap:10px; align-items:center; font-size:14.5px }
+.chips .sw{ width:26px; height:26px; border-radius:7px; box-shadow:inset 0 0 0 1px rgba(0,0,0,.14) }
+.chips b{ display:block; font-weight:600 } .chips .hx{ display:block; font:400 12.5px/1.35 var(--f-mono); color:var(--m-ink2) }
+.kept h4{ margin-top:4px } .kept ul{ margin:0; padding-left:18px; font-size:14.5px } .kept li{ margin-bottom:6px }
+.pick{ font-weight:600 }
+.declined{ margin-top:42px }
+.declined ul{ list-style:none; padding:0; margin:14px 0 0; display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:16px 30px }
+.declined b{ display:block; font:650 16px/1.3 var(--f-display) } .declined span{ font-size:15px; color:var(--ink-2) }
+
+/* next */
+.asks{ margin:22px 0 0; padding-left:22px; max-width:76ch } .asks li{ margin-bottom:12px; padding-left:4px } .asks b{ font-family:var(--f-display); font-weight:650 }
+.order{ margin:14px 0 0; padding-left:22px; max-width:76ch; color:var(--ink-2) } .order li{ margin-bottom:8px }
+.sources{ margin:12px 0 0; padding-left:22px; font-size:14.5px; color:var(--ink-3); columns:2 360px; column-gap:40px }
+.sources li{ margin-bottom:6px; break-inside:avoid }
+footer{ padding-block:80px 64px; color:var(--ink-3); font-size:14.5px }
+
+@media (max-width: 980px){
+  .reads{ grid-template-columns:minmax(0,1fr) }
+  .flow{ grid-template-columns:repeat(2, minmax(0,1fr)) } .flow li:nth-child(3)::before{ display:none }
+  .side-by{ grid-template-columns:minmax(0,1fr) }
+}
+@media (max-width: 720px){
+  section{ padding-block:72px 0 }
+  .find{ grid-template-columns:minmax(0,1fr) }
+  .two,.recipe,.arch{ grid-template-columns:minmax(0,1fr) }
+  .row{ grid-template-columns:minmax(0,1fr) auto; grid-template-areas:"l v" "t t"; gap:4px 10px; padding-bottom:8px }
+  .row .rl{ grid-area:l } .row .rv{ grid-area:v } .row .track,.row .stack{ grid-area:t }
+  .axis{ grid-template-columns:minmax(0,1fr) } .axis > span{ display:none }
+  .dirx{ padding:24px 14px 20px; border-radius:22px }
+  .dgrid{ grid-template-columns:minmax(0,1fr); grid-template-areas:"every" "phone" "dev" "spec" }
+  .mac{ min-width:0 }
+  .scroll{ overflow:visible; padding:0; margin:0 }
+  .flow{ grid-template-columns:minmax(0,1fr) } .flow li::before{ display:none }
+  .when li{ grid-template-columns:minmax(0,1fr); gap:2px }
+  .phone{ margin-inline:auto }
+}
+
+/* ---- mocks: sizes are design pixels, scaled with the mock's own width ---- */
+.mac{ container-type:inline-size; width:100%; min-width:680px }
+.win{ position:relative; width:100cqw; height:64cqw; border-radius:1.2cqw; overflow:hidden; display:grid;
+  grid-template-columns:25cqw minmax(0,1fr); background:var(--m-win); color:var(--m-ink); font-family:var(--f-ui);
+  box-shadow:0 2.8cqw 6cqw var(--m-shadow), 0 0.3cqw 1cqw var(--m-shadow2), 0 0 0 0.1cqw var(--m-edge); -webkit-font-smoothing:antialiased }
+.side{ background:var(--m-side); color:var(--m-side-ink); display:flex; flex-direction:column; gap:1.2cqw;
+  padding:1.6cqw 1.2cqw 1.4cqw; min-width:0; box-shadow:inset -0.1cqw 0 0 var(--m-side-rule) }
+.lights{ display:flex; gap:0.8cqw; padding-left:0.6cqw; height:1.4cqw; align-items:center }
+.lights i{ width:1.2cqw; height:1.2cqw; border-radius:50%; background:#ff5f57; box-shadow:inset 0 0 0 0.05cqw rgba(0,0,0,.14) }
+.lights i:nth-child(2){ background:#febc2e } .lights i:nth-child(3){ background:#28c840 }
+.spaces{ display:flex; gap:0.6cqw; padding-left:0.2cqw }
+.space{ font-size:1.2cqw; font-weight:600; line-height:1; padding:0.7cqw 1.1cqw; border-radius:var(--m-r-pill); color:var(--m-side-ink2) }
+.space.on{ background:var(--m-space); color:var(--m-space-ink) }
+.label{ display:flex; justify-content:space-between; padding:0 1cqw 0 0.8cqw; font-size:1.1cqw; font-weight:600; color:var(--m-side-ink2); margin-bottom:-0.6cqw }
+.tabs{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:0.2cqw }
+.tab{ display:grid; grid-template-columns:1.6cqw minmax(0,1fr) auto; align-items:center; column-gap:0.8cqw; height:3.2cqw;
+  padding:0 1cqw 0 0.8cqw; border-radius:var(--m-r); font-size:1.3cqw; color:var(--m-side-ink) }
+.tab .fav{ display:grid; place-items:center; width:1.6cqw; height:1.6cqw; color:var(--m-fav) }
+.tab .fav .i{ width:1.5cqw; height:1.5cqw }
+.tab .t{ overflow:hidden; white-space:nowrap; text-overflow:ellipsis }
+.tab .w{ font-family:var(--m-num); font-variant-numeric:tabular-nums; font-size:1.2cqw; color:var(--m-side-ink2); display:inline-flex; align-items:center; gap:0.4cqw }
+.tab .w .i{ width:1.1cqw; height:1.1cqw }
+.tab.sleep .t,.tab.sleep .fav{ color:var(--m-side-ink2) }
+.tab.on{ background:var(--m-sel); color:var(--m-sel-ink) } .tab.on .w,.tab.on .fav{ color:var(--m-sel-ink) }
+.foot{ margin-top:auto }
+.main{ display:grid; grid-template-rows:5.2cqw minmax(0,1fr); min-width:0; min-height:0; background:var(--m-win) }
+.bar{ display:flex; align-items:center; gap:0.6cqw; padding:0 1.2cqw 0 1cqw; background:var(--m-bar); box-shadow:inset 0 -0.1cqw 0 var(--m-rule); color:var(--m-ink2) }
+.btn{ height:2.8cqw; min-width:2.8cqw; display:inline-flex; align-items:center; justify-content:center; gap:0.6cqw; border-radius:0.7cqw; flex:none; font-size:1.2cqw; font-weight:600 }
+.btn .i{ width:1.6cqw; height:1.6cqw }
+.btn.txt{ padding:0 1cqw }
+.btn.on{ background:var(--m-ink); color:var(--m-win) }
+.addr{ flex:1; min-width:0; height:3.2cqw; border-radius:0.9cqw; background:var(--m-field); display:flex; align-items:center; gap:0.7cqw; padding:0 1.2cqw; font-size:1.3cqw; color:var(--m-ink); margin:0 0.4cqw }
+.addr .lk{ width:1.2cqw; height:1.2cqw; color:var(--m-ink2) }
+.addr .host{ font-weight:600; white-space:nowrap } .addr .path{ color:var(--m-ink2); overflow:hidden; white-space:nowrap; text-overflow:ellipsis }
+.page{ overflow:hidden; background:var(--m-page); color:var(--m-page-ink); min-height:0 }
+.art{ max-width:56cqw; margin:0 auto; padding:4.6cqw 2.4cqw; font-family:ui-serif, "New York", Georgia, serif }
+.art .src,.ph-art .src{ font:500 1.1cqw/1 var(--f-ui); color:var(--m-page-ink2); margin-bottom:1.4cqw }
+.art h4{ font:600 3.8cqw/1.05 ui-serif, "New York", Georgia, serif; letter-spacing:-.015em; margin:0 0 1.6cqw; color:var(--m-page-ink) }
+.art p{ font-size:1.55cqw; line-height:1.62; margin:0 0 1.2cqw }
+.art h5{ font:600 1.9cqw/1.2 ui-serif, "New York", Georgia, serif; margin:2cqw 0 0.8cqw }
+
+/* dev mode */
+.devarea{ display:grid; grid-template-rows:minmax(0,1fr) 20.6cqw; min-height:0; background:var(--m-devbg) }
+.views{ display:grid; grid-template-columns:minmax(0,1fr) 19.6cqw; gap:1.4cqw; padding:1.4cqw 1.4cqw 1.2cqw; min-height:0 }
+.vp{ position:relative; background:var(--m-page); color:var(--m-page-ink); border-radius:0.8cqw; overflow:hidden; box-shadow:0 0 0 0.1cqw var(--m-rule), 0 0.6cqw 1.6cqw var(--m-shadow2); min-height:0 }
+.vp-ph{ border-radius:2cqw }
+.vp .cap{ position:absolute; right:1cqw; top:0.9cqw; font:500 1cqw/1 var(--m-num); font-variant-numeric:tabular-nums; color:var(--m-page-ink2) }
+.site{ padding:2.4cqw 2.6cqw; font-family:var(--f-ui) }
+.site .logo{ font:800 1.4cqw/1 var(--f-ui); letter-spacing:-.03em }
+.site h4{ font:750 3cqw/1.02 var(--f-ui); letter-spacing:-.035em; margin:2.2cqw 0 1cqw; max-width:42cqw; color:var(--m-page-ink) }
+.site p{ font-size:1.25cqw; line-height:1.5; color:var(--m-page-ink2); max-width:33cqw; margin:0 }
+.site .cta{ display:inline-block; margin-top:1.4cqw; padding:0.8cqw 1.4cqw; border-radius:0.8cqw; background:var(--m-page-ink); color:var(--m-page); font-weight:650; font-size:1.2cqw }
+.widget{ margin-top:1.6cqw; display:grid; gap:0.3cqw; padding:1cqw 1.2cqw; border-radius:0.8cqw; background:var(--m-field); font-size:1.2cqw; max-width:33cqw }
+.widget span{ display:inline-flex; align-items:center; gap:0.6cqw; font-weight:600 } .widget .i{ width:1.3cqw; height:1.3cqw; color:var(--m-err) }
+.widget small{ font:400 1.1cqw/1.3 var(--m-num); color:var(--m-page-ink2) }
+.site.sm{ padding:3cqw 1.4cqw 1.4cqw }
+.site.sm h4{ font-size:2.7cqw; white-space:nowrap; margin:1.8cqw 0 0.6cqw; width:max-content; outline:0.15cqw dashed var(--m-err); outline-offset:0.3cqw }
+.site.sm p{ font-size:1.15cqw }
+.flag{ display:inline-block; font:600 1cqw/1.2 var(--f-ui); color:var(--m-err); margin:0.4cqw 0 1cqw }
+.drawer{ display:grid; grid-template-rows:3.6cqw minmax(0,1fr); min-height:0; background:var(--m-win); box-shadow:inset 0 0.1cqw 0 var(--m-rule); font-family:var(--f-ui) }
+.dtabs{ display:flex; align-items:center; gap:0.4cqw; padding:0 1cqw }
+.dtab{ display:inline-flex; align-items:center; gap:0.6cqw; font-size:1.2cqw; font-weight:550; padding:0.5cqw 1cqw; border-radius:0.6cqw; color:var(--m-ink2) }
+.dtab.on{ background:var(--m-field); color:var(--m-ink); font-weight:650 }
+.dtab .n{ font:600 1.05cqw/1 var(--m-num); padding:0.3cqw 0.5cqw; border-radius:0.4cqw; background:var(--m-field); color:var(--m-ink) }
+.dtab .n.bad{ background:var(--m-err); color:var(--m-win) }
+.dtab .i{ width:1.3cqw; height:1.3cqw }
+.dsp{ flex:1 }
+.reqs{ display:grid; grid-template-columns:6.4cqw minmax(0,1fr) 4.6cqw 7.2cqw 7.2cqw; align-content:start; padding:0.2cqw 1.4cqw; font-size:1.2cqw; overflow:hidden }
+.reqs > span{ padding:0.5cqw 0.6cqw 0.5cqw 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; box-shadow:inset 0 -0.1cqw 0 var(--m-rule2); display:flex; align-items:center }
+.reqs .ms,.reqs .sz,.reqs .st{ font-family:var(--m-num); font-variant-numeric:tabular-nums; justify-content:flex-end }
+.reqs .ms{ color:var(--m-ink2); justify-content:flex-start }
+.reqs .knd{ color:var(--m-ink2) }
+.reqs .pth.bad{ font-weight:650 }
+.reqs .st .i{ width:1.2cqw; height:1.2cqw; margin-right:0.4cqw }
+.reqs .st.bad{ color:var(--m-err); font-weight:700 }
+
+/* clock (direction A) */
+.clk{ position:relative; display:inline-block; width:1.3cqw; height:1.3cqw; border-radius:50%; box-shadow:inset 0 0 0 0.13cqw var(--m-clockrim); background:var(--m-clockface); flex:none }
+.clk i{ position:absolute; left:50%; bottom:50%; width:0.16cqw; height:42%; margin-left:-0.08cqw; border-radius:0.1cqw; background:var(--m-live); transform-origin:50% 100% }
+.clk.sleep i{ background:var(--m-sleep) }
+.clk.live i{ animation:stopgo 60s linear infinite }
+@keyframes stopgo{ 0%{ transform:rotate(0deg) } 97.5%{ transform:rotate(360deg) } 100%{ transform:rotate(360deg) } }
+
+/* phone */
+.phone{ width:300px; max-width:100%; padding:12px }
+.ph{ container-type:inline-size }
+.phone .dev{ position:relative; width:100.000cqw; height:216.410cqw; border-radius:13.846cqw; overflow:hidden;
+  background:var(--m-page); color:var(--m-page-ink); font-family:var(--f-ui); -webkit-font-smoothing:antialiased;
+  box-shadow:0 0 0 2.308cqw var(--m-bezel), 0 0 0 2.692cqw var(--m-bezel-edge), 0 7.692cqw 12.821cqw var(--m-shadow) }
+.phone .clk{ box-shadow:inset 0 0 0 0.410cqw var(--m-clockrim) }
+.island{ position:absolute; top:2.821cqw; left:50%; width:31.282cqw; height:8.974cqw; margin-left:-15.641cqw; border-radius:4.615cqw; background:#000; z-index:2 }
+.status{ height:13.846cqw; display:flex; align-items:center; justify-content:space-between; padding:1.026cqw 7.692cqw 0 12.308cqw; font:650 4.103cqw/1 var(--f-ui) }
+.sicons{ display:flex; align-items:center; gap:1.538cqw } .sicons svg{ fill:currentColor }
+.sig{ width:4.615cqw; height:3.077cqw } .sicons .wf{ width:4.359cqw; height:4.359cqw; fill:none }
+.bat{ width:6.923cqw; height:3.333cqw } .bat rect:first-child{ fill:none; stroke:currentColor; opacity:.45 } .bat .lvl{ fill:currentColor }
+.handoff{ display:flex; align-items:center; gap:2.051cqw; margin:1.538cqw 3.590cqw 0; padding:2.564cqw 3.077cqw; border-radius:4.103cqw; background:var(--m-chip); font-size:3.462cqw; color:var(--m-page-ink) }
+.handoff .i{ width:4.359cqw; height:4.359cqw; color:var(--m-page-ink2) }
+.handoff b{ font-weight:650; white-space:nowrap; overflow:hidden; text-overflow:ellipsis } .handoff span{ white-space:nowrap }
+.handoff .go{ margin-left:auto; font-weight:650; color:var(--m-link) }
+.handoff .clk{ width:3.846cqw; height:3.846cqw } .handoff .clk i{ width:0.462cqw; margin-left:-0.231cqw }
+.ph-art{ padding:5.128cqw 5.641cqw; font-family:ui-serif, "New York", Georgia, serif }
+.ph-art .src{ font-size:3.077cqw; margin-bottom:3.077cqw }
+.ph-art h4{ font:600 8.718cqw/1.05 ui-serif, "New York", Georgia, serif; margin:0 0 3.077cqw; color:var(--m-page-ink) }
+.ph-art p{ font-size:4.359cqw; line-height:1.55; margin:0 0 3.077cqw }
+.ph-art h5{ font:600 5.385cqw/1.2 ui-serif, "New York", Georgia, serif; margin:4.103cqw 0 2.051cqw }
+.phbar{ position:absolute; left:3.590cqw; right:3.590cqw; bottom:7.179cqw; height:14.359cqw; border-radius:7.179cqw; display:flex; align-items:center; gap:1.026cqw; padding:0 2.051cqw;
+  background:var(--m-phbar); color:var(--m-ink); -webkit-backdrop-filter:blur(4.615cqw) saturate(1.6); backdrop-filter:blur(4.615cqw) saturate(1.6);
+  box-shadow:0 2.051cqw 6.154cqw var(--m-shadow2), 0 0 0 0.256cqw var(--m-edge); z-index:3 }
+.pb{ width:10.256cqw; height:10.256cqw; display:grid; place-items:center; flex:none } .pb .i{ width:5.385cqw; height:5.385cqw }
+.pill{ flex:1; min-width:0; height:10.256cqw; border-radius:5.128cqw; background:var(--m-field); display:flex; align-items:center; justify-content:center; gap:1.795cqw; padding:0 3.077cqw; font-size:3.846cqw }
+.pill .host{ font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+.pill .w{ font:600 3.077cqw/1 var(--m-num); font-variant-numeric:tabular-nums; color:var(--m-ink2) }
+.pill .clk{ width:3.846cqw; height:3.846cqw } .pill .clk i{ width:0.462cqw; margin-left:-0.231cqw }
+.home{ position:absolute; bottom:2.051cqw; left:50%; width:34.359cqw; height:1.282cqw; margin-left:-17.179cqw; border-radius:0.769cqw; background:var(--m-page-ink); opacity:.8; z-index:3 }
+
+@media (prefers-reduced-motion: reduce){ .clk.live i{ animation:none; transform:rotate(132deg) } }
+.dir-a{
+  --m-stage:#e7e7e4; --m-mark:#eb0000; --m-ink:#0f0f0f; --m-ink2:#565654;
+  --m-win:#ffffff; --m-side:#f4f4f2; --m-side-ink:#141414; --m-side-ink2:#6b6b68; --m-side-rule:#e2e2df;
+  --m-bar:#ffffff; --m-field:#efefec; --m-rule:#e4e4e1; --m-rule2:#efefec; --m-edge:rgba(0,0,0,.10);
+  --m-shadow:rgba(20,20,18,.20); --m-shadow2:rgba(20,20,18,.08);
+  --m-live:#eb0000; --m-sleep:#a3a3a0; --m-clockface:#ffffff; --m-clockrim:#141414;
+  --m-sel:#ffde00; --m-sel-ink:#111111; --m-space:#1d2a6e; --m-space-ink:#ffffff; --m-fav:#141414;
+  --m-page:#ffffff; --m-page-ink:#191919; --m-page-ink2:#686866; --m-devbg:#f1f1ef; --m-err:#111111;
+  --m-chip:#f1f1ef; --m-link:#1d2a6e; --m-phbar:rgba(255,255,255,.86); --m-bezel:#0f0f0f; --m-bezel-edge:#3a3a3a;
+  --m-r:4px; --m-r-pill:4px; --m-num:var(--f-ui);}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]) .dir-a{
+  --m-stage:#0a0a0a; --m-mark:#ff3030; --m-ink:#f2f2f0; --m-ink2:#a5a5a2;
+  --m-win:#141414; --m-side:#0d0d0d; --m-side-ink:#efefed; --m-side-ink2:#8f8f8c; --m-side-rule:#232323;
+  --m-bar:#141414; --m-field:#222221; --m-rule:#262626; --m-rule2:#1d1d1d; --m-edge:rgba(255,255,255,.10);
+  --m-shadow:rgba(0,0,0,.6); --m-shadow2:rgba(0,0,0,.35);
+  --m-live:#ff3030; --m-sleep:#5e5e5c; --m-clockface:#141414; --m-clockrim:#e9e9e7;
+  --m-sel:#ffde00; --m-sel-ink:#111111; --m-space:#2c3c9e; --m-space-ink:#ffffff; --m-fav:#efefed;
+  --m-page:#171717; --m-page-ink:#ececea; --m-page-ink2:#9a9a97; --m-devbg:#0f0f0f; --m-err:#f2f2f0;
+  --m-chip:#232322; --m-link:#8fa2ff; --m-phbar:rgba(30,30,30,.86); --m-bezel:#000000; --m-bezel-edge:#3a3a3a;} }
+:root[data-theme="dark"] .dir-a{
+  --m-stage:#0a0a0a; --m-mark:#ff3030; --m-ink:#f2f2f0; --m-ink2:#a5a5a2;
+  --m-win:#141414; --m-side:#0d0d0d; --m-side-ink:#efefed; --m-side-ink2:#8f8f8c; --m-side-rule:#232323;
+  --m-bar:#141414; --m-field:#222221; --m-rule:#262626; --m-rule2:#1d1d1d; --m-edge:rgba(255,255,255,.10);
+  --m-shadow:rgba(0,0,0,.6); --m-shadow2:rgba(0,0,0,.35);
+  --m-live:#ff3030; --m-sleep:#5e5e5c; --m-clockface:#141414; --m-clockrim:#e9e9e7;
+  --m-sel:#ffde00; --m-sel-ink:#111111; --m-space:#2c3c9e; --m-space-ink:#ffffff; --m-fav:#efefed;
+  --m-page:#171717; --m-page-ink:#ececea; --m-page-ink2:#9a9a97; --m-devbg:#0f0f0f; --m-err:#f2f2f0;
+  --m-chip:#232322; --m-link:#8fa2ff; --m-phbar:rgba(30,30,30,.86); --m-bezel:#000000; --m-bezel-edge:#3a3a3a;}
+.dir-b{
+  --m-stage:#e6e6e6; --m-mark:#0b0b0b; --m-ink:#0b0b0b; --m-ink2:#4f4f4f;
+  --m-win:#ffffff; --m-side:#1a1a1a; --m-side-ink:#ffffff; --m-side-ink2:#9c9c9c; --m-side-rule:#000000;
+  --m-bar:#ffcc00; --m-band:#ffcc00; --m-band-ink:#0b0b0b; --m-field:#f0f0f0; --m-rule:#e2e2e2; --m-rule2:#eeeeee; --m-edge:rgba(0,0,0,.14);
+  --m-shadow:rgba(0,0,0,.22); --m-shadow2:rgba(0,0,0,.09);
+  --m-live:#ffcc00; --m-sleep:#6f6f6f; --m-sel:#ffcc00; --m-sel-ink:#0b0b0b; --m-space:#ffcc00; --m-space-ink:#0b0b0b; --m-fav:#ffffff;
+  --m-page:#ffffff; --m-page-ink:#141414; --m-page-ink2:#666666; --m-devbg:#f2f2f2; --m-err:#d81e05;
+  --m-chip:#f2f2f2; --m-link:#0b0b0b; --m-phbar:#ffcc00; --m-bezel:#0b0b0b; --m-bezel-edge:#333333;
+  --m-r:3px; --m-r-pill:3px; --m-num:"Signika", var(--f-ui);}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]) .dir-b{
+  --m-stage:#050505; --m-mark:#ffcc00; --m-ink:#f5f5f5; --m-ink2:#acacac;
+  --m-win:#0f0f0f; --m-side:#000000; --m-side-ink:#ffffff; --m-side-ink2:#8a8a8a; --m-side-rule:#1f1f1f;
+  --m-bar:#ffcc00; --m-band:#ffcc00; --m-band-ink:#0b0b0b; --m-field:#1d1d1d; --m-rule:#262626; --m-rule2:#1a1a1a; --m-edge:rgba(255,255,255,.12);
+  --m-shadow:rgba(0,0,0,.6); --m-shadow2:rgba(0,0,0,.35);
+  --m-page:#151515; --m-page-ink:#ececec; --m-page-ink2:#9d9d9d; --m-devbg:#0a0a0a; --m-err:#ff5a45;
+  --m-chip:#1f1f1f; --m-link:#ffcc00; --m-bezel:#000000; --m-bezel-edge:#3a3a3a;} }
+:root[data-theme="dark"] .dir-b{
+  --m-stage:#050505; --m-mark:#ffcc00; --m-ink:#f5f5f5; --m-ink2:#acacac;
+  --m-win:#0f0f0f; --m-side:#000000; --m-side-ink:#ffffff; --m-side-ink2:#8a8a8a; --m-side-rule:#1f1f1f;
+  --m-bar:#ffcc00; --m-band:#ffcc00; --m-band-ink:#0b0b0b; --m-field:#1d1d1d; --m-rule:#262626; --m-rule2:#1a1a1a; --m-edge:rgba(255,255,255,.12);
+  --m-shadow:rgba(0,0,0,.6); --m-shadow2:rgba(0,0,0,.35);
+  --m-page:#151515; --m-page-ink:#ececec; --m-page-ink2:#9d9d9d; --m-devbg:#0a0a0a; --m-err:#ff5a45;
+  --m-chip:#1f1f1f; --m-link:#ffcc00; --m-bezel:#000000; --m-bezel-edge:#3a3a3a;}
+.dir-c{
+  --m-stage:#e9f0ee; --m-mark:#ff5a1f; --m-ink:#101418; --m-ink2:#4f5b64;
+  --m-win:#fbfcfc; --m-side:rgba(242,247,246,.58); --m-side-ink:#101418; --m-side-ink2:#5d6870; --m-side-rule:rgba(16,20,24,.08);
+  --m-bar:#fbfcfc; --m-field:rgba(16,20,24,.055); --m-rule:rgba(16,20,24,.09); --m-rule2:rgba(16,20,24,.05); --m-edge:rgba(16,20,24,.12);
+  --m-shadow:rgba(13,40,44,.24); --m-shadow2:rgba(13,40,44,.09);
+  --m-live:#ff5a1f; --m-sleep:#0796b8; --m-sel:rgba(255,90,31,.14); --m-sel-ink:#101418; --m-space:#101418; --m-space-ink:#ffffff; --m-fav:#101418;
+  --m-page:#ffffff; --m-page-ink:#14181c; --m-page-ink2:#64707a; --m-devbg:#f1f5f4; --m-err:#d92d20;
+  --m-chip:rgba(16,20,24,.055); --m-link:#e2480f; --m-phbar:rgba(250,252,252,.72); --m-bezel:#101418; --m-bezel-edge:#3c4650;
+  --m-r:8px; --m-r-pill:999px; --m-num:"Martian Mono", var(--f-mono);}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]) .dir-c{
+  --m-stage:#0b1113; --m-mark:#ff6a33; --m-ink:#eef3f3; --m-ink2:#9babb1;
+  --m-win:#13181b; --m-side:rgba(20,28,31,.6); --m-side-ink:#eef3f3; --m-side-ink2:#91a0a6; --m-side-rule:rgba(255,255,255,.07);
+  --m-bar:#13181b; --m-field:rgba(255,255,255,.07); --m-rule:rgba(255,255,255,.08); --m-rule2:rgba(255,255,255,.05); --m-edge:rgba(255,255,255,.12);
+  --m-shadow:rgba(0,0,0,.6); --m-shadow2:rgba(0,0,0,.35);
+  --m-live:#ff6a33; --m-sleep:#2cc5e6; --m-sel:rgba(255,106,51,.18); --m-sel-ink:#ffffff; --m-space:#eef3f3; --m-space-ink:#101418; --m-fav:#eef3f3;
+  --m-page:#121719; --m-page-ink:#e6ebec; --m-page-ink2:#93a1a7; --m-devbg:#0e1315; --m-err:#ff6b5e;
+  --m-chip:rgba(255,255,255,.07); --m-link:#ff8a5c; --m-phbar:rgba(24,32,35,.72); --m-bezel:#000000; --m-bezel-edge:#3c4650;} }
+:root[data-theme="dark"] .dir-c{
+  --m-stage:#0b1113; --m-mark:#ff6a33; --m-ink:#eef3f3; --m-ink2:#9babb1;
+  --m-win:#13181b; --m-side:rgba(20,28,31,.6); --m-side-ink:#eef3f3; --m-side-ink2:#91a0a6; --m-side-rule:rgba(255,255,255,.07);
+  --m-bar:#13181b; --m-field:rgba(255,255,255,.07); --m-rule:rgba(255,255,255,.08); --m-rule2:rgba(255,255,255,.05); --m-edge:rgba(255,255,255,.12);
+  --m-shadow:rgba(0,0,0,.6); --m-shadow2:rgba(0,0,0,.35);
+  --m-live:#ff6a33; --m-sleep:#2cc5e6; --m-sel:rgba(255,106,51,.18); --m-sel-ink:#ffffff; --m-space:#eef3f3; --m-space-ink:#101418; --m-fav:#eef3f3;
+  --m-page:#121719; --m-page-ink:#e6ebec; --m-page-ink2:#93a1a7; --m-devbg:#0e1315; --m-err:#ff6b5e;
+  --m-chip:rgba(255,255,255,.07); --m-link:#ff8a5c; --m-phbar:rgba(24,32,35,.72); --m-bezel:#000000; --m-bezel-edge:#3c4650;}
+.dir-c{ --m-wall:url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1000 640' preserveAspectRatio='xMidYMid slice'><path d='M-40 120C80 60 190 110 300 70S520 10 640 80 860 150 1040 90M-40 200C90 140 210 190 320 150S540 90 660 160 880 230 1040 170M-40 280C100 220 230 270 340 230S560 170 680 240 900 310 1040 250M-40 470C120 420 250 470 380 430S600 380 720 440 920 500 1040 450M-40 550C130 500 260 560 390 520S610 460 740 530 930 590 1040 540M560 300c60-40 150-30 170 20s-40 90-110 80-120-60-60-100ZM590 310c40-20 100-15 110 15s-30 55-75 50-75-40-35-65Z' fill='none' stroke='%23b7c9c5' stroke-width='1.6'/></svg>") }
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]) .dir-c{ --m-wall:url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1000 640' preserveAspectRatio='xMidYMid slice'><path d='M-40 120C80 60 190 110 300 70S520 10 640 80 860 150 1040 90M-40 200C90 140 210 190 320 150S540 90 660 160 880 230 1040 170M-40 280C100 220 230 270 340 230S560 170 680 240 900 310 1040 250M-40 470C120 420 250 470 380 430S600 380 720 440 920 500 1040 450M-40 550C130 500 260 560 390 520S610 460 740 530 930 590 1040 540M560 300c60-40 150-30 170 20s-40 90-110 80-120-60-60-100ZM590 310c40-20 100-15 110 15s-30 55-75 50-75-40-35-65Z' fill='none' stroke='%2322363a' stroke-width='1.6'/></svg>") } }
+:root[data-theme="dark"] .dir-c{ --m-wall:url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1000 640' preserveAspectRatio='xMidYMid slice'><path d='M-40 120C80 60 190 110 300 70S520 10 640 80 860 150 1040 90M-40 200C90 140 210 190 320 150S540 90 660 160 880 230 1040 170M-40 280C100 220 230 270 340 230S560 170 680 240 900 310 1040 250M-40 470C120 420 250 470 380 430S600 380 720 440 920 500 1040 450M-40 550C130 500 260 560 390 520S610 460 740 530 930 590 1040 540M560 300c60-40 150-30 170 20s-40 90-110 80-120-60-60-100ZM590 310c40-20 100-15 110 15s-30 55-75 50-75-40-35-65Z' fill='none' stroke='%2322363a' stroke-width='1.6'/></svg>") }
+.dir-c{ background:var(--m-wall) center top / 1400px 896px no-repeat, var(--m-stage) }
+/* A: every tab row leads with its clock */
+.dir-a .tab{ grid-template-columns:1.3cqw 1.6cqw minmax(0,1fr) auto }
+/* A: timetable footer */
+.dir-a .tt{ display:grid; gap:0.2cqw; padding:1cqw 0.8cqw 0; box-shadow:inset 0 0.1cqw 0 var(--m-side-rule) }
+.dir-a .tt-r{ display:grid; grid-template-columns:1.3cqw minmax(0,1fr) auto; gap:0.8cqw; align-items:center; font-size:1.2cqw; color:var(--m-side-ink2); height:2.2cqw }
+.dir-a .tt-r b{ font-weight:600; color:var(--m-side-ink); font-variant-numeric:tabular-nums }
+.dir-a .tt-r.tot{ color:var(--m-side-ink); font-weight:650; margin-top:0.4cqw } .dir-a .tt-r.tot b{ font-weight:750 }
+.dir-a .addr .clk{ margin-right:0.2cqw }
+.dir-a .space{ font-weight:700 }
+
+/* B: the sign band */
+.dir-b .side{ box-shadow:none }
+.dir-b .tab{ font-weight:500 } .dir-b .tab.on{ font-weight:700 }
+.dir-b .tab .w.zz{ font:600 1cqw/1 var(--f-ui); letter-spacing:.06em; text-transform:uppercase }
+.dir-b .space{ font-family:"Signika", var(--f-ui); font-size:1.3cqw; color:var(--m-side-ink2) }
+.dir-b .bfoot{ display:flex; justify-content:space-between; align-items:baseline; padding:1cqw 0.8cqw 0; box-shadow:inset 0 0.1cqw 0 #333; font-size:1.2cqw; color:var(--m-side-ink2) }
+.dir-b .bfoot b{ font:600 1.6cqw/1 "Signika", var(--f-ui); color:var(--m-side-ink); font-variant-numeric:tabular-nums }
+.dir-b .band{ background:var(--m-band); color:var(--m-band-ink); box-shadow:none; gap:0.8cqw }
+.dir-b .band .btn{ color:var(--m-band-ink) }
+.dir-b .pict{ width:3.4cqw; height:3.4cqw; background:#0b0b0b; color:#fff; display:grid; place-items:center; border-radius:0.3cqw; flex:none }
+.dir-b .pict .i{ width:1.9cqw; height:1.9cqw }
+.dir-b .dest{ flex:1; min-width:0; display:flex; align-items:baseline; gap:0.8cqw; font-family:"Signika", var(--f-ui); white-space:nowrap; overflow:hidden }
+.dir-b .dest b{ font-size:2.1cqw; font-weight:650; letter-spacing:-.01em } .dir-b .dest small{ font-size:1.4cqw; font-weight:500; overflow:hidden; text-overflow:ellipsis }
+.dir-b .moves{ display:flex; gap:1cqw; flex:none }
+.dir-b .mv{ display:inline-flex; align-items:center; gap:0.6cqw; font:600 1.2cqw/1 "Signika", var(--f-ui) }
+.dir-b .mv .sq{ width:2.4cqw; height:2.4cqw; background:#0b0b0b; color:#fff; display:grid; place-items:center; border-radius:0.2cqw }
+.dir-b .mv .sq .i{ width:1.4cqw; height:1.4cqw }
+.dir-b .mv.on .sq{ background:#fff; color:#0b0b0b; box-shadow:inset 0 0 0 0.2cqw #0b0b0b }
+.dir-b .phbar{ background:var(--m-band); color:var(--m-band-ink); -webkit-backdrop-filter:none; backdrop-filter:none; gap:2.564cqw; padding:0 2.051cqw; border-radius:2.564cqw }
+.dir-b .phbar .pict{ width:10.256cqw; height:10.256cqw; border-radius:1.026cqw } .dir-b .phbar .pict .i{ width:5.641cqw; height:5.641cqw }
+.dir-b .phbar .dest{ flex-direction:column; align-items:flex-start; gap:0.513cqw }
+.dir-b .phbar .dest b{ font-size:4.872cqw } .dir-b .phbar .dest small{ font-size:3.205cqw }
+.dir-b .phbar .sq.n{ width:10.256cqw; height:10.256cqw; background:#0b0b0b; color:#fff; display:grid; place-items:center; border-radius:1.026cqw; font:650 4.359cqw/1 "Signika", var(--f-ui) }
+.dir-b .handoff{ border-radius:1.538cqw }
+.dir-b .drawer .dtab.on{ background:var(--m-band); color:var(--m-band-ink) }
+
+/* C: the pack */
+.dir-c .win{ background:transparent }
+.dir-c .side{ -webkit-backdrop-filter:blur(2.6cqw) saturate(1.7); backdrop-filter:blur(2.6cqw) saturate(1.7) }
+.dir-c .space{ font:650 1.1cqw/1 "Archivo", var(--f-ui); font-stretch:87%; letter-spacing:.05em; text-transform:uppercase; padding:0.7cqw 1cqw }
+.dir-c .label{ font:650 1cqw/1 "Archivo", var(--f-ui); font-stretch:87%; letter-spacing:.07em; text-transform:uppercase }
+.dir-c .tab .w{ font-size:1.1cqw }
+.dir-c .tab .w.zz,.dir-c .zz{ color:var(--m-sleep) }
+.dir-c .tab.on .w{ color:var(--m-live); font-weight:600 }
+.pack{ padding:1.2cqw 1cqw 1.2cqw; border-radius:1.2cqw; background:var(--m-field); box-shadow:inset 0 0 0 0.1cqw var(--m-rule) }
+.pk-h{ display:flex; justify-content:space-between; align-items:baseline }
+.pk-l{ font:700 1.1cqw/1 "Archivo", var(--f-ui); font-stretch:87%; letter-spacing:.08em; text-transform:uppercase; color:var(--m-side-ink2) }
+.pk-n{ font:500 2cqw/1 "Martian Mono", var(--f-mono); letter-spacing:-.02em; color:var(--m-side-ink) } .pk-n small{ font-size:1.1cqw; color:var(--m-side-ink2) }
+.pk-bar{ display:flex; gap:0.2cqw; height:1cqw; margin:1cqw 0 0.8cqw; border-radius:0.3cqw; overflow:hidden; background:var(--m-rule) }
+.pk-bar i{ display:block; height:100%; background:var(--m-live) }
+.pk-bar i:nth-child(2){ opacity:.78 } .pk-bar i:nth-child(3){ opacity:.58 } .pk-bar i.p2{ background:var(--m-live); opacity:.4 }
+.pk-bar i.s{ background:var(--m-side-ink2); opacity:.45 }
+.pk-k{ display:flex; flex-direction:column; gap:0.4cqw; font:500 1.05cqw/1.3 "Martian Mono", var(--f-mono); color:var(--m-side-ink2) }
+.pk-k .zz{ display:inline-flex; align-items:center; gap:0.5cqw } .pk-k .i{ width:1.1cqw; height:1.1cqw }
+.dir-c .addr{ background:var(--m-field) }
+.dir-c .btn.on{ background:var(--m-live); color:#101418 }
+.dir-c .phbar .pkm{ display:flex; flex-direction:column; justify-content:center; gap:1.026cqw; width:16.410cqw; flex:none; padding:0 1.026cqw }
+.dir-c .phbar .pkm b{ font:500 3.333cqw/1 "Martian Mono", var(--f-mono); color:var(--m-ink) }
+.dir-c .phbar .pkm i{ display:block; height:1.282cqw; border-radius:0.769cqw; background:var(--m-live) }
+</style>
+<svg class="sprite" aria-hidden="true"><symbol id="i-chev-l" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol><symbol id="i-chev-r" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol><symbol id="i-reload" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></symbol><symbol id="i-lock" viewBox="0 0 24 24"><rect width="16" height="11" x="4" y="11" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol><symbol id="i-share" viewBox="0 0 24 24"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><path d="m16 6-4-4-4 4"/><path d="M12 2v13"/></symbol><symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol><symbol id="i-side" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></symbol><symbol id="i-code" viewBox="0 0 24 24"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></symbol><symbol id="i-phone" viewBox="0 0 24 24"><rect width="12" height="20" x="6" y="2" rx="2.5"/><path d="M11 18h2"/></symbol><symbol id="i-dots" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol><symbol id="i-tabs" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2"/></symbol><symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></symbol><symbol id="i-book" viewBox="0 0 24 24"><path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></symbol><symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></symbol><symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol><symbol id="i-cols" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/></symbol><symbol id="i-term" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></symbol><symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol><symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol><symbol id="i-laptop" viewBox="0 0 24 24"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></symbol><symbol id="i-wifi" viewBox="0 0 24 24"><path d="M12 20h.01"/><path d="M2 8.82a15 15 0 0 1 20 0"/><path d="M5 12.86a10 10 0 0 1 14 0"/><path d="M8.5 16.43a5 5 0 0 1 7 0"/></symbol><symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol><symbol id="i-gh" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></symbol><symbol id="i-mdn" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="m21.538 1.1-6.745 21.8h-2.77L18.77 1.1ZM24 1.1v21.8h-2.462V1.1Zm-12 0v21.8H9.538V1.1Zm-2.462 0L2.77 22.9H0L6.746 1.1Z"/></symbol><symbol id="i-wiki" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12.09 13.119c-.936 1.932-2.217 4.548-2.853 5.728-.616 1.074-1.127.931-1.532.029-1.406-3.321-4.293-9.144-5.651-12.409-.251-.601-.441-.987-.619-1.139-.181-.15-.554-.24-1.122-.271C.103 5.033 0 4.982 0 4.898v-.455l.052-.045c.924-.005 5.401 0 5.401 0l.051.045v.434c0 .119-.075.176-.225.176l-.564.031c-.485.029-.727.164-.727.436 0 .135.053.33.166.601 1.082 2.646 4.818 10.521 4.818 10.521l.136.046 2.411-4.81-.482-1.067-1.658-3.264s-.318-.654-.428-.872c-.728-1.443-.712-1.518-1.447-1.617-.207-.023-.313-.05-.313-.149v-.468l.06-.045h4.292l.113.037v.451c0 .105-.076.15-.227.15l-.308.047c-.792.061-.661.381-.136 1.422l1.582 3.252 1.758-3.504c.293-.64.233-.801.111-.947-.07-.084-.305-.22-.812-.24l-.201-.021c-.052 0-.098-.015-.145-.051-.045-.031-.067-.076-.067-.129v-.427l.061-.045c1.247-.008 4.043 0 4.043 0l.059.045v.436c0 .121-.059.178-.193.178-.646.03-.782.095-1.023.439-.12.186-.375.589-.646 1.039l-2.301 4.273-.065.135 2.792 5.712.17.048 4.396-10.438c.154-.422.129-.722-.064-.895-.197-.172-.346-.273-.857-.295l-.42-.016c-.061 0-.105-.014-.152-.045-.043-.029-.072-.075-.072-.119v-.436l.059-.045h4.961l.041.045v.437c0 .119-.074.18-.209.18-.648.03-1.127.18-1.443.421-.314.255-.557.616-.736 1.067 0 0-4.043 9.258-5.426 12.339-.525 1.007-1.053.917-1.503-.031-.571-1.171-1.773-3.786-2.646-5.71l.053-.036z"/></symbol></svg>
+<header class="wrap top">
+  <div class="brandrow"><span class="word">goose<small>working name</small></span>
+    <span class="meta">Design draft 1 · 29 Oct 2026 · for Vlad and Gleb</span></div>
+  <h1>Smooth, light, and on an engine we own</h1>
+  <p class="lede">A private browser for the two of us: our own engine in Goose, with Rust for everything Goose lacks.
+  It shows what each tab weighs, puts idle tabs to sleep, and opens a developer workbench with a project. This draft
+  covers where the repo stands, what a browser weighs on your Mac, what the best browsers do in 2026, how our engine
+  will work, and three directions for the interface.</p>
+  <ul class="settled">
+    <li><svg class="i " aria-hidden="true"><use href="#i-check"/></svg>Our own engine: Goose and Rust</li>
+    <li><svg class="i " aria-hidden="true"><use href="#i-check"/></svg>Private, not distributed</li>
+    <li><svg class="i " aria-hidden="true"><use href="#i-check"/></svg>Apple silicon: Mac, then iPhone</li>
+    <li><svg class="i " aria-hidden="true"><use href="#i-check"/></svg>Smooth first</li>
+    <li class="open"><svg class="i " aria-hidden="true"><use href="#i-dots"/></svg>JavaScript engine, interface, name: open</li>
+  </ul>
+  <nav class="toc" aria-label="Sections"><a href="#repo">The repo today</a><a href="#weight">What a browser weighs</a>
+    <a href="#recipe">What the best do</a><a href="#design">How our engine works</a><a href="#directions">Three directions</a>
+    <a href="#next">What I need from you</a></nav>
+</header>
+
+<main>
+<section id="repo" class="wrap">
+  <h2>The repo today</h2>
+  <div class="prose"><p>goose-mini-browser is a one-day learning demo. A window written in Goose scans a little HTML, and
+  a small Rust library fetches pages over HTTP and HTTPS. The code is tidy and the README is honest about its limits. It
+  proves Goose can open a window and fetch a page. For the engine we're building, nearly every part gets replaced: the
+  scanner by a spec HTML parser, the Nuklear window by a Rust platform layer and GPU compositor, the fetch shim by a Rust
+  network stack. The bugs below become the rules for that rebuild.</p></div>
+  <ul class="facts"><li><b>1</b>commit, 29 Oct 2026</li><li><b>474</b>lines of Goose</li>
+    <li><b>258</b>lines of Rust</li><li><b>0</b>tests, no CI</li><li><b>MIT</b>licence</li></ul>
+  <ol class="findings"><li class="find crit"><span class="sev">Critical</span><div><h3>Any website can crash it</h3><p>A chunk-size line of <code>ffffffffffffffff</code> makes the Rust shim panic in <code>dechunk</code> (<code>goosenet/src/lib.rs:166</code>). The panic crosses the <code>extern "C"</code> boundary, and that aborts the whole browser.</p><p class="ev"><span class="tag">Reproduced</span>A local server sent that one response; the calling process exited with code 134.</p></div></li><li class="find crit"><span class="sev">Critical</span><div><h3>A link longer than 200 bytes crashes it</h3><p>Every URL lives in a <code>u8[..200]</code> buffer, and Goose aborts when a bounded array overflows. Long links are everyday: search results, tracking links, shop pages.</p><p class="ev"><span class="tag">Language docs</span>Goose reference, section 5.3: exceeding the capacity aborts. Not run, because the Goose build was blocked.</p></div></li><li class="find high"><span class="sev">High</span><div><h3>Most real links go to the wrong address</h3><p><code>resolve()</code> only joins a link to the current folder. On MDN, <code>/en-US/docs/Web/CSS</code> becomes <code>…/docs//en-US/docs/Web/CSS</code>; on <code>https://example.com</code>, <code>about.html</code> becomes the host <code>about.html</code>. Anchors, <code>//cdn</code> links and <code>mailto:</code> turn into page loads.</p><p class="ev"><span class="tag">Ran a port</span>A line-for-line port of the function got five of seven common link types wrong.</p></div></li><li class="find high"><span class="sev">High</span><div><h3>Redirects lose the page's address</h3><p>The shim follows redirects but hands back only the status and body, so links on a redirected page resolve against the address you typed.</p><p class="ev"><span class="tag">Code</span><code>goosenet_fetch</code> has no output for the final URL (<code>lib.rs:29</code>).</p></div></li><li class="find high"><span class="sev">High</span><div><h3>One dead link freezes navigation for 75 seconds</h3><p>All fetches share one worker and one queue, the connect has no timeout, and quitting waits for the worker.</p><p class="ev"><span class="tag">Measured</span>75.0 s to an unreachable address, the macOS connect timeout.</p></div></li><li class="find med"><span class="sev">Medium</span><div><h3>Paragraphs are cut to one line</h3><p>Wrapped text sits in fixed 20-pixel rows, so a paragraph shows its first line only.</p><p class="ev"><span class="tag">Screenshot</span>Visible in the repo's own <code>screenshot.png</code>.</p></div></li><li class="find med"><span class="sev">Medium</span><div><h3>It redraws at the screen's refresh rate while idle</h3><p><code>gfx::frame()</code> is a game loop with vsync, so an idle window keeps the CPU and GPU busy.</p><p class="ev"><span class="tag">Language docs</span>Goose gfx reference. Not measured.</p></div></li><li class="find low"><span class="sev">Low</span><div><h3>Every HTTPS request rebuilds the TLS setup</h3><p>It reloads the whole root-certificate store per request and speaks HTTP/1.0 with no keep-alive, compression, cookies or cache.</p><p class="ev"><span class="tag">Code</span><code>fetch_https</code> and <code>request_bytes</code> in <code>lib.rs</code>.</p></div></li></ol>
+  <div class="two">
+    <div><h3>Worth keeping</h3><ul>
+      <li>An honest README that lists what the demo does not do.</li>
+      <li>Fetches run off the UI thread, and stale results are dropped by request id.</li>
+      <li>The headless <code>--frames N</code> mode, a ready-made screenshot test.</li>
+      <li>rustls for TLS, with a body-size cap and read timeouts.</li></ul></div>
+    <div><h3>Setup</h3><ul>
+      <li>The README builds Goose from its main branch, which changed yesterday, and the language is two months old. Pin a commit.</li>
+      <li><code>Cargo.lock</code> is ignored, so two builds can pull different crate versions.</li>
+      <li>No tests or CI, although the headless mode is ready for them.</li>
+      <li>The browser's header comment and both demo pages still say there is no networking.</li></ul></div>
+  </div>
+  <p class="note"><b>Measured since:</b> the demo builds and runs on your Mac. Left idle in a window it uses 13.8% CPU,
+  redraws about 116 times a second, and holds 208–235 MB, about 175 MB of it GPU allocations.</p>
+</section>
+
+<section id="weight" class="wrap">
+  <h2>What a browser weighs on your Mac</h2>
+  <div class="prose"><p>I built an 80 KB WebKit shell (a window with web views and nothing else) and ran it beside a fresh
+  Chrome with a throwaway profile, on the same pages, twice. Memory is Activity Monitor's figure, with memory shared
+  between processes counted once.</p></div>
+  <figure class="chart" aria-label="Memory of a bare WebKit shell and Chrome, one blank tab and three tabs">
+    <h3>Total memory, low and high of two runs</h3>
+    <div class="grp"><div class="gl">One blank tab</div><div class="row a"><span class="rl">WebKit shell</span><div class="track"><span class="bar-min" style="width:9.06%"></span><span class="bar-rng" style="left:9.06%;width:0.66%"></span></div><span class="rv">58.9–63.2 MB</span></div><div class="row b"><span class="rl">Chrome</span><div class="track"><span class="bar-min" style="width:59.95%"></span><span class="bar-rng" style="left:59.95%;width:5.97%"></span></div><span class="rv">389.7–428.5 MB</span></div></div>
+    <div class="grp"><div class="gl">Three tabs: example.com, MDN, GitHub</div><div class="row a"><span class="rl">WebKit shell</span><div class="track"><span class="bar-min" style="width:51.29%"></span><span class="bar-rng" style="left:51.29%;width:2.32%"></span></div><span class="rv">333.4–348.5 MB</span></div><div class="row b"><span class="rl">Chrome</span><div class="track"><span class="bar-min" style="width:86.14%"></span><span class="bar-rng" style="left:86.14%;width:7.18%"></span></div><span class="rv">559.9–606.6 MB</span></div></div>
+    <div class="axis"><span></span><div class="ticks"><span style="left:0.00%">0</span><span style="left:30.77%">200</span><span style="left:61.54%">400</span><span style="left:92.31%">600</span></div><span class="rv" style="color:var(--ink-3)">MB</span></div>
+    <figcaption>The solid bar is the lower run; the pale extension reaches the higher one.</figcaption>
+  </figure>
+  <figure class="chart" aria-label="Where the memory goes with three tabs">
+    <h3>Where it goes with three tabs (second run)</h3>
+    <div class="grp"><div class="row a"><span class="rl">WebKit shell</span><div class="stack" style="width:51.29%"><i class="pg" style="width:79.96%"></i><i class="ov" style="flex:1"></i></div><span class="rv">333.4 MB</span></div><div class="row b"><span class="rl">Chrome</span><div class="stack" style="width:86.14%"><i class="pg" style="width:45.63%"></i><i class="ov" style="flex:1"></i></div><span class="rv">559.9 MB</span></div></div>
+    <div class="axis"><span></span><div class="ticks"><span style="left:0.00%">0</span><span style="left:30.77%">200</span><span style="left:61.54%">400</span><span style="left:92.31%">600</span></div><span class="rv" style="color:var(--ink-3)">MB</span></div>
+    <div class="legend"><span><i style="background:var(--ink-2)"></i>Solid: page processes (266.6 MB in WebKit, 255.5 MB in Chrome)</span>
+      <span><i style="background:repeating-linear-gradient(135deg, var(--ink-2) 0 3px, transparent 3px 7px)"></i>Striped: everything else (66.8 MB in WebKit, 304.4 MB in Chrome)</span></div>
+  </figure>
+  <div class="reads">
+    <p><b>The page is the weight.</b>GitHub's tab alone took 182.7–192.7 MB across three runs, about three times
+    the whole bare WebKit shell with a blank tab.</p>
+    <p><b>Both engines pay the same for pages.</b>Page processes took 266.6–266.8 MB in WebKit and 255.0–255.5 MB
+    in Chrome, whose count includes a spare renderer.</p>
+    <p><b>The overhead is where they differ.</b>Everything else took 66.8–81.7 MB for WebKit and 304.4–351.6 MB for
+    Chrome. With one blank tab Chrome already sits at 389.7–428.5 MB.</p>
+  </div>
+  <p class="so">These are the numbers our engine has to beat. Most of the weight is the pages, so ours must keep pages
+  compact and put idle tabs to sleep.</p>
+  <p class="method">MacBook Pro M5 Pro, 24 GB, macOS 26.5.1, 29 Oct 2026. Private sessions, 15 seconds to settle after
+  loading, the last tab on screen. Chrome's figures include its spare renderer and, in the first run, its updater.
+  Scripts and raw JSON: <code>design/measurements/</code>.</p>
+</section>
+
+<section id="recipe" class="wrap">
+  <h2>What the best browsers do</h2>
+  <div class="prose"><p>Two research passes on 29 Oct 2026. I checked every claim below against its source before
+  using it.</p></div>
+  <ul class="recipe">
+    <li><h3>Familiar first, power on request</h3><p>Arc's own numbers: “Only 5.52% of DAUs use more than one Space
+      regularly.” Its makers called it too different, with too much to learn. Arc stops working on 22 Dec 2026.</p>
+      <p class="src-l"><a href="https://browsercompany.substack.com/p/letter-to-arc-members-2025">[1]</a> <a href="https://www.androidauthority.com/arc-browser-shutting-down-december-2026-3726900/">[2]</a></p></li>
+    <li><h3>Vertical tabs and split view are standard</h3><p>Chrome added native vertical tabs on 7 Apr 2026; Firefox 149
+      added Split View on 24 Mar 2026. Neither is a reason to switch anymore.</p><p class="src-l"><a href="https://blog.google/products-and-platforms/products/chrome/new-chrome-productivity-features/">[3]</a> <a href="https://www.firefox.com/en-US/firefox/149.0/releasenotes/">[4]</a></p></li>
+    <li><h3>Sleep idle tabs</h3><p>Microsoft measured an 83% average memory saving for each sleeping tab in Edge. Our own
+      numbers say the pages are most of the weight.</p><p class="src-l"><a href="https://blogs.windows.com/msedgedev/2022/12/06/sleeping-tabs-edge-105-sleep-before-discarding/">[5]</a></p></li>
+    <li><h3>Block ads inside the engine</h3><p>Google removed uBlock Origin from the Chrome Web Store in its last
+      Manifest V2 purge. In our engine, blocking lives in the network layer, before a byte is parsed.</p>
+      <p class="src-l"><a href="https://cyberinsider.com/?p=339072">[6]</a></p></li>
+    <li><h3>Sync privately</h3><p>Apple encrypts Safari history, Tab Groups and iCloud Tabs end to end. A new browser
+      should promise no less.</p><p class="src-l"><a href="https://support.apple.com/en-us/102651">[7]</a></p></li>
+    <li><h3>Developers want every viewport in sync</h3><p>Polypane shows every breakpoint side by side, all synced;
+      Sizzy mirrors devices in one workspace for $15 a month. Both are separate Chromium apps.</p>
+      <p class="src-l"><a href="https://polypane.app/">[8]</a> <a href="https://sizzy.co/">[9]</a></p></li>
+    <li><h3>Build only what you can keep secure</h3><p>Kagi ended Orion for Linux and Windows on 2 Oct 2026 to focus on
+      macOS and iOS; Arc's makers cited the constant work of keeping a browser secure. Our answer is scope: two users,
+      Mac and iPhone, documents first, in two memory-safe languages.</p><p class="src-l"><a href="https://blog.kagi.com/update-orion-linux-windows">[10]</a> <a href="https://www.androidauthority.com/arc-browser-shutting-down-december-2026-3726900/">[2]</a></p></li>
+  </ul>
+  <div class="side-by">
+    <div class="ios"><h3>The iPhone rule, and why it doesn't bind us</h3>
+      <p>Outside the EU and Japan, every browser in the App Store runs Apple's WebKit. The EU (iOS 17.4 and later) and
+      Japan (iOS 26.2 and later) allow other engines only in separate, region-only apps that pass 90% of the Web Platform
+      Tests. In May 2026 Open Web Advocacy reported that no vendor had shipped one in the EU.</p>
+      <p>We aren't distributing, so we install our own engine on our own iPhones from Xcode. Two limits stay: apps can't
+      JIT, so JavaScript runs interpreted, and iOS ends apps that use too much memory.</p>
+      <p class="src-l"><a href="https://developer.apple.com/support/alternative-browser-engines/">[11]</a> <a href="https://developer.apple.com/support/alternative-browser-engines-jp/">[12]</a> <a href="https://open-web-advocacy.org/blog/the-digital-markets-act-is-delivering-real-wins-but-not-yet-for-browser-engines/">[13]</a></p></div>
+    <div><h3 style="margin-bottom:14px">What changed this year</h3><ol class="when">
+      <li><time datetime="2026-03-24">24 Mar</time><span>Firefox 149 ships Split View and a free built-in VPN.</span></li>
+      <li><time datetime="2026-04-07">7 Apr</time><span>Chrome gets native vertical tabs.</span></li>
+      <li><time datetime="2026-09-01">1 Sep</time><span>CyberInsider reports Google has removed uBlock Origin from the Chrome Web Store.</span></li>
+      <li><time datetime="2026-10-02">2 Oct</time><span>Kagi stops Orion for Linux and Windows.</span></li>
+      <li><time datetime="2026-12-22">22 Dec</time><span>Arc stops working; its makers moved to Dia.</span></li></ol></div>
+  </div>
+  <div class="tablewrap"><table class="engines">
+    <thead><tr><th>Engine</th><th>Where it stands</th><th>iPhone</th><th>For us</th></tr></thead>
+    <tbody>
+      <tr class="pick"><td>goose, ours</td><td>Goose for HTML, CSS, layout and paint; Rust for the platform layer, network, text, images and JavaScript. Documents first.</td><td class="yes">Yes, from Xcode</td><td>Building</td></tr>
+      <tr><td>WebKit, from the OS</td><td>Safari's engine; web extensions for apps since macOS 15.4 and iOS 18.4. 58.9 MB for the Focaccia article here.</td><td>Yes</td><td>The bar to beat</td></tr>
+      <tr><td>Chromium</td><td>Best site compatibility and Chrome DevTools; 389.7–428.5 MB with one blank tab here.</td><td>EU and Japan only</td><td>Not used</td></tr>
+      <tr><td>Servo</td><td>Rust, embeddable; passes 66.9% of WPT tests on its own dashboard (29 Oct 2026), up from 53.7% in April.</td><td>No port</td><td>A source of Rust modules</td></tr>
+      <tr><td>Ladybird</td><td>A funded team, still preparing its first alpha for macOS and Linux (Sep 2026); mobile is not a focus.</td><td>No</td><td>Proof of how long an engine takes</td></tr>
+    </tbody></table></div>
+  <p class="src-l" style="margin-top:10px"><a href="https://servo.org/wpt/">[14]</a> <a href="https://ladybird.org/newsletter/2026-09-30">[15]</a> <a href="https://developer.apple.com/documentation/webkit/wkwebextensioncontroller">[16]</a></p>
+</section>
+
+<section id="design" class="wrap">
+  <h2>How our engine works</h2>
+  <div class="prose"><p>The full plan is in <code>docs/ENGINE.md</code>. In short: Goose owns the engine, Rust owns
+  everything Goose lacks, and every frame is judged against 120 Hz. Apple silicon is the only target, so the engine
+  leans on what it gives: one arm64 architecture, Metal, memory shared by CPU and GPU, and separate performance and
+  efficiency cores.</p></div>
+  <ul class="principles">
+    <li><b>Smooth first</b><p>A frame is never late because of network, parsing or layout.</p></li>
+    <li><b>Memory is a budget</b><p>Every part has a number, and the build fails when it goes over.</p></li>
+    <li><b>Idle means zero</b><p>Nothing redraws, polls or runs while nothing changes.</p></li>
+    <li><b>One renderer</b><p>The engine draws the pages and the browser's own interface.</p></li>
+    <li><b>Documents first</b><p>Be the best at the pages we render before rendering more.</p></li>
+  </ul>
+  <div class="tablewrap"><table class="budget">
+    <thead><tr><th>Test, on the 120 Hz M5 Pro</th><th>Pass</th><th>The bar today</th></tr></thead>
+    <tbody>
+      <tr><td>Scroll a long article for 10 seconds</td><td>Every frame under 8.3 ms, none dropped</td><td>Not measured yet</td></tr>
+      <tr><td>Input to screen: a scroll, a key in the address bar</td><td>The next frame</td><td>Not measured yet</td></tr>
+      <tr><td>A page loading in the background</td><td>Scrolling and typing never wait</td><td>The demo blocks for 75.0 s on a dead host</td></tr>
+      <tr><td>Window idle, nothing animating</td><td>0% CPU, no frames drawn</td><td>Demo: 13.8% CPU, about 116 frames a second. M0: 0.0%, none</td></tr>
+      <tr><td>An empty window</td><td>Under the bare WebKit shell</td><td>M0: 27.0 MB. WebKit shell: 58.9–63.2 MB. Demo: 208–235 MB</td></tr>
+      <tr><td>Memory per tab</td><td>Shown in MB; budget set from the first measurement, then cut 20% per milestone</td><td>WebKit: 58.9 MB for the Focaccia article</td></tr>
+    </tbody></table></div>
+  <ol class="flow" aria-label="One frame">
+    <li><b>Input</b><p>The main thread sleeps until an event or a display tick wakes it.</p><span class="m">Rust · main thread</span></li>
+    <li><b>Tab worker</b><p>Parse, DOM, style, layout, paint. Each tab is its own contained Goose worker.</p><span class="m">Goose · one per tab</span></li>
+    <li><b>Compositor</b><p>Scrolls and animates from rasterized tiles, so a busy page never holds up a frame.</p><span class="m">Rust · Metal</span></li>
+    <li><b>Present</b><p>Only when something changed. A sleeping tab is a worker that has ended.</p><span class="m">under 8.3 ms a frame</span></li>
+  </ol>
+  <div class="arch" aria-label="Who does what">
+    <div class="full core"><b>Goose: the engine</b><span>The HTML tokenizer and tree builder (the WHATWG algorithm) · a DOM of compact inline nodes · CSS parsing, selectors and cascade · layout, block and inline first, then flex, grid and tables · a flat display list per frame · tabs, history, the sleep policy and the chrome's logic</span></div>
+    <div><b>Rust: platform</b><span>Window, input, IME, the display link and the GPU compositor on Metal</span></div>
+    <div><b>Rust: text</b><span>Core Text for fonts, fallback and shaping; glyphs rasterized into a GPU atlas in shared memory</span></div>
+    <div><b>Rust: network</b><span>HTTP/1.1 and HTTP/2, TLS, cookies, cache, compression and ad blocking</span></div>
+    <div><b>Rust: the rest</b><span>URLs, ImageIO and VideoToolbox decoding, storage, and the JavaScript engine after a bake-off</span></div>
+    <div class="full os"><b>Two rules at the boundary</b><span>A Rust panic never crosses into Goose: every entry point returns an error code. Every tab is a contained worker, so a bad page ends its tab, never the browser.</span></div>
+  </div>
+  <div class="tablewrap" style="margin-top:34px"><table class="budget">
+    <thead><tr><th>Milestone</th><th>Goal</th><th>Done when</th></tr></thead>
+    <tbody>
+      <tr><td>M0</td><td>Foundations</td><td>Goose pinned and built; CI with the headless screenshot test; a Rust window that waits for input and draws on demand at 0% idle CPU; one Goose and Rust frame on an iPhone. Done on 29 Oct except CI and the iPhone frame</td></tr>
+      <tr><td>M1</td><td>One article, perfectly smooth</td><td>A saved copy of the Focaccia article scrolls 10 seconds with no dropped frame, its weight on screen</td></tr>
+      <tr><td>M2</td><td>The live document web</td><td>Network, images, tabs as contained workers, sleep, and the chosen interface as our chrome</td></tr>
+      <tr><td>M3</td><td>Layout breadth</td><td>Flex, grid, tables, positioning and forms, with Web Platform Tests as regression tests</td></tr>
+      <tr><td>M4</td><td>JavaScript</td><td>A measured bake-off of Boa and QuickJS-ng, then DOM bindings, events and fetch</td></tr>
+      <tr><td>M5</td><td>iPhone daily driver</td><td>Touch, the bottom bar, and sync with the Mac</td></tr>
+    </tbody></table></div>
+  <div class="devmode prose"><h3>Dev mode</h3>
+    <p>It turns on when you open a project: a local server, a folder, or a site you mark as yours. Owning the engine
+    makes it better than an embedded engine allows.</p>
+    <ul>
+      <li>Phone and desktop views of the same page, with scrolling and clicks mirrored between them.</li>
+      <li>Open on iPhone: the Mac shares your local server with your paired iPhone over Wi-Fi.</li>
+      <li>Every request with headers, bodies and timings, because the network stack is ours.</li>
+      <li>A frame strip that marks any frame over 8.3 ms and names what caused it.</li>
+      <li>The DOM, layout boxes and every tab's weight, live.</li>
+    </ul></div>
+</section>
+
+<section id="directions" class="wrap">
+  <h2>Three directions</h2>
+  <p class="dirs-intro">One layout for all three, so the choice is about character. Each borrows four things from its world:
+  type, colour, density and one signature move. The chrome will be HTML and CSS drawn by our own engine, so the winner
+  becomes the first page the engine renders every day. Weights for
+  Wikipedia, MDN, example.com and GitHub come from one measured run; the local site, the phone view and the iPhone figures
+  are illustrative. Switch your system to dark mode to see each one at night.</p>
+  
+<article class="dirx dir-a" id="dir-a">
+  <div class="dhead"><span class="dl">A</span><h3>Station</h3><p>The calm of a Swiss railway: white, black, and red only for what is running.</p></div>
+  <div class="dgrid">
+    <figure class="cell c-every"><div class="scroll"><div class="mac" role="img" aria-label="Mac, everyday: reading in the Personal space, with GitHub asleep"><div class="win"><div class="side"><div class="lights"><i></i><i></i><i></i></div><div class="spaces"><span class="space on">Personal</span><span class="space">goose</span></div><div class="label"><span>Tabs</span><span>MB</span></div><ul class="tabs"><li class="tab live on"><span class="clk live" aria-hidden="true"><i></i></span><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-wiki"/></svg></span><span class="t">Focaccia – Wikipedia</span><span class="w">58.9</span></li><li class="tab live"><span class="clk live" aria-hidden="true"><i></i></span><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-mdn"/></svg></span><span class="t">JavaScript | MDN</span><span class="w">59.2</span></li><li class="tab live"><span class="clk live" aria-hidden="true"><i></i></span><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-globe"/></svg></span><span class="t">Example Domain</span><span class="w">28.6</span></li><li class="tab sleep"><span class="clk sleep" aria-hidden="true"><i></i></span><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-gh"/></svg></span><span class="t">aardappel/goose</span><span class="w">0.0</span></li><li class="tab sleep"><span class="clk sleep" aria-hidden="true"><i></i></span><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-globe"/></svg></span><span class="t">Weekend plan</span><span class="w">0.0</span></li></ul><div class="foot tt"><div class="tt-r"><span class="clk live" aria-hidden="true"><i></i></span><span>Live 3</span><b>146.7</b></div><div class="tt-r"><span class="clk sleep" aria-hidden="true"><i></i></span><span>Asleep 2</span><b>0.0</b></div><div class="tt-r"><span></span><span>Browser</span><b>95.4</b></div><div class="tt-r tot"><span></span><span>Window</span><b>242.1 MB</b></div></div></div><div class="main"><div class="bar"><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-side"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-l"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-r"/></svg></span><span class="addr"><span class="clk live" aria-hidden="true"><i></i></span><svg class="i lk" aria-hidden="true"><use href="#i-lock"/></svg><span class="host">en.wikipedia.org</span><span class="path">/wiki/Focaccia</span></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-share"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-code"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-plus"/></svg></span></div><div class="page">
+<div class="art">
+  <h4>Focaccia</h4>
+  <p>Focaccia is a flat, oven-baked Italian bread. Bakers press dimples into the dough with their
+  fingertips and pour on olive oil and salt before it goes in, often with rosemary.</p>
+  <p>It sits close to pizza dough in style and is eaten on its own, beside a meal, or split for
+  sandwiches.</p>
+  <h5>Regional styles</h5>
+  <p>Genoa's focaccia is thin and glossy with oil. In Puglia, potato goes into the dough. The
+  version from Recco is two thin sheets with soft cheese between them.</p>
+</div></div></div></div></div></div>
+      <figcaption>Everyday: reading on the Mac. GitHub's 192.7 MB tab is asleep.</figcaption></figure>
+    <figure class="cell c-phone"><div class="phone" role="img" aria-label="iPhone: the article continues from the Mac, and the Mac offers its local server"><div class="ph"><div class="dev"><div class="island"></div><div class="status"><span>9:41</span><span class="sicons"><svg viewBox="0 0 18 12" class="sig" aria-hidden="true"><rect x="0" y="8" width="3" height="4" rx="1"/><rect x="5" y="5.5" width="3" height="6.5" rx="1"/><rect x="10" y="3" width="3" height="9" rx="1"/><rect x="15" y="0" width="3" height="12" rx="1"/></svg><svg class="i wf" aria-hidden="true"><use href="#i-wifi"/></svg><svg viewBox="0 0 27 13" class="bat" aria-hidden="true"><rect x=".5" y=".5" width="23" height="12" rx="3.5"/><rect x="2.5" y="2.5" width="17" height="8" rx="2" class="lvl"/><path d="M25.5 4.5v4a2.2 2.2 0 0 0 0-4Z" class="lvl"/></svg></span></div><div class="handoff"><span class="clk live" aria-hidden="true"><i></i></span><span>From your Mac</span><b>localhost:5173</b><span class="go">Open</span></div><div class="ph-art"><h4>Focaccia</h4><p>Focaccia is a flat, oven-baked Italian bread. Bakers press dimples into the dough with their fingertips and pour on olive oil and salt before it goes in, often with rosemary.</p><p>It sits close to pizza dough in style and is eaten on its own, beside a meal, or split for sandwiches.</p><h5>Regional styles</h5><p>Genoa's focaccia is thin and glossy with oil.</p></div><div class="phbar"><span class="pb"><svg class="i " aria-hidden="true"><use href="#i-chev-l"/></svg></span><span class="pill"><span class="clk live" aria-hidden="true"><i></i></span><span class="host">en.wikipedia.org</span><b class="w">58.9</b></span><span class="pb"><svg class="i " aria-hidden="true"><use href="#i-tabs"/></svg></span><span class="pb"><svg class="i " aria-hidden="true"><use href="#i-dots"/></svg></span></div><div class="home"></div></div></div></div>
+      <figcaption>iPhone: the same browser, with the Mac's local server one tap away.</figcaption></figure>
+    <figure class="cell c-dev"><div class="scroll"><div class="mac" role="img" aria-label="Mac, dev mode: the goose space with its local server, phone and desktop views side by side"><div class="win"><div class="side"><div class="lights"><i></i><i></i><i></i></div><div class="spaces"><span class="space">Personal</span><span class="space on">goose</span></div><div class="label"><span>Tabs</span><span>MB</span></div><ul class="tabs"><li class="tab live on"><span class="clk live" aria-hidden="true"><i></i></span><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-term"/></svg></span><span class="t">goose site · local</span><span class="w">41.3</span></li><li class="tab live"><span class="clk live" aria-hidden="true"><i></i></span><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-mdn"/></svg></span><span class="t">JavaScript | MDN</span><span class="w">59.2</span></li><li class="tab sleep"><span class="clk sleep" aria-hidden="true"><i></i></span><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-gh"/></svg></span><span class="t">aardappel/goose</span><span class="w">0.0</span></li><li class="tab sleep"><span class="clk sleep" aria-hidden="true"><i></i></span><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-gh"/></svg></span><span class="t">Grumbash/goose-mini-browser</span><span class="w">0.0</span></li></ul><div class="foot tt"><div class="tt-r"><span class="clk live" aria-hidden="true"><i></i></span><span>Live 2 + phone view</span><b>138.3</b></div><div class="tt-r"><span class="clk sleep" aria-hidden="true"><i></i></span><span>Asleep 2</span><b>0.0</b></div><div class="tt-r"><span></span><span>Browser</span><b>95.4</b></div><div class="tt-r tot"><span></span><span>Window</span><b>233.7 MB</b></div></div></div><div class="main dev"><div class="bar"><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-side"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-l"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-r"/></svg></span><span class="addr"><span class="clk live" aria-hidden="true"><i></i></span><svg class="i lk" aria-hidden="true"><use href="#i-lock"/></svg><span class="host">localhost:5173</span><span class="path">/</span></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-share"/></svg></span><span class="btn txt on"><svg class="i " aria-hidden="true"><use href="#i-phone"/></svg>Open on iPhone</span><span class="btn on"><svg class="i " aria-hidden="true"><use href="#i-code"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-plus"/></svg></span></div>
+<div class="devarea">
+  <div class="views">
+    <div class="vp"><span class="cap">1280 × 800</span>
+      <div class="site"><div class="logo">goose</div>
+        <h4>Light on memory. Quick on Mac and iPhone.</h4>
+        <p>A browser that shows what every tab weighs and puts idle tabs to sleep.</p>
+        <span class="cta">Join the beta</span>
+        <div class="widget"><span><svg class="i " aria-hidden="true"><use href="#i-alert"/></svg>Tab weights did not load</span><small>GET /api/weights · 500</small></div>
+      </div>
+    </div>
+    <div class="vp vp-ph"><span class="cap">390 × 844</span>
+      <div class="site sm"><div class="logo">goose</div>
+        <h4 class="over">Light on memory.</h4>
+        <span class="flag">412 px wide on a 390 px screen</span>
+        <p>A browser that shows what every tab weighs.</p>
+      </div>
+    </div>
+  </div>
+  <div class="drawer">
+    <div class="dtabs"><span class="dtab">Console <b class="n bad">1</b></span><span class="dtab on">Requests <b class="n">6</b></span>
+      <span class="dtab">Frames</span><span class="dtab">Weights</span><span class="dsp"></span><span class="dtab ins"><svg class="i " aria-hidden="true"><use href="#i-search"/></svg>Inspect</span></div>
+    <div class="reqs"><span class="ms">18 ms</span><span class="pth">GET /</span><span class="knd">html</span><span class="sz">3.2 KB</span><span class="st">200</span><span class="ms">32 ms</span><span class="pth">GET /src/main.ts</span><span class="knd">js</span><span class="sz">41.6 KB</span><span class="st">200</span><span class="ms">21 ms</span><span class="pth">GET /src/hero.css</span><span class="knd">css</span><span class="sz">6.1 KB</span><span class="st">200</span><span class="ms">44 ms</span><span class="pth">GET /fonts/display.woff2</span><span class="knd">font</span><span class="sz">38.4 KB</span><span class="st">200</span><span class="ms">112 ms</span><span class="pth bad">GET /api/weights</span><span class="knd">json</span><span class="sz">0.4 KB</span><span class="st bad"><svg class="i " aria-hidden="true"><use href="#i-alert"/></svg>500</span><span class="ms">27 ms</span><span class="pth">GET /img/phone.webp</span><span class="knd">img</span><span class="sz">88.0 KB</span><span class="st">200</span></div>
+  </div>
+</div></div></div></div></div>
+      <figcaption>Dev mode: the project's phone and desktop views, requests and the failing call.</figcaption></figure>
+    <div class="cell c-spec spec">
+      <h4>Signature move</h4><p>Stop-to-go. Every live tab carries a small second hand that sweeps and waits at the top of the minute, the way Swiss station clocks wait for the signal. A sleeping tab's hand stands still and its weight drops to 0 MB. When Mac and iPhone sync, every hand moves together.</p>
+      <h4>Palette</h4><ul class="chips"><li><span class="sw" style="background:#EB0000"></span><span><b>Signal red</b><span class="hx">#EB0000 · live tabs only</span></span></li><li><span class="sw" style="background:#FFDE00"></span><span><b>Departure yellow</b><span class="hx">#FFDE00 · selection</span></span></li><li><span class="sw" style="background:#1D2A6E"></span><span><b>Sign blue</b><span class="hx">#1D2A6E · spaces</span></span></li><li><span class="sw" style="background:#0F0F0F"></span><span><b>Clock black</b><span class="hx">#0F0F0F · ink</span></span></li><li><span class="sw" style="background:#FFFFFF"></span><span><b>Station white</b><span class="hx">#FFFFFF · ground</span></span></li></ul>
+      <h4>Type</h4><p>San Francisco throughout, with tabular figures set in a timetable's column rhythm.</p>
+      <h4>Risk</h4><p>Restraint can tip into austere, and the red only works while it stays rare. The SBB clock face is a licensed design, so we borrow its stop-to-go timing, never the face or its disc hand.</p><div class="kept"><h4>Taken from the worlds we turned down</h4><ul><li><b>Data field:</b> exact megabytes with one decimal, never “high” or “low”</li><li><b>Orienteering map:</b> red belongs to the live tab and nothing else</li><li><b>Botanical folio:</b> every weight drawn at one fixed scale</li><li><b>Boarding pass:</b> rows move in place, and a tab that changed while hidden keeps its mark until you look</li><li><b>Developer console:</b> dev panels fold away by priority, and destructive actions stand apart</li></ul></div>
+    </div>
+  </div>
+</article>
+<article class="dirx dir-b" id="dir-b">
+  <div class="dhead"><span class="dl">B</span><h3>Terminal</h3><p>Airport wayfinding for the web: one yellow band says where you are and where you can go next.</p></div>
+  <div class="dgrid">
+    <figure class="cell c-every"><div class="scroll"><div class="mac" role="img" aria-label="Mac, everyday: reading in the Personal space, with GitHub asleep"><div class="win"><div class="side"><div class="lights"><i></i><i></i><i></i></div><div class="spaces"><span class="space on">Personal</span><span class="space">goose</span></div><div class="label"><span>Tabs</span><span>MB</span></div><ul class="tabs"><li class="tab live on"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-wiki"/></svg></span><span class="t">Focaccia – Wikipedia</span><span class="w">58.9</span></li><li class="tab live"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-mdn"/></svg></span><span class="t">JavaScript | MDN</span><span class="w">59.2</span></li><li class="tab live"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-globe"/></svg></span><span class="t">Example Domain</span><span class="w">28.6</span></li><li class="tab sleep"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-gh"/></svg></span><span class="t">aardappel/goose</span><span class="w zz">asleep</span></li><li class="tab sleep"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-globe"/></svg></span><span class="t">Weekend plan</span><span class="w zz">asleep</span></li></ul><div class="foot bfoot"><span>3 live · 2 asleep</span><b>242.1 MB</b></div></div><div class="main"><div class="bar band"><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-l"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-r"/></svg></span><span class="pict"><svg class="i " aria-hidden="true"><use href="#i-book"/></svg></span><span class="dest"><b>en.wikipedia.org</b><small>/wiki/Focaccia</small></span><span class="moves"><span class="mv"><span class="sq"><svg class="i " aria-hidden="true"><use href="#i-phone"/></svg></span>iPhone</span><span class="mv"><span class="sq"><svg class="i " aria-hidden="true"><use href="#i-cols"/></svg></span>Views</span><span class="mv"><span class="sq"><svg class="i " aria-hidden="true"><use href="#i-code"/></svg></span>Dev</span></span></div><div class="page">
+<div class="art">
+  <h4>Focaccia</h4>
+  <p>Focaccia is a flat, oven-baked Italian bread. Bakers press dimples into the dough with their
+  fingertips and pour on olive oil and salt before it goes in, often with rosemary.</p>
+  <p>It sits close to pizza dough in style and is eaten on its own, beside a meal, or split for
+  sandwiches.</p>
+  <h5>Regional styles</h5>
+  <p>Genoa's focaccia is thin and glossy with oil. In Puglia, potato goes into the dough. The
+  version from Recco is two thin sheets with soft cheese between them.</p>
+</div></div></div></div></div></div>
+      <figcaption>Everyday: reading on the Mac. GitHub's 192.7 MB tab is asleep.</figcaption></figure>
+    <figure class="cell c-phone"><div class="phone" role="img" aria-label="iPhone: the article continues from the Mac, and the Mac offers its local server"><div class="ph"><div class="dev"><div class="island"></div><div class="status"><span>9:41</span><span class="sicons"><svg viewBox="0 0 18 12" class="sig" aria-hidden="true"><rect x="0" y="8" width="3" height="4" rx="1"/><rect x="5" y="5.5" width="3" height="6.5" rx="1"/><rect x="10" y="3" width="3" height="9" rx="1"/><rect x="15" y="0" width="3" height="12" rx="1"/></svg><svg class="i wf" aria-hidden="true"><use href="#i-wifi"/></svg><svg viewBox="0 0 27 13" class="bat" aria-hidden="true"><rect x=".5" y=".5" width="23" height="12" rx="3.5"/><rect x="2.5" y="2.5" width="17" height="8" rx="2" class="lvl"/><path d="M25.5 4.5v4a2.2 2.2 0 0 0 0-4Z" class="lvl"/></svg></span></div><div class="handoff"><svg class="i " aria-hidden="true"><use href="#i-laptop"/></svg><span>From your Mac</span><b>localhost:5173</b><span class="go">Open</span></div><div class="ph-art"><h4>Focaccia</h4><p>Focaccia is a flat, oven-baked Italian bread. Bakers press dimples into the dough with their fingertips and pour on olive oil and salt before it goes in, often with rosemary.</p><p>It sits close to pizza dough in style and is eaten on its own, beside a meal, or split for sandwiches.</p><h5>Regional styles</h5><p>Genoa's focaccia is thin and glossy with oil.</p></div><div class="phbar band"><span class="pict"><svg class="i " aria-hidden="true"><use href="#i-book"/></svg></span><span class="dest"><b>en.wikipedia.org</b><small>58.9 MB</small></span><span class="sq n">5</span></div><div class="home"></div></div></div></div>
+      <figcaption>iPhone: the same browser, with the Mac's local server one tap away.</figcaption></figure>
+    <figure class="cell c-dev"><div class="scroll"><div class="mac" role="img" aria-label="Mac, dev mode: the goose space with its local server, phone and desktop views side by side"><div class="win"><div class="side"><div class="lights"><i></i><i></i><i></i></div><div class="spaces"><span class="space">Personal</span><span class="space on">goose</span></div><div class="label"><span>Tabs</span><span>MB</span></div><ul class="tabs"><li class="tab live on"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-term"/></svg></span><span class="t">goose site · local</span><span class="w">41.3</span></li><li class="tab live"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-mdn"/></svg></span><span class="t">JavaScript | MDN</span><span class="w">59.2</span></li><li class="tab sleep"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-gh"/></svg></span><span class="t">aardappel/goose</span><span class="w zz">asleep</span></li><li class="tab sleep"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-gh"/></svg></span><span class="t">Grumbash/goose-mini-browser</span><span class="w zz">asleep</span></li></ul><div class="foot bfoot"><span>2 live · 2 asleep</span><b>233.7 MB</b></div></div><div class="main dev"><div class="bar band"><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-l"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-r"/></svg></span><span class="pict"><svg class="i " aria-hidden="true"><use href="#i-term"/></svg></span><span class="dest"><b>localhost:5173</b><small>/</small></span><span class="moves"><span class="mv"><span class="sq"><svg class="i " aria-hidden="true"><use href="#i-phone"/></svg></span>iPhone</span><span class="mv"><span class="sq"><svg class="i " aria-hidden="true"><use href="#i-cols"/></svg></span>Views</span><span class="mv on"><span class="sq"><svg class="i " aria-hidden="true"><use href="#i-code"/></svg></span>Dev</span></span></div>
+<div class="devarea">
+  <div class="views">
+    <div class="vp"><span class="cap">1280 × 800</span>
+      <div class="site"><div class="logo">goose</div>
+        <h4>Light on memory. Quick on Mac and iPhone.</h4>
+        <p>A browser that shows what every tab weighs and puts idle tabs to sleep.</p>
+        <span class="cta">Join the beta</span>
+        <div class="widget"><span><svg class="i " aria-hidden="true"><use href="#i-alert"/></svg>Tab weights did not load</span><small>GET /api/weights · 500</small></div>
+      </div>
+    </div>
+    <div class="vp vp-ph"><span class="cap">390 × 844</span>
+      <div class="site sm"><div class="logo">goose</div>
+        <h4 class="over">Light on memory.</h4>
+        <span class="flag">412 px wide on a 390 px screen</span>
+        <p>A browser that shows what every tab weighs.</p>
+      </div>
+    </div>
+  </div>
+  <div class="drawer">
+    <div class="dtabs"><span class="dtab">Console <b class="n bad">1</b></span><span class="dtab on">Requests <b class="n">6</b></span>
+      <span class="dtab">Frames</span><span class="dtab">Weights</span><span class="dsp"></span><span class="dtab ins"><svg class="i " aria-hidden="true"><use href="#i-search"/></svg>Inspect</span></div>
+    <div class="reqs"><span class="ms">18 ms</span><span class="pth">GET /</span><span class="knd">html</span><span class="sz">3.2 KB</span><span class="st">200</span><span class="ms">32 ms</span><span class="pth">GET /src/main.ts</span><span class="knd">js</span><span class="sz">41.6 KB</span><span class="st">200</span><span class="ms">21 ms</span><span class="pth">GET /src/hero.css</span><span class="knd">css</span><span class="sz">6.1 KB</span><span class="st">200</span><span class="ms">44 ms</span><span class="pth">GET /fonts/display.woff2</span><span class="knd">font</span><span class="sz">38.4 KB</span><span class="st">200</span><span class="ms">112 ms</span><span class="pth bad">GET /api/weights</span><span class="knd">json</span><span class="sz">0.4 KB</span><span class="st bad"><svg class="i " aria-hidden="true"><use href="#i-alert"/></svg>500</span><span class="ms">27 ms</span><span class="pth">GET /img/phone.webp</span><span class="knd">img</span><span class="sz">88.0 KB</span><span class="st">200</span></div>
+  </div>
+</div></div></div></div></div>
+      <figcaption>Dev mode: the project's phone and desktop views, requests and the failing call.</figcaption></figure>
+    <div class="cell c-spec spec">
+      <h4>Signature move</h4><p>The sign band. The toolbar is a yellow band with a black pictogram square for the kind of page, the destination in large type, and the next moves (iPhone, views, dev) locked to its edge. The tab you follow stays yellow from the sidebar to the band; everything else is black and white.</p>
+      <h4>Palette</h4><ul class="chips"><li><span class="sw" style="background:#FFCC00"></span><span><b>Signal yellow</b><span class="hx">#FFCC00 · the band and the followed tab</span></span></li><li><span class="sw" style="background:#0B0B0B"></span><span><b>Sign black</b><span class="hx">#0B0B0B · panels</span></span></li><li><span class="sw" style="background:#1A1A1A"></span><span><b>Panel frame</b><span class="hx">#1A1A1A · sidebar</span></span></li><li><span class="sw" style="background:#E6E6E6"></span><span><b>Surface grey</b><span class="hx">#E6E6E6 · ground</span></span></li><li><span class="sw" style="background:#FFFFFF"></span><span><b>Icon white</b><span class="hx">#FFFFFF · pictograms</span></span></li></ul>
+      <h4>Type</h4><p>Signika for destinations and figures; San Francisco for controls.</p>
+      <h4>Risk</h4><p>Yellow tires the eye if it spreads past the band and the followed tab. It is the boldest of the three for an everyday browser.</p>
+    </div>
+  </div>
+</article>
+<article class="dirx dir-c" id="dir-c">
+  <div class="dhead"><span class="dl">C</span><h3>Pack</h3><p>Built like ultralight gear: everything carries its weight, and the pack is always in view.</p></div>
+  <div class="dgrid">
+    <figure class="cell c-every"><div class="scroll"><div class="mac" role="img" aria-label="Mac, everyday: reading in the Personal space, with GitHub asleep"><div class="win"><div class="side"><div class="lights"><i></i><i></i><i></i></div><div class="spaces"><span class="space on">Personal</span><span class="space">goose</span></div><div class="pack"><div class="pk-h"><span class="pk-l">Pack</span><span class="pk-n">242.1<small> MB</small></span></div><div class="pk-bar" role="img" aria-label="Window weight 242.1 MB of a 500 MB scale"><i class="p" style="width:11.78%" title="Focaccia 58.9 MB"></i><i class="p" style="width:11.84%" title="JavaScript 59.2 MB"></i><i class="p" style="width:5.72%" title="Example 28.6 MB"></i><i class="s" style="width:19.08%" title="Browser 95.4 MB"></i></div><div class="pk-k"><span>3 live</span><span class="zz"><svg class="i " aria-hidden="true"><use href="#i-moon"/></svg>2 asleep, saving 192.7 MB</span></div></div><div class="label"><span>Tabs</span><span>MB</span></div><ul class="tabs"><li class="tab live on"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-wiki"/></svg></span><span class="t">Focaccia – Wikipedia</span><span class="w">58.9</span></li><li class="tab live"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-mdn"/></svg></span><span class="t">JavaScript | MDN</span><span class="w">59.2</span></li><li class="tab live"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-globe"/></svg></span><span class="t">Example Domain</span><span class="w">28.6</span></li><li class="tab sleep"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-gh"/></svg></span><span class="t">aardappel/goose</span><span class="w zz"><svg class="i " aria-hidden="true"><use href="#i-moon"/></svg>0.0</span></li><li class="tab sleep"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-globe"/></svg></span><span class="t">Weekend plan</span><span class="w zz"><svg class="i " aria-hidden="true"><use href="#i-moon"/></svg>0.0</span></li></ul></div><div class="main"><div class="bar"><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-side"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-l"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-r"/></svg></span><span class="addr"><svg class="i lk" aria-hidden="true"><use href="#i-lock"/></svg><span class="host">en.wikipedia.org</span><span class="path">/wiki/Focaccia</span></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-share"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-code"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-plus"/></svg></span></div><div class="page">
+<div class="art">
+  <h4>Focaccia</h4>
+  <p>Focaccia is a flat, oven-baked Italian bread. Bakers press dimples into the dough with their
+  fingertips and pour on olive oil and salt before it goes in, often with rosemary.</p>
+  <p>It sits close to pizza dough in style and is eaten on its own, beside a meal, or split for
+  sandwiches.</p>
+  <h5>Regional styles</h5>
+  <p>Genoa's focaccia is thin and glossy with oil. In Puglia, potato goes into the dough. The
+  version from Recco is two thin sheets with soft cheese between them.</p>
+</div></div></div></div></div></div>
+      <figcaption>Everyday: reading on the Mac. GitHub's 192.7 MB tab is asleep.</figcaption></figure>
+    <figure class="cell c-phone"><div class="phone" role="img" aria-label="iPhone: the article continues from the Mac, and the Mac offers its local server"><div class="ph"><div class="dev"><div class="island"></div><div class="status"><span>9:41</span><span class="sicons"><svg viewBox="0 0 18 12" class="sig" aria-hidden="true"><rect x="0" y="8" width="3" height="4" rx="1"/><rect x="5" y="5.5" width="3" height="6.5" rx="1"/><rect x="10" y="3" width="3" height="9" rx="1"/><rect x="15" y="0" width="3" height="12" rx="1"/></svg><svg class="i wf" aria-hidden="true"><use href="#i-wifi"/></svg><svg viewBox="0 0 27 13" class="bat" aria-hidden="true"><rect x=".5" y=".5" width="23" height="12" rx="3.5"/><rect x="2.5" y="2.5" width="17" height="8" rx="2" class="lvl"/><path d="M25.5 4.5v4a2.2 2.2 0 0 0 0-4Z" class="lvl"/></svg></span></div><div class="handoff"><svg class="i " aria-hidden="true"><use href="#i-laptop"/></svg><span>From your Mac</span><b>localhost:5173</b><span class="go">Open</span></div><div class="ph-art"><h4>Focaccia</h4><p>Focaccia is a flat, oven-baked Italian bread. Bakers press dimples into the dough with their fingertips and pour on olive oil and salt before it goes in, often with rosemary.</p><p>It sits close to pizza dough in style and is eaten on its own, beside a meal, or split for sandwiches.</p><h5>Regional styles</h5><p>Genoa's focaccia is thin and glossy with oil.</p></div><div class="phbar"><span class="pb"><svg class="i " aria-hidden="true"><use href="#i-chev-l"/></svg></span><span class="pill"><span class="host">en.wikipedia.org</span></span><span class="pkm"><b>58.9</b><i style="width:11.8%"></i></span><span class="pb"><svg class="i " aria-hidden="true"><use href="#i-tabs"/></svg></span></div><div class="home"></div></div></div></div>
+      <figcaption>iPhone: the same browser, with the Mac's local server one tap away.</figcaption></figure>
+    <figure class="cell c-dev"><div class="scroll"><div class="mac" role="img" aria-label="Mac, dev mode: the goose space with its local server, phone and desktop views side by side"><div class="win"><div class="side"><div class="lights"><i></i><i></i><i></i></div><div class="spaces"><span class="space">Personal</span><span class="space on">goose</span></div><div class="pack"><div class="pk-h"><span class="pk-l">Pack</span><span class="pk-n">233.7<small> MB</small></span></div><div class="pk-bar" role="img" aria-label="Window weight 233.7 MB of a 500 MB scale"><i class="p" style="width:8.26%" title="goose 41.3 MB"></i><i class="p" style="width:11.84%" title="JavaScript 59.2 MB"></i><i class="p2" style="width:7.56%" title="phone view 37.8 MB"></i><i class="s" style="width:19.08%" title="Browser 95.4 MB"></i></div><div class="pk-k"><span>2 live + phone view</span><span class="zz"><svg class="i " aria-hidden="true"><use href="#i-moon"/></svg>2 asleep, saving 192.7 MB</span></div></div><div class="label"><span>Tabs</span><span>MB</span></div><ul class="tabs"><li class="tab live on"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-term"/></svg></span><span class="t">goose site · local</span><span class="w">41.3</span></li><li class="tab live"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-mdn"/></svg></span><span class="t">JavaScript | MDN</span><span class="w">59.2</span></li><li class="tab sleep"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-gh"/></svg></span><span class="t">aardappel/goose</span><span class="w zz"><svg class="i " aria-hidden="true"><use href="#i-moon"/></svg>0.0</span></li><li class="tab sleep"><span class="fav"><svg class="i " aria-hidden="true"><use href="#i-gh"/></svg></span><span class="t">Grumbash/goose-mini-browser</span><span class="w zz"><svg class="i " aria-hidden="true"><use href="#i-moon"/></svg>0.0</span></li></ul></div><div class="main dev"><div class="bar"><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-side"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-l"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-chev-r"/></svg></span><span class="addr"><svg class="i lk" aria-hidden="true"><use href="#i-lock"/></svg><span class="host">localhost:5173</span><span class="path">/</span></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-share"/></svg></span><span class="btn txt on"><svg class="i " aria-hidden="true"><use href="#i-phone"/></svg>Open on iPhone</span><span class="btn on"><svg class="i " aria-hidden="true"><use href="#i-code"/></svg></span><span class="btn"><svg class="i " aria-hidden="true"><use href="#i-plus"/></svg></span></div>
+<div class="devarea">
+  <div class="views">
+    <div class="vp"><span class="cap">1280 × 800</span>
+      <div class="site"><div class="logo">goose</div>
+        <h4>Light on memory. Quick on Mac and iPhone.</h4>
+        <p>A browser that shows what every tab weighs and puts idle tabs to sleep.</p>
+        <span class="cta">Join the beta</span>
+        <div class="widget"><span><svg class="i " aria-hidden="true"><use href="#i-alert"/></svg>Tab weights did not load</span><small>GET /api/weights · 500</small></div>
+      </div>
+    </div>
+    <div class="vp vp-ph"><span class="cap">390 × 844</span>
+      <div class="site sm"><div class="logo">goose</div>
+        <h4 class="over">Light on memory.</h4>
+        <span class="flag">412 px wide on a 390 px screen</span>
+        <p>A browser that shows what every tab weighs.</p>
+      </div>
+    </div>
+  </div>
+  <div class="drawer">
+    <div class="dtabs"><span class="dtab">Console <b class="n bad">1</b></span><span class="dtab on">Requests <b class="n">6</b></span>
+      <span class="dtab">Frames</span><span class="dtab">Weights</span><span class="dsp"></span><span class="dtab ins"><svg class="i " aria-hidden="true"><use href="#i-search"/></svg>Inspect</span></div>
+    <div class="reqs"><span class="ms">18 ms</span><span class="pth">GET /</span><span class="knd">html</span><span class="sz">3.2 KB</span><span class="st">200</span><span class="ms">32 ms</span><span class="pth">GET /src/main.ts</span><span class="knd">js</span><span class="sz">41.6 KB</span><span class="st">200</span><span class="ms">21 ms</span><span class="pth">GET /src/hero.css</span><span class="knd">css</span><span class="sz">6.1 KB</span><span class="st">200</span><span class="ms">44 ms</span><span class="pth">GET /fonts/display.woff2</span><span class="knd">font</span><span class="sz">38.4 KB</span><span class="st">200</span><span class="ms">112 ms</span><span class="pth bad">GET /api/weights</span><span class="knd">json</span><span class="sz">0.4 KB</span><span class="st bad"><svg class="i " aria-hidden="true"><use href="#i-alert"/></svg>500</span><span class="ms">27 ms</span><span class="pth">GET /img/phone.webp</span><span class="knd">img</span><span class="sz">88.0 KB</span><span class="st">200</span></div>
+  </div>
+</div></div></div></div></div>
+      <figcaption>Dev mode: the project's phone and desktop views, requests and the failing call.</figcaption></figure>
+    <div class="cell c-spec spec">
+      <h4>Signature move</h4><p>The pack. The sidebar opens with the window's total and a bar split by tab at one fixed scale (500 MB across). Sleeping tabs leave the bar, turn glacier blue, and show what they save.</p>
+      <h4>Palette</h4><ul class="chips"><li><span class="sw" style="background:#FF5A1F"></span><span><b>Safety orange</b><span class="hx">#FF5A1F · live and primary</span></span></li><li><span class="sw" style="background:#0796B8"></span><span><b>Glacier blue</b><span class="hx">#0796B8 · asleep</span></span></li><li><span class="sw" style="background:#101418"></span><span><b>Trail black</b><span class="hx">#101418 · ink</span></span></li><li><span class="sw" style="background:#F4F8F7"></span><span><b>Fabric white</b><span class="hx">#F4F8F7 · translucent sidebar</span></span></li><li><span class="sw" style="background:#C9D3D1"></span><span><b>Contour grey</b><span class="hx">#C9D3D1 · wallpaper lines</span></span></li></ul>
+      <h4>Type</h4><p>Archivo, semi-condensed, for labels; Martian Mono for weights; San Francisco for controls.</p>
+      <h4>Risk</h4><p>It sits closest to Arc's and Zen's sidebar, so it can read as familiar. The outdoor world has to stay in colour, type and the pack bar, never in textures.</p><p class="pick">My pick: it puts the product's promise, weight you can see, on every screen.</p>
+    </div>
+  </div>
+</article>
+  <div class="declined"><h3>Worlds I weighed and turned down</h3><ul>
+    <li><b>Boarding pass and gate board</b><span>Read as a travel app. Station keeps its rows that move in place.</span></li>
+    <li><b>Developer console</b><span>Read as a tool for developers only. Station keeps its folding panels.</span></li>
+    <li><b>Botanical folio</b><span>Too far from a browser. Station keeps its single fixed scale.</span></li>
+    <li><b>Orienteering map</b><span>Too niche. Station keeps one colour for the live tab.</span></li>
+    <li><b>Data field</b><span>Too cold for everyday use. Station keeps its exact figures.</span></li>
+  </ul></div>
+</section>
+
+<section id="next" class="wrap">
+  <h2>What I need from you</h2>
+  <ol class="asks">
+    <li><b>Pick a direction.</b> A, B or C, or ask for three new ones. The winner becomes our chrome, written in HTML and
+      CSS for our engine.</li>
+    <li><b>Connect your personal GitHub.</b> Then I commit the plan, this draft and the measurements on a branch.</li>
+    <li><b>The name.</b> goose is a working name; the Goose language and Block's goose agent already use it.</li>
+  </ol>
+  <p class="method">Not verified yet: CI, Goose on an iPhone, and the long-article scroll test. Images and video are
+  Gleb's part.</p>
+  <h3 style="margin-top:44px">Sources</h3>
+  <ol class="sources"><li><a href="https://browsercompany.substack.com/p/letter-to-arc-members-2025">Arc: letter to members (May 2025)</a></li><li><a href="https://www.androidauthority.com/arc-browser-shutting-down-december-2026-3726900/">Android Authority: Arc shuts down on 22 Dec (22 Oct 2026)</a></li><li><a href="https://blog.google/products-and-platforms/products/chrome/new-chrome-productivity-features/">Google: vertical tabs in Chrome (7 Apr 2026)</a></li><li><a href="https://www.firefox.com/en-US/firefox/149.0/releasenotes/">Firefox 149 release notes (24 Mar 2026)</a></li><li><a href="https://blogs.windows.com/msedgedev/2022/12/06/sleeping-tabs-edge-105-sleep-before-discarding/">Microsoft Edge: sleeping tabs (6 Dec 2022)</a></li><li><a href="https://cyberinsider.com/?p=339072">CyberInsider: uBlock Origin removed from the Chrome Web Store (2026)</a></li><li><a href="https://support.apple.com/en-us/102651">Apple: iCloud data protection overview</a></li><li><a href="https://polypane.app/">Polypane</a></li><li><a href="https://sizzy.co/">Sizzy</a></li><li><a href="https://blog.kagi.com/update-orion-linux-windows">Kagi: an update on Orion for Linux and Windows (2 Oct 2026)</a></li><li><a href="https://developer.apple.com/support/alternative-browser-engines/">Apple: alternative browser engines in the EU</a></li><li><a href="https://developer.apple.com/support/alternative-browser-engines-jp/">Apple: alternative browser engines in Japan</a></li><li><a href="https://open-web-advocacy.org/blog/the-digital-markets-act-is-delivering-real-wins-but-not-yet-for-browser-engines/">Open Web Advocacy: the DMA and browser engines (May 2026)</a></li><li><a href="https://servo.org/wpt/">Servo: Web Platform Tests dashboard</a></li><li><a href="https://ladybird.org/newsletter/2026-09-30">Ladybird newsletter (30 Sep 2026)</a></li><li><a href="https://developer.apple.com/documentation/webkit/wkwebextensioncontroller">Apple: WKWebExtensionController</a></li></ol>
+</section>
+</main>
+<footer class="wrap">Design draft 1 · built from <code>design/build_draft.py</code> · engine plan in <code>docs/ENGINE.md</code> · product record in <code>PRODUCT.md</code></footer>

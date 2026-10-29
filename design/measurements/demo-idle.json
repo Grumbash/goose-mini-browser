@@ -1,0 +1,9 @@
+{
+ "idle_cpu_percent": 13.8,
+ "footprint_mb": 208.0,
+ "frames_drawn": 1200,
+ "wall_seconds": 10.37,
+ "frames_per_second": 115.7,
+ "page": "page1.html",
+ "note": "Window left idle the whole time: no input, nothing loading."
+}

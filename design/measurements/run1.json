@@ -1,0 +1,190 @@
+[
+ {
+  "label": "webkit-blank",
+  "total_mb": 63.2,
+  "processes": [
+   {
+    "name": "com.apple.WebKit.WebContent",
+    "pid": 3874,
+    "mb": 25.8
+   },
+   {
+    "name": "webview_probe",
+    "pid": 3868,
+    "mb": 21.0
+   },
+   {
+    "name": "com.apple.WebKit.GPU",
+    "pid": 3872,
+    "mb": 11.4
+   },
+   {
+    "name": "com.apple.WebKit.Networking",
+    "pid": 3873,
+    "mb": 5.3
+   }
+  ],
+  "errors": [],
+  "log": [
+   "PID 3868",
+   "LOADED about:blank 1/1"
+  ]
+ },
+ {
+  "label": "webkit-3tabs",
+  "total_mb": 348.5,
+  "processes": [
+   {
+    "name": "com.apple.WebKit.WebContent",
+    "pid": 3961,
+    "mb": 182.7
+   },
+   {
+    "name": "com.apple.WebKit.WebContent",
+    "pid": 3960,
+    "mb": 56.8
+   },
+   {
+    "name": "com.apple.WebKit.GPU",
+    "pid": 3955,
+    "mb": 36.0
+   },
+   {
+    "name": "com.apple.WebKit.WebContent",
+    "pid": 3957,
+    "mb": 27.3
+   },
+   {
+    "name": "webview_probe",
+    "pid": 3954,
+    "mb": 24.0
+   },
+   {
+    "name": "com.apple.WebKit.Networking",
+    "pid": 3956,
+    "mb": 22.0
+   }
+  ],
+  "errors": [],
+  "log": [
+   "PID 3954",
+   "LOADED https://example.com/ 1/3",
+   "LOADED https://developer.mozilla.org/en-US/docs/Web/JavaScript 2/3",
+   "LOADED https://github.com/aardappel/goose 3/3"
+  ]
+ },
+ {
+  "label": "chrome-blank",
+  "total_mb": 428.5,
+  "processes": [
+   {
+    "name": "Google Chrome Helper",
+    "pid": 3996,
+    "mb": 183.1
+   },
+   {
+    "name": "Google Chrome",
+    "pid": 3990,
+    "mb": 90.7
+   },
+   {
+    "name": "Google Chrome Helper (Renderer)",
+    "pid": 4000,
+    "mb": 53.7
+   },
+   {
+    "name": "Google Chrome Helper (Renderer)",
+    "pid": 4002,
+    "mb": 27.6
+   },
+   {
+    "name": "Google Chrome Helper (Renderer)",
+    "pid": 4030,
+    "mb": 25.3
+   },
+   {
+    "name": "Google Chrome Helper",
+    "pid": 3997,
+    "mb": 24.1
+   },
+   {
+    "name": "Google Chrome Helper",
+    "pid": 3998,
+    "mb": 19.0
+   },
+   {
+    "name": "GoogleUpdater",
+    "pid": 4111,
+    "mb": 3.6
+   },
+   {
+    "name": "GoogleUpdater",
+    "pid": 4108,
+    "mb": 3.4
+   }
+  ],
+  "errors": []
+ },
+ {
+  "label": "chrome-3tabs",
+  "total_mb": 606.6,
+  "processes": [
+   {
+    "name": "Google Chrome Helper",
+    "pid": 4207,
+    "mb": 201.3
+   },
+   {
+    "name": "Google Chrome",
+    "pid": 4203,
+    "mb": 96.3
+   },
+   {
+    "name": "Google Chrome Helper (Renderer)",
+    "pid": 4214,
+    "mb": 92.6
+   },
+   {
+    "name": "Google Chrome Helper (Renderer)",
+    "pid": 4211,
+    "mb": 53.3
+   },
+   {
+    "name": "Google Chrome Helper (Renderer)",
+    "pid": 4212,
+    "mb": 48.0
+   },
+   {
+    "name": "Google Chrome Helper (Renderer)",
+    "pid": 4213,
+    "mb": 35.2
+   },
+   {
+    "name": "Google Chrome Helper",
+    "pid": 4208,
+    "mb": 32.7
+   },
+   {
+    "name": "Google Chrome Helper (Renderer)",
+    "pid": 4244,
+    "mb": 25.9
+   },
+   {
+    "name": "Google Chrome Helper",
+    "pid": 4209,
+    "mb": 19.9
+   },
+   {
+    "name": "GoogleUpdater",
+    "pid": 4304,
+    "mb": 3.5
+   },
+   {
+    "name": "GoogleUpdater",
+    "pid": 4301,
+    "mb": 3.4
+   }
+  ],
+  "errors": []
+ }
+]

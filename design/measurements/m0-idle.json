@@ -1,0 +1,9 @@
+{
+ "idle_cpu_percent": 0.0,
+ "cpu_seconds_in_window": 0.0,
+ "footprint_mb": 27.0,
+ "frames_presented_total": 1,
+ "idle_window_seconds": 10.01,
+ "output": "frames presented: 1",
+ "note": "Window left idle: no input. Frames include the first paint and any resize."
+}

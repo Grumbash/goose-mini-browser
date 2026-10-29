@@ -1,0 +1,53 @@
+{
+ "label": "webkit-mock4",
+ "total_mb": 434.3,
+ "processes": [
+  {
+   "name": "com.apple.WebKit.WebContent",
+   "pid": 14832,
+   "mb": 192.7
+  },
+  {
+   "name": "com.apple.WebKit.WebContent",
+   "pid": 14831,
+   "mb": 59.2
+  },
+  {
+   "name": "com.apple.WebKit.WebContent",
+   "pid": 14823,
+   "mb": 58.9
+  },
+  {
+   "name": "com.apple.WebKit.GPU",
+   "pid": 14820,
+   "mb": 42.9
+  },
+  {
+   "name": "com.apple.WebKit.WebContent",
+   "pid": 14830,
+   "mb": 28.6
+  },
+  {
+   "name": "com.apple.WebKit.Networking",
+   "pid": 14821,
+   "mb": 28.3
+  },
+  {
+   "name": "webview_probe",
+   "pid": 14818,
+   "mb": 24.2
+  }
+ ],
+ "errors": [],
+ "log": [
+  "PID 14818",
+  "LOADED https://example.com/ 1/4",
+  "LOADED https://developer.mozilla.org/en-US/docs/Web/JavaScript 2/4",
+  "LOADED https://en.wikipedia.org/wiki/Focaccia 3/4",
+  "LOADED https://github.com/aardappel/goose 4/4",
+  "TAB 14823 https://en.wikipedia.org/wiki/Focaccia",
+  "TAB 14830 https://example.com/",
+  "TAB 14831 https://developer.mozilla.org/en-US/docs/Web/JavaScript",
+  "TAB 14832 https://github.com/aardappel/goose"
+ ]
+}
