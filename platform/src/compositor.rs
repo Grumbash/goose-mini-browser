@@ -191,15 +191,26 @@ impl Compositor {
     ) -> Result<(), i32> {
         let mut instances = std::mem::take(&mut self.layers[layer].instances);
         instances.clear();
+        let mut rescaled = false;
         with_text(|t| {
             if t.atlas.scale != scale {
                 // Glyphs drawn for another backing scale are of no use now.
                 t.atlas = Atlas::new(scale);
                 self.atlas_rows = 0;
+                rescaled = true;
             }
             build(items, text, scale, t, &mut instances);
             self.upload_atlas(&mut t.atlas)
         })?;
+        if rescaled {
+            // The other layers' glyphs point into the old atlas: they draw
+            // nothing until they are set again at the new scale.
+            for (i, other) in self.layers.iter_mut().enumerate() {
+                if i != layer {
+                    *other = Layer::default();
+                }
+            }
+        }
         self.layers[layer].buffer = if instances.is_empty() {
             None
         } else {
