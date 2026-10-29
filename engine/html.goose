@@ -219,8 +219,26 @@ fn end_tag(p: Parser&) {
         let br = make_element(p.d, "br", current_parent(p));
         return;
     }
-    let k = find_open(p, name[..], "");
+    let k = if is_table_part(name[..]) { find_open_in_table(p, name[..]) } else { find_open(p, name[..], "") };
     if k >= 0 { pop_to(p, k); }
+}
+
+fn is_table_part(n: const u8[:]) -> bool {
+    return n == "table" || n == "caption" || n == "tbody" || n == "thead" || n == "tfoot" || n == "tr" || n == "td" || n == "th";
+}
+
+// Like find_open for the end tags of a table's parts, which reach through the
+// cells and rows still open (the table scope of the WHATWG algorithm): </table>
+// closes them all, </tr> the cell open in its row.
+fn find_open_in_table(p: Parser&, name: const u8[:]) -> i64 {
+    var k = p.open.len - 1;
+    while k >= 0 {
+        let n = node_name(p.d, p.open[k]);
+        if n == name { return k; }
+        if n == "table" || n == "template" { return -1; }
+        k -= 1;
+    }
+    return -1;
 }
 
 // The index in the open stack of the nearest element called `name`, searching

@@ -39,6 +39,9 @@ fn test_html() {
     check("scripts are skipped, styles kept, stray end tags ignored",
           tree_of("<p>x</span><script>if (a < b) { x() }</script><style>p { color: red }</style></p>"),
           "#document\n  html\n    head\n    body\n      p\n        \"x\"\n        script\n        style\n          \"p { color: red }\"\n");
+    check("</table> closes the cells and rows still open",
+          tree_of("<table><tr><td>a<td>b</table><p>after"),
+          "#document\n  html\n    head\n    body\n      table\n        tr\n          td\n            \"a\"\n          td\n            \"b\"\n      p\n        \"after\"\n");
     check("a heading closes the paragraph before it",
           tree_of("<P>Intro<H2 class=c>Heading</H2>after"),
           "#document\n  html\n    head\n    body\n      p\n        \"Intro\"\n      h2 class=\"c\"\n        \"Heading\"\n      \"after\"\n");
