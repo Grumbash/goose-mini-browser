@@ -9,6 +9,7 @@ import std;
 import os;
 import gfx;
 import ui;
+import math;
 import .net;
 
 struct Item { kind: i64, text: u8[varint], href: u8[varint], color: u32 }
@@ -339,9 +340,16 @@ fn main() {
     // fixed pixel density, which stays constant across a resize, so it is
     // computed once, here, rather than every frame.
     let initial_px = gfx::screen_size();
-    let ui_scale = max((initial_px.x as f32) / WIN_W, 1.0);
+    let ui_scale = max(round((initial_px.x as f32) / WIN_W), 1.0);
 
-    var ctx = ui::create(15.0, ui_scale);
+    // Nuklear's built-in font (no asset file needed) is a bitmap font, not
+    // a scalable one: docs/stdlib.md says 13 is its native size, and it
+    // "scales well only by whole numbers." 15 wasn't that native size to
+    // begin with, so baking it and then multiplying by an integer ui_scale
+    // compounds two resampling errors into visibly blurry text. 13 bakes
+    // pixel-perfect, and ui_scale (the display's own pixel density) stays
+    // a clean integer on every display that matters here.
+    var ctx = ui::create(13.0, ui_scale);
     guard ctx.id != 0 else {
         write_stderr(str("ui: ", ui::error(), "\n"));
         return;
