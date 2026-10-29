@@ -270,7 +270,10 @@ fn translate(p: &Platform, ev: &NSEvent) -> Option<GpEvent> {
 
 /// After AppKit has handled an event: notice a closed window or a new size.
 fn check_window(p: &mut Platform) {
-    if p.open && !p.window.isVisible() {
+    // A minimized window, and every window of a hidden app, isn't visible
+    // either: only a window that is none of these has been closed.
+    let closed = !p.window.isVisible() && !p.window.isMiniaturized() && !p.app.isHidden();
+    if p.open && closed {
         p.open = false;
         p.pending.push_back(GpEvent {
             kind: EV_CLOSE,
