@@ -1,0 +1,91 @@
+# Tusk's checks on Apple silicon (docs/adr/0002): the platform layer's tests
+# and lints, the engine's checks, the app's build, a snapshot of the M1 page,
+# and a screenshot of it drawn offscreen where the runner has a Metal device.
+name: Tusk
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      GOOSE_PIN: cce94b919d27458856ae2685974049eac78debcf  # docs/adr/0001
+      GOOSE_BIN: ${{ github.workspace }}/../goose/build/goose
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the Goose compiler
+        id: goose
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../goose
+          key: goose-${{ env.GOOSE_PIN }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build Goose at the pinned commit
+        if: steps.goose.outputs.cache-hit != 'true'
+        run: |
+          git init ../goose
+          cd ../goose
+          git remote add origin https://github.com/aardappel/goose.git
+          git fetch --depth 1 origin "$GOOSE_PIN"
+          git checkout --detach FETCH_HEAD
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j "$(sysctl -n hw.ncpu)"
+
+      - name: Cache Rust builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            platform/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('platform/Cargo.lock') }}
+
+      - name: Platform layer (fmt, clippy, tests)
+        working-directory: platform
+        run: |
+          rustup update stable
+          cargo fmt --check
+          cargo clippy --release --all-targets -- -D warnings
+          cargo test --release
+
+      - name: Build the app
+        run: ./app/build.sh
+
+      - name: Engine checks
+        run: |
+          "$GOOSE_BIN" tests/engine_test.goose
+
+      - name: Snapshot of the M1 page
+        run: |
+          ./app/tusk snapshot tests/pages/focaccia.html > snapshot.txt
+          grep -q 'heading "Etymology" \[level=2\]' snapshot.txt
+
+      - name: Look for a Metal device
+        id: metal
+        run: |
+          if system_profiler SPDisplaysDataType | grep -q "Metal"; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Metal device on this runner: the screenshot is skipped."
+          fi
+
+      - name: Screenshot of the M1 page, drawn offscreen
+        if: steps.metal.outputs.found == 'true'
+        run: |
+          ./app/tusk --screenshot focaccia.png
+          # A blank window compresses to a few KB; the article is hundreds.
+          test "$(stat -f %z focaccia.png)" -gt 100000
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tusk-m1
+          path: |
+            snapshot.txt
+            focaccia.png
+          if-no-files-found: ignore
