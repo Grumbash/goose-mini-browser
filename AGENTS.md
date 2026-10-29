@@ -11,7 +11,7 @@ I want to understand my own code, not just close tasks. So the agent explains be
 - What it is: a tiny GUI web browser written in [Goose](https://github.com/aardappel/goose) (a young, heap-free, GC-free systems language), with the HTTP(S) networking Goose v1 doesn't ship bolted on via a small Rust FFI shim.
 - Stack: Goose compiled to C (the `browser/` program — HTML scanning, an SDL3/Nuklear UI via the `gfx`/`ui` packages, a `thread_fn` worker for non-blocking fetches) + Rust (`goosenet/`, a `cdylib` using `rustls`/`webpki-roots`, exposed through a plain C ABI and bound with `extern "goosenet" { ... }`).
 - Glossary: none yet — this is a small two-crate project; a `CONTEXT.md` is worth starting once the vocabulary (job queues, the HTML scanner's block/kind model, the FFI boundary's ownership rules) needs to stop living only in comments.
-- Decisions: no `docs/adr/` yet. Start one the first time a non-obvious choice (e.g. why `thread_fn` + typed queues instead of callbacks, why hand-rolled HTML scanning instead of a real parser) needs to survive past the commit that made it.
+- Decisions: [`docs/adr/`](docs/adr/README.md). Tusk, the engine of our own beside the demo, is set out in 0001–0009; a new decision gets the next number.
 
 ## Commands
 

@@ -16,6 +16,14 @@ blocking the UI thread while a request or an image decode is in flight.
 This is a demo/learning project, not a production browser. See
 [Limitations](#limitations) for exactly where it stops.
 
+## Where this is going: Tusk
+
+The demo in `browser/` is the starting point. Beside it we are building **Tusk**:
+a browser for the two of us, on an engine of our own written in Goose, with Rust
+for the modules Goose doesn't have, for Apple silicon only. Smooth first, idle
+means zero, memory is a budget, and AI tools are users too. The decisions behind
+it are in [docs/adr/](docs/adr/README.md).
+
 ## Why this exists
 
 Goose v1 ships no sockets, no TLS, and no subprocess support by design (see
