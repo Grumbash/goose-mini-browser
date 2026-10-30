@@ -17,6 +17,7 @@ import engine.html;
 import engine.css;
 import engine.layout;
 import .tab;
+import .net;
 
 extern "tusk_platform" {
     fn tp_set_layer(layer: i32, items: const DItem[:], text: const u8[:], paths: const f32[:], scale: f32) -> i32;
@@ -137,10 +138,11 @@ fn errors_of(t: Tab, T: UiText) -> i64 {
 fn loc_of(t: Tab, T: UiText) -> const u8[:] { return note(T, t.loc_at, t.loc_len); }
 
 // Where the host of web address `loc` starts and ends, its port included:
-// past "://", up to the path. For a file's path, 0 and 0.
+// past "://" and any user's name and password, up to the path. For a file's
+// path, 0 and 0.
 fn host_span(loc: const u8[:]) -> i64, i64 {
     let s = find(loc, "://");
-    guard s > 0 else { return 0, 0; }
+    guard s > 0 && is_web(loc) else { return 0, 0; }
     var a = s + 3;
     var b = a;
     while b < loc.len && loc[b] != '/' && loc[b] != '?' && loc[b] != '#' {
@@ -151,10 +153,10 @@ fn host_span(loc: const u8[:]) -> i64, i64 {
 }
 
 // Where the last step of `loc`'s path starts: past its last '/' before any
-// query or fragment.
+// query or fragment. A file's path has neither: '?' and '#' are in its name.
 fn last_step(loc: const u8[:]) -> i64 {
     var end = loc.len;
-    for c, j in loc { if (c == '?' || c == '#') && j < end { end = j; break; } }
+    if is_web(loc) { for c, j in loc { if (c == '?' || c == '#') && j < end { end = j; break; } } }
     var name: i64 = 0;
     for j in 0..end { if loc[j] == '/' { name = j + 1; } }
     return name;
@@ -167,7 +169,7 @@ fn name_of(t: Tab, T: UiText) -> const u8[:] {
     let h0, h1 = host_span(loc);
     let name = last_step(loc);
     var end = loc.len;
-    for c, j in loc { if (c == '?' || c == '#') && j >= name { end = j; break; } }
+    if h1 > h0 { for c, j in loc { if (c == '?' || c == '#') && j >= name { end = j; break; } } }
     if h1 > h0 && (name <= h1 || name >= end) { return loc[h0..h1]; }
     return loc[name..end];
 }
@@ -273,11 +275,12 @@ fn address(out: u8[>..]&, p: const u8[:], room: i64) {
         let local = host == "localhost" || host == "127.0.0.1" || host == "[::1]" || ends_with(host, ".localhost");
         out.append("<span class=\"env\">");
         if local { out.append("LOCAL"); }
-        else { for c in p[..h0 - 3] { out.push(if c >= 'a' && c <= 'z' { c - 32 } else { c }); } }
+        else { for c in p[..find(p, "://")] { out.push(if c >= 'a' && c <= 'z' { c - 32 } else { c }); } }
         out.append("</span><span class=\"u\">");
         if local {
+            // The scheme alone: a user's name and password stay out of the bar.
             out.append("<i>");
-            esc(out, p[..h0]);
+            esc(out, p[..find(p, "://") + 3]);
             out.append("</i>");
         }
         out.append("<b>");

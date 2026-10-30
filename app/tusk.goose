@@ -442,14 +442,17 @@ fn show_ui(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, last_ms: f32, scale
     return took;
 }
 
-// The boar on his rail, `t` seconds into tab k's load, over the content's foot.
-fn show_loader(F: UiFiles, U: Ui, k: i64, t: f32, scale: f32) {
-    // The rail fills with the document's bytes as they come, when the server
-    // said how many; else, and for a file, toward its end, never quite there.
+// The boar on his rail, `t` seconds into page `page`'s load, over the
+// content's foot. The rail fills toward its end with time, never quite
+// there, and faster with the document's bytes as they come when the server
+// said how many; it never goes back from `rail`, where it got to last.
+fn show_loader(F: UiFiles, U: Ui, page: i32, t: f32, scale: f32, rail: f32&) {
     var got: i64 = 0;
     var of: i64 = -1;
     var p = 1.0 - exp(-t / 1.5);
-    if tp_net_progress(k as i32, got, of) == 1 && of > 0 { p = min((got / of) as f32, 1.0); }
+    if page >= 0 && tp_net_progress(page, got, of) == 1 && of > 0 { p = max(p, min((got as f64 / of as f64) as f32, 1.0)); }
+    p = max(p, rail);
+    rail = p;
     var html: u8[>..] = [];
     loader_html(F, U.w, p, t, html);
     var none = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
@@ -532,6 +535,11 @@ fn main() {
         else if a.len > 0 && a[0] != '-' && path_ends.len < MAX_TABS {
             if is_web(a) {
                 guard resolve_url(a, a, paths) else { usage(); return; }
+            } else if starts_with(a, "file://") {
+                // A file's URL opens as its path.
+                var path: u8[>..] = [];
+                as_loc(a, path);
+                full_path(path[..], paths);
             } else {
                 full_path(a, paths);
             }
@@ -695,6 +703,8 @@ fn main() {
     var sized = Rect { x: 0.0, y: 0.0, w: -1.0, h: -1.0 };   // the slot the tabs were laid out for
     var sized_scale: f32 = 0.0;      // and the backing scale
     var last_step: i64 = 0;          // the boar's last step
+    var rail: f32 = 0.0;             // how far his rail has filled, for page rail_page
+    var rail_page: i32 = -1;
     // The window's line: frames drawn for what changed on screen since it
     // was measured, when it was, and the CPU time then, Tusk's and the
     // whole Mac's (busy and in all, in ticks).
@@ -900,8 +910,7 @@ fn main() {
                         // A page Tusk can't show yet opens in Safari (docs/adr/0001).
                         var url: u8[>..] = [];
                         let loc = loc_of(tabs[U.cur], T);
-                        if !is_web(loc) { url.append("file://"); }
-                        url.append(loc);
+                        if is_web(loc) { url.append(loc); } else { file_url(loc, url); }
                         tp_open_in_safari(url[..]);
                     }
                     else if (mods & MOD_COMMAND) != 0 {
@@ -1008,7 +1017,8 @@ fn main() {
         // His next step, every STEP_MS whatever else happens meanwhile.
         var stepped = false;
         if U.running && scale > 0.0 && (redo || ms(last_step, clock_ns()) >= STEP_MS) {
-            show_loader(F, U, U.cur, ms(shown.opened, clock_ns()) as f32 / 1000.0, scale);
+            if shown.page != rail_page { rail = 0.0; rail_page = shown.page; }
+            show_loader(F, U, shown.page, ms(shown.opened, clock_ns()) as f32 / 1000.0, scale, rail);
             last_step = clock_ns();
             stepped = true;
         }

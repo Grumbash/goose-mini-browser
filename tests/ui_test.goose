@@ -18,6 +18,7 @@ import app.ui;
 import app.net;
 import app.history;
 import app.address;
+import app.sheets;
 
 var failures = 0;
 
@@ -311,7 +312,45 @@ fn test_address() {
     yes("a click on the address types in it", find(html[..], "data-action=\"address\"") >= 0);
 }
 
+fn test_bar_names_and_log() {
+    var bar: u8[>..] = [];
+    address(bar, "https://user:secret@example.com/path", 80);
+    yes("a URL's user and password stay out of the bar", find(bar[..], "secret") < 0 && find(bar[..], "USER") < 0
+        && find(bar[..], ">HTTPS<") >= 0 && find(bar[..], "<b>example.com</b>/path") >= 0);
+    var local: u8[>..] = [];
+    address(local, "http://me:pw@localhost:8000/", 80);
+    yes("on this Mac too", find(local[..], "pw") < 0 && find(local[..], "<i>http://</i><b>localhost</b>") >= 0);
+    var path: u8[>..] = [];
+    path.append("/Users/v/notes/C#/intro?.html");
+    var notes: u8[>..] = [];
+    notes.append(path);
+    var edit: u8[>..] = [];
+    let T = UiText { notes: notes, edit: edit };
+    let info = FrameInfo { height: 0.0, background: 0, nodes: 0, bytes: 0, parse: 0.0, style: 0.0, measure: 0.0,
+                           layout: 0.0, scale: 1.0, read: 0.0 };
+    var tabs: Tab[>..] = [];
+    tabs.push(Tab { worker: -1, page: -1, ready: true, failed: false, info: info, paint: 0.0, waiting: false, scroll: 0.0,
+                    restore: -1.0, opened: 0, load_ms: 0.0, status: 0, entry: -1, loc_at: 0, loc_len: path.len, title_at: 0,
+                    title_len: 0, why_at: 0, why_len: 0, log_at: 0, log_len: 0, elems_at: 0, elems_len: 0 });
+    check("a file's name keeps its ? and #", str(name_of(tabs[0], T), " ", board_of(tabs[..], T)), "intro?.html C#");
+    var log: u8[>..] = [];
+    for k in 45 { format(log, "Sheet ", k, " failed\n"); }
+    var long: u8[>..] = [];
+    long.append("Sheet ");
+    for k in 400 { long.push('x'); }
+    var told: u8[>..] = [];
+    capped_log(log[..], told);
+    var lines: i64 = 0;
+    for c in told { if c == '\n' { lines += 1; } }
+    check("a page's log is at most 40 lines, and says how many more", str(lines, " ", told[told.len - 11..]), "41 And 5 more\n");
+    var cut: u8[>..] = [];
+    long.push('\n');
+    capped_log(long[..], cut);
+    check("and each line at most 300 bytes", str(cut.len), str(300 + 3 + 1));
+}
+
 fn main() {
+    test_bar_names_and_log();
     test_address();
     test_links();
     test_history();

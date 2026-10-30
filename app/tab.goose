@@ -154,7 +154,11 @@ fn show_page(tab: i32, loc: const u8[:], profile: i32, dark: bool, reload: bool)
     var log: u8[>..] = [];
     guard gather_sheets(tab, profile, flags, d, page[..], base[..], sheet_texts, sheet_ends, sheet_medias,
                         sheet_media_ends, later, log) else { return; }
-    if log.len > 0 { tp_post_reply(tab, REPLY_LOG, 0, log[..]); }
+    if log.len > 0 {
+        var told: u8[>..] = [];
+        capped_log(log[..], told);
+        tp_post_reply(tab, REPLY_LOG, 0, told[..]);
+    }
     info.read += ms_since(t);
     t = clock_ns();
     var rules: Rule[>..] = [];
@@ -172,22 +176,19 @@ fn show_page(tab: i32, loc: const u8[:], profile: i32, dark: bool, reload: bool)
     // Styled for the viewport the main thread asked for while the page came,
     // or else the design's window.
     var env = MediaEnv { width: 1200.0, height: 760.0, scale: 2.0, dark: dark };
-    for m in later { if m.kind == MSG_SIZE { env = MediaEnv { width: m.a, height: m.b, scale: m.c, dark: dark }; } }
+    var sized = false;
+    for m in later {
+        if m.kind == MSG_SIZE { env = MediaEnv { width: m.a, height: m.b, scale: m.c, dark: dark }; sized = true; }
+    }
+    // With no size asked for, a snapshot's width (`tusk snapshot`).
+    for m in later {
+        if m.kind == MSG_SNAPSHOT && !sized { env = MediaEnv { width: m.a, height: m.b, scale: 2.0, dark: dark }; sized = true; }
+    }
     set_media(sh, env);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
     info.style = ms_since(t);
-    t = clock_ns();
-    var text: u8[>..] = [];
-    var carets: f32[>..] = [];
-    var runs: Run[>..] = [];
-    var run_of: i32[>..] = [];
-    var fonts: FontInfo[>..] = [];
-    let P = Page { d: d, styles: styles, text: text, carets: carets, runs: runs, run_of: run_of, fonts: fonts };
-    measure_page(P);
-    info.measure = ms_since(t);
     info.nodes = nodes.len as i32;
-    info.background = background_of(P);
     var title: u8[>..] = [];
     for n, k in nodes {
         if n.kind == NODE_ELEMENT && n.first >= 0 && node_name(d, k as i32) == "title" && styles[k].svg == 0 {
@@ -199,7 +200,43 @@ fn show_page(tab: i32, loc: const u8[:], profile: i32, dark: bool, reload: bool)
     var elems: u8[>..] = [];
     elements_of(d, elems);
     tp_post_reply(tab, REPLY_ELEMENTS, 0, elems[..]);
-    serve(tab, P, sh, env, info, later[..], base[..], page[..]);
+    // Measured, then served. A size or a snapshot that turns an @media on
+    // or off styles the page again and measures it afresh, in a pass of its
+    // own, so what the last pass measured goes with it. Before the first
+    // display list, what a pass costs counts toward the load's.
+    var viewport = env;
+    var shown = false;
+    var pending = copy(later);
+    loop {
+        t = clock_ns();
+        var text: u8[>..] = [];
+        var carets: f32[>..] = [];
+        var runs: Run[>..] = [];
+        var run_of: i32[>..] = [];
+        var fonts: FontInfo[>..] = [];
+        let P = Page { d: d, styles: styles, text: text, carets: carets, runs: runs, run_of: run_of, fonts: fonts };
+        measure_page(P);
+        info.measure = (if shown { 0.0 } else { info.measure }) + ms_since(t);
+        info.background = background_of(P);
+        var left: TabMsg[>..] = [];
+        guard serve(tab, P, sh, viewport, info, pending[..], base[..], page[..], shown, left) else { return; }
+        pending = copy(left);
+        t = clock_ns();
+        compute_styles(d, sh, styles);
+        info.style = (if shown { 0.0 } else { info.style }) + ms_since(t);
+    }
+}
+
+// Keeps message m from the main thread to answer once there is a page: a
+// size replaces one already kept, where it is, as the mailbox does
+// (platform/src/tabs.rs), so a quit never waits behind sizes no one wants.
+fn keep_for_later(later: TabMsg[>..]&, m: TabMsg) {
+    if m.kind == MSG_SIZE {
+        for w, k in later {
+            if w.kind == MSG_SIZE { later[k] = m; return; }
+        }
+    }
+    later.push(m);
 }
 
 // Loads the document at `url` on profile `profile`'s session into `src`, as
@@ -265,7 +302,7 @@ fn wait_net(tab: i32, req: i32, later: TabMsg[>..]&) -> bool {
         } else if m.kind == MSG_HIT {
             tp_post_reply(tab, REPLY_HIT, CURSOR_ARROW, "");
         } else {
-            later.push(m);
+            keep_for_later(later, m);
         }
     }
     return false;
@@ -337,15 +374,17 @@ fn one_line(out: u8[>..]&, s: const u8[:], max: i64) {
     }
 }
 
-// Answers the main thread for page P until it says quit: a display list for
-// each size, the pointer's shape for each point, a tree for each snapshot.
-// What it asked while the page came, `later`, is answered first. A size that
-// turns one of its sheets' @media on or off styles and measures it again
-// first, against sheets `sh`, for viewport `env`. A click on a link says
-// where it leads, its URL resolved against `base`, the page being `page`.
-fn serve(tab: i32, P: Page, sh: Sheet, env: MediaEnv, info: FrameInfo&, later: const TabMsg[:], base: const u8[:],
-         page: const u8[:]) {
-    var viewport = env;
+// Answers the main thread for page P, styled by sheets `sh` for `viewport`:
+// a display list for each size, the pointer's shape for each point, a tree
+// for each snapshot, where a clicked link leads (its URL resolved against
+// `base`, the page being `page`). What it asked while the page came, `later`,
+// is answered first. `shown` says whether a display list has gone. Returns
+// false when the main thread says quit; true when a size or a snapshot needs
+// the page styled for another viewport: set_media has set it, and `left`
+// gets that message and what of `later` came after it, to answer once
+// styled.
+fn serve(tab: i32, P: Page, sh: Sheet, viewport: MediaEnv&, info: FrameInfo&, later: const TabMsg[:], base: const u8[:],
+         page: const u8[:], shown: bool&, left: TabMsg[>..]&) -> bool {
     var items: DItem[>..<] = [];     // the display list as laid out last, for hit tests
     var bounds: f32[>..<] = [];      // where its items are: made at the first hit test after a layout
     var bounded = false;
@@ -357,32 +396,28 @@ fn serve(tab: i32, P: Page, sh: Sheet, env: MediaEnv, info: FrameInfo&, later: c
             m = later[next];
             next += 1;
         } else {
+            next = later.len + 1;    // past `later`: none of it is left
             // A mailbox that fails (closed under it) ends the worker.
             let got = tp_tab_next(tab, -1, m);
-            guard got >= 0 else { return; }
+            guard got >= 0 else { return false; }
             guard got == 1 else { continue; }
         }
-        if m.kind == MSG_QUIT { return; }
+        if m.kind == MSG_QUIT { return false; }
         if m.kind == MSG_SIZE {
-            viewport = MediaEnv { width: m.a, height: m.b, scale: m.c, dark: viewport.dark };
-            if set_media(sh, viewport) {
-                let t0 = clock_ns();
-                compute_styles(P.d, sh, P.styles);
-                info.style = ms_since(t0);
-                // Measured again: new runs go after the old, and each node
-                // points at its new one. The old stay until the page goes, a
-                // copy of its text for each flip.
-                let t1 = clock_ns();
-                measure_page(P);
-                info.measure = ms_since(t1);
-                info.background = background_of(P);
+            let wanted = MediaEnv { width: m.a, height: m.b, scale: m.c, dark: viewport.dark };
+            if set_media(sh, wanted) {
+                viewport = wanted;
+                keep_after(left, later, next, m, m);
+                return true;
             }
+            viewport = wanted;
             let t = clock_ns();
             info.height = lay_out(P, items, paths, m.a, m.b);
             info.layout = ms_since(t);
             info.scale = m.c;
             bounded = false;
             tp_post_frame(tab, items[..], P.text[..], paths[..], info);
+            shown = true;
         } else if m.kind == MSG_HIT {
             if !bounded {
                 hit_bounds(items[..], P.fonts[..], bounds);
@@ -398,11 +433,30 @@ fn serve(tab: i32, P: Page, sh: Sheet, env: MediaEnv, info: FrameInfo&, later: c
             let link = link_at(P.d, node_at(items[..], P.fonts[..], bounds[..], m.a, m.b));
             if link >= 0 { follow(tab, P, items[..], base, page, link, m.c != 0.0); }
         } else if m.kind == MSG_SNAPSHOT {
+            // Styled for the snapshot's width; then, if the window had a
+            // size, for the window's again.
+            let wanted = MediaEnv { width: m.a, height: m.b, scale: viewport.scale, dark: viewport.dark };
+            if set_media(sh, wanted) {
+                let back = TabMsg { kind: MSG_SIZE, a: viewport.width, b: viewport.height, c: viewport.scale };
+                viewport = wanted;
+                keep_after(left, later, next, m, if shown { back } else { m });
+                return true;
+            }
             var out: u8[>..] = [];
             snapshot_of(P, m.a, m.b, info, out);
             tp_post_reply(tab, REPLY_SNAPSHOT, 0, out[..]);
         }
     }
+    return false;
+}
+
+// What is left to answer once the page is styled again, onto `left`:
+// `first`, then `then` when it isn't `first` itself, then what of `later` is
+// from `next` on.
+fn keep_after(left: TabMsg[>..]&, later: const TabMsg[:], next: i64, first: TabMsg, then: TabMsg) {
+    left.push(first);
+    if then.kind != first.kind { left.push(then); }
+    for k in next..max(later.len, next) { left.push(later[k]); }
 }
 
 // Where a click on link `link` of page P (at `page`, its URLs resolving

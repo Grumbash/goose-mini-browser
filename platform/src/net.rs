@@ -613,11 +613,30 @@ pub extern "C" fn tp_net_progress(tab: i32, received: *mut i64, expected: *mut i
             return Ok(0);
         };
         unsafe {
-            received.write_unaligned(r.body.len() as i64);
+            received.write_unaligned(r.got);
             expected.write_unaligned(r.expected);
         }
         Ok(1)
     })
+}
+
+/// The size in bytes of the file at `path` (UTF-8), if it is a regular file:
+/// what a file's page may read as a sheet. A device, a pipe, a folder or
+/// nothing at all is ERR_ARGUMENT, so a page can't make its tab wait on one.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_file_size(path: GSlice<u8>) -> i64 {
+    let mut size = ERR_ARGUMENT as i64;
+    guarded(|| {
+        let path = std::str::from_utf8(unsafe { path.as_slice() }.ok_or(ERR_ARGUMENT)?)
+            .map_err(|_| ERR_ARGUMENT)?;
+        let meta = std::fs::metadata(path).map_err(|_| ERR_ARGUMENT)?;
+        if !meta.is_file() {
+            return Err(ERR_ARGUMENT);
+        }
+        size = meta.len() as i64;
+        Ok(0)
+    });
+    size
 }
 
 /// Opens `url` (UTF-8; http, https or file) in Safari, for a page Tusk can't
@@ -630,10 +649,12 @@ pub extern "C" fn tp_open_in_safari(url: GSlice<u8>) -> i32 {
         if !matches!(scheme_of(url).as_str(), "http" | "https" | "file") {
             return Err(ERR_ARGUMENT);
         }
-        std::process::Command::new("/usr/bin/open")
+        let mut child = std::process::Command::new("/usr/bin/open")
             .args(["-b", "com.apple.Safari", url])
             .spawn()
             .map_err(|_| ERR_ARGUMENT)?;
+        // Reaped once it is done, so it leaves no zombie behind.
+        std::thread::spawn(move || child.wait());
         Ok(0)
     })
 }
@@ -898,6 +919,20 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::time::Duration;
+
+    #[test]
+    fn only_a_regular_file_has_a_size() {
+        let slice = |s: &str| GSlice {
+            data: s.as_ptr().cast_mut(),
+            len: s.len() as i64,
+        };
+        let here = format!("{}/src/net.rs", env!("CARGO_MANIFEST_DIR"));
+        assert!(tp_file_size(slice(&here)) > 1000);
+        assert_eq!(tp_file_size(slice("/dev/stdin")), ERR_ARGUMENT as i64);
+        assert_eq!(tp_file_size(slice("/dev/zero")), ERR_ARGUMENT as i64);
+        assert_eq!(tp_file_size(slice("/tmp")), ERR_ARGUMENT as i64);
+        assert_eq!(tp_file_size(slice("/no/such/file")), ERR_ARGUMENT as i64);
+    }
 
     #[test]
     fn the_head_matches_the_goose_layout() {

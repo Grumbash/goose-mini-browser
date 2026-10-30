@@ -17,6 +17,9 @@ import .net;
 let SHEETS_MAX: i64 = 256;       // sheets per page, imports included
 let IMPORT_DEPTH: i32 = 4;
 let WAVE_MS: i64 = 10000;
+let SHEET_FILE_MAX: i64 = 16 << 20;  // a sheet read from a file, as the network's cap (docs/adr/0011)
+let LOG_LINES: i64 = 40;         // lines of what went wrong a page tells the interface
+let LOG_LINE_MAX: i64 = 300;     // bytes of each
 
 // A sheet: the one that imports it (-1 for the page's own), how deep, its
 // URL (what its imports resolve against), text and media (what its <link>,
@@ -41,7 +44,10 @@ fn gather_sheets(tab: i32, profile: i32, flags: i32, d: Doc, page: const u8[:], 
     var fetches: SheetFetch[>..] = [];
     var pool: u8[>..] = [];
     for n in sources {
-        guard fetches.len < SHEETS_MAX else { break; }
+        guard fetches.len < SHEETS_MAX else {
+            format(log, "Sheets past ", SHEETS_MAX, " are left out\n");
+            break;
+        }
         let k = fetches.len as i32;
         fetches.push(SheetFetch { parent: -1, depth: 0, url_at: pool.len, url_len: 0, text_at: 0, text_len: 0, media_at: 0,
                                   media_len: 0, req: 0 });
@@ -52,6 +58,9 @@ fn gather_sheets(tab: i32, profile: i32, flags: i32, d: Doc, page: const u8[:], 
             fetches[k].media_len = pool.len - fetches[k].media_at;
         }
         if node_name(d, n) == "style" {
+            // Its imports resolve against the page's base: its URL is that,
+            // after the media just added to the pool.
+            fetches[k].url_at = pool.len;
             pool.append(base);
             fetches[k].url_len = base.len;
             fetches[k].text_at = pool.len;
@@ -68,17 +77,25 @@ fn gather_sheets(tab: i32, profile: i32, flags: i32, d: Doc, page: const u8[:], 
         guard wait_sheets(tab, fetches, pool, later, log) else { return false; }
         let wave_to = fetches.len;
         for k in wave_from..wave_to {
-            guard fetches[k].depth < IMPORT_DEPTH && fetches[k].text_len > 0 else { continue; }
+            guard fetches[k].text_len > 0 else { continue; }
             var hrefs: u8[>..] = [];
             var href_ends: i64[>..] = [];
             var import_medias: u8[>..] = [];
             var import_media_ends: i64[>..] = [];
             sheet_imports(pool[fetches[k].text_at..fetches[k].text_at + fetches[k].text_len], hrefs, href_ends,
                           import_medias, import_media_ends);
+            guard fetches[k].depth < IMPORT_DEPTH || href_ends.len == 0 else {
+                format(log, "Sheet ", pool[fetches[k].url_at..fetches[k].url_at + fetches[k].url_len],
+                       " imports more, ", IMPORT_DEPTH, " imports deep, which is left out\n");
+                continue;
+            }
             var from: i64 = 0;
             var mfrom: i64 = 0;
             for e, h in href_ends {
-                guard fetches.len < SHEETS_MAX else { break; }
+                guard fetches.len < SHEETS_MAX else {
+                    format(log, "Sheets past ", SHEETS_MAX, " are left out\n");
+                    break;
+                }
                 let at = fetches.len as i32;
                 let media_at = pool.len;
                 pool.append(import_medias[mfrom..import_media_ends[h]]);
@@ -173,14 +190,31 @@ fn start_sheet(tab: i32, profile: i32, flags: i32, page: const u8[:], base: cons
     if is_web(page) {
         let req = tp_net_open(tab, profile, NET_STYLE, url[..], page, flags);
         if req > 0 { fetches[k].req = req; }
-        else if req == ERR_BLOCKED { format(log, "Sheet ", url, " is blocked: an https page loads no http sheets\n"); }
+        else if req == ERR_BLOCKED && is_web(url[..]) { format(log, "Sheet ", url, " is blocked: an https page loads no http sheets\n"); }
+        else if req == ERR_BLOCKED { format(log, "Sheet ", url, " is blocked: a page from the web loads only http and https\n"); }
         else { format(log, "Sheet ", url, " can't be loaded\n"); }
         return;
     }
-    // A file's page: its sheets are files too, and nothing else.
+    // A file's page: its sheets are files on this Mac (no host, or
+    // localhost), without a query or a fragment, and regular ones of at
+    // most 16 MB, so that a page can't make its tab wait on a device or a
+    // pipe.
     var path: u8[>..] = [];
-    guard starts_with(url[..], "file://") && percent_decoded(url[7..], path) else {
-        format(log, "Sheet ", url, " isn't a file\n");
+    var rest = if starts_with(url[..], "file://") { url[7..] } else { url[0..0] };
+    if starts_with(rest, "localhost/") { rest = rest[9..]; }
+    var end = rest.len;
+    for c, j in rest { if (c == '?' || c == '#') && j < end { end = j; break; } }
+    guard rest.len > 0 && rest[0] == '/' && percent_decoded(rest[..end], path) else {
+        format(log, "Sheet ", url, " isn't a file on this Mac\n");
+        return;
+    }
+    let size = tp_file_size(path[..]);
+    guard size >= 0 else {
+        format(log, "Sheet ", path, " isn't a file Tusk can read\n");
+        return;
+    }
+    guard size <= SHEET_FILE_MAX else {
+        format(log, "Sheet ", path, " is over 16 MB\n");
         return;
     }
     var text: u8[>..] = [];
@@ -219,7 +253,7 @@ fn wait_sheets(tab: i32, fetches: SheetFetch[>..]&, pool: u8[>..]&, later: TabMs
         }
         if m.kind == MSG_QUIT { cancel_sheets(fetches); return false; }
         if m.kind == MSG_HIT { tp_post_reply(tab, REPLY_HIT, CURSOR_ARROW, ""); continue; }
-        guard m.kind == MSG_NET else { later.push(m); continue; }
+        guard m.kind == MSG_NET else { keep_for_later(later, m); continue; }
         let req = m.a as i32;
         for f, k in fetches {
             guard f.req == req else { continue; }
@@ -273,6 +307,27 @@ fn file_url(path: const u8[:], out: u8[>..]&) {
         out.push(digits[c >> 4]);
         out.push(digits[c & 15]);
     }
+}
+
+// What went wrong, `log`, as the interface takes it: at most LOG_LINES lines
+// (and how many more there were), each at most LOG_LINE_MAX bytes, cut
+// before a character.
+fn capped_log(log: const u8[:], out: u8[>..]&) {
+    var lines: i64 = 0;
+    var from: i64 = 0;
+    for c, j in log {
+        guard c == '\n' else { continue; }
+        lines += 1;
+        if lines <= LOG_LINES {
+            var end = min(j, from + LOG_LINE_MAX);
+            if end < j { while end > from && (log[end] & 0xC0) == 0x80 { end -= 1; } }
+            out.append(log[from..end]);
+            if end < j { out.append("…"); }
+            out.push('\n');
+        }
+        from = j + 1;
+    }
+    if lines > LOG_LINES { format(out, "And ", lines - LOG_LINES, " more\n"); }
 }
 
 // `s` with its %XX escapes decoded, onto `out`; false for a broken escape.
