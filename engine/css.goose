@@ -1129,9 +1129,7 @@ fn attr_matches(sh: Sheet, d: Doc, a: AttrSel, e: i32) -> bool {
     if a.op == A_SUFFIX { return want.len > 0 && v.len >= want.len && v[v.len - want.len..] == want; }
     if a.op == A_SUB { return want.len > 0 && find(v, want) >= 0; }
     if a.op == A_DASH { return v == want || (starts_with(v, want) && v.len > want.len && v[want.len] == '-'); }
-    var found = false;
-    each_word(v) { if it == want { found = true; } };
-    return found;
+    return has_word(v, want);
 }
 
 // Whether position i (counting from 1) is a·k + b for some k ≥ 0.
@@ -1237,6 +1235,17 @@ fn rule_bucket(sh: Sheet, r: Rule) -> i32 {
     return UNIVERSAL;
 }
 
+// Adds bucket b after the first nb of `buckets`, unless `seen` has it already;
+// returns how many there are now.
+fn add_bucket(buckets: i32[:], seen: u64[:], nb: i64, b: i32) -> i64 {
+    let word: i64 = b >> 6;
+    let bit: u64 = 1 << (b & 63);
+    guard (seen[word] & bit) == 0 else { return nb; }
+    seen[word] = seen[word] | bit;
+    buckets[nb] = b;
+    return nb + 1;
+}
+
 // A key's bucket: FNV-1a over its kind ('#' id, '.' class, '<' tag) and its
 // bytes, so that the tag p and the class p land apart.
 fn bucket_of(kind: u8, key: const u8[:]) -> i32 {
@@ -1299,16 +1308,24 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
     var win: Decl[NPROPS];
     fill(win_prio[..], -1);
     let mark = w.customs.len;
-    // The buckets this element's rules can be in. A rule whose bucket comes
-    // up twice (two keys that hash alike) is tried twice, which changes nothing.
-    var buckets: i32[64];
-    buckets[0] = UNIVERSAL;
-    buckets[1] = bucket_of('<', node_name(d, e));
-    var nb = 2;
+    // The buckets this element's rules can be in, each once however many
+    // classes it has: the universal one, its tag's, its id's and its classes',
+    // split as has_class splits them.
+    var buckets: i32[1025];
+    var seen: u64[17];
+    fill(seen[..], 0);
+    var nb = add_bucket(buckets[..], seen[..], 0, UNIVERSAL);
+    nb = add_bucket(buckets[..], seen[..], nb, bucket_of('<', node_name(d, e)));
     let id, has_id = attr_value(d, e, "id");
-    if has_id && id.len > 0 { buckets[nb] = bucket_of('#', id); nb += 1; }
+    if has_id && id.len > 0 { nb = add_bucket(buckets[..], seen[..], nb, bucket_of('#', id)); }
     let cls, has_cls = attr_value(d, e, "class");
-    if has_cls { each_word(cls) { if nb < 64 { buckets[nb] = bucket_of('.', it); nb += 1; } }; }
+    var ci: i64 = 0;
+    while has_cls && ci < cls.len {
+        while ci < cls.len && is_ws(cls[ci]) { ci += 1; }
+        let st = ci;
+        while ci < cls.len && !is_ws(cls[ci]) { ci += 1; }
+        if ci > st { nb = add_bucket(buckets[..], seen[..], nb, bucket_of('.', cls[st..ci])); }
+    }
     for bi in nb {
         let b = buckets[bi];
         for k in w.offsets[b]..w.offsets[b + 1] {

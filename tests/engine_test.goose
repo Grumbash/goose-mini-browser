@@ -254,6 +254,20 @@ fn test_css_interface() {
     check("[attr^=value]", style_at(sel, "a", 0, false), "display=2 size=10.0 bold=0 italic=0 color=ff00ff00 mt=0.0 ml=0.0 auto_ml=0");
     check("[attr~=word]", style_at(sel, "b", 0, false), "display=2 size=10.0 bold=1 italic=0 color=ff1c1c1c mt=2.0 ml=0.0 auto_ml=0");
     check("[attr|=value]", style_at(sel, "span", 1, false), "display=2 size=10.0 bold=0 italic=1 color=ff1c1c1c mt=0.0 ml=0.0 auto_ml=0");
+
+    // Every class's rules, however many classes there are, split on HTML
+    // whitespace as has_class splits them (a form feed too); [attr~=word] the same.
+    var many: u8[>..] = [];
+    many.append("<style>.c69 { color: #ff0000 } [data-k~=b] { margin-left: 4px }</style><p class=\"");
+    for k in 70 { format(many, "c", k, " "); }
+    many.append("\">x</p><b class=\"a");
+    many.push(12);
+    many.append("c69\" data-k=\"a");
+    many.push(12);
+    many.append("b\">y</b>");
+    check("a rule for the seventieth class", style_at(many[..], "p", 0, false), "display=1 size=17.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check("classes and [attr~=word] split on a form feed",
+          style_at(many[..], "b", 0, false), "display=2 size=17.0 bold=1 italic=0 color=ffff0000 mt=0.0 ml=4.0 auto_ml=0");
 }
 
 fn test_css() {

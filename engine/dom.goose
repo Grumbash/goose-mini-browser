@@ -129,13 +129,17 @@ fn attr_value(d: Doc, n: i32, name: const u8[:]) -> const u8[:], bool {
 // Whether `cls` is one of the space-separated words of the element's class.
 fn has_class(d: Doc, n: i32, cls: const u8[:]) -> bool {
     let v, ok = attr_value(d, n, "class");
-    guard ok else { return false; }
+    return ok && has_word(v, cls);
+}
+
+// Whether `w` is one of the words of `v`, split on HTML whitespace.
+fn has_word(v: const u8[:], w: const u8[:]) -> bool {
     var i = 0;
     while i < v.len {
         while i < v.len && is_ws(v[i]) { i += 1; }
         let start = i;
         while i < v.len && !is_ws(v[i]) { i += 1; }
-        if i > start && v[start..i] == cls { return true; }
+        if i > start && v[start..i] == w { return true; }
     }
     return false;
 }
