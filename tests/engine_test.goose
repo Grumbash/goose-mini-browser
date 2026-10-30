@@ -1146,6 +1146,22 @@ fn test_heights() {
           "1200.0");
     check("an svg's percentage height", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none }</style><div style="height: 100px"><svg id=s viewBox="0 0 2 1" style="display: block; height: 50%"></svg></div>""", 400.0, PROBE_GEOMETRY),
           "s x 0.0 y 0.0 w 100.0 h 50.0\n");
+    // What a clip cuts away entirely (clip_items makes it ITEM_NONE and sets
+    // no clip) doesn't reach down the page: a "show more" box or a max-height
+    // code block mustn't grow the page by all it hides.
+    check("what a clip hides entirely doesn't lengthen the page", layout_probe("""<style>html, body { height: 100%; margin: 0; padding: 0; max-width: none }</style><div style="height: 300px; overflow: hidden"><div style="height: 300px"></div><div style="height: 5000px; background: #000"></div></div>""", 400.0, PROBE_PAGE),
+          "600.0");
+    // A fixed box stays on the screen: what overflows it can't be scrolled
+    // to, and positioned_bottom leaves fixed boxes out for that reason.
+    check("what overflows a fixed box doesn't lengthen the page", layout_probe("""<style>html, body { height: 100%; margin: 0; padding: 0; max-width: none }</style><div style="position: fixed; top: 0; left: 0; width: 100px; height: 100%"><div style="height: 3000px; background: #000"></div></div>""", 400.0, PROBE_PAGE),
+          "600.0");
+    // What a transform moves up reaches only as far as where it is drawn,
+    // not where it was before.
+    check("overflow a transform moves up reaches only as far as it is drawn", layout_probe("""<style>html, body { height: 100%; margin: 0; padding: 0; max-width: none }</style><div style="height: 100px; transform: translateY(-500px)"><div style="height: 1000px; background: #000"></div></div>""", 400.0, PROBE_PAGE),
+          "600.0");
+    // A shadow is ink overflow: it doesn't scroll (CSS Overflow 3).
+    check("a box-shadow doesn't lengthen the page", layout_probe("""<style>html, body { height: 100%; margin: 0; padding: 0; max-width: none }</style><div style="height: 900px; background: #000; box-shadow: 0 100px 0 #000"></div>""", 400.0, PROBE_PAGE),
+          "900.0");
 }
 
 fn test_svg() {

@@ -463,8 +463,22 @@ fn layout_page(L: const Layout&, width: f32, height: f32) -> f32 {
     // The page scrolls as far as what it draws reaches, as a browser's
     // viewport scrolls its overflow: an <html> or <body> 100% high (a page
     // that sizes itself to the window, as Wikipedia's does) holds less than
-    // its content. What a clip cuts reaches only as far as the clip.
+    // its content. What a clip cuts reaches only as far as the clip, and what
+    // it cuts away not at all; a shadow doesn't count. Neither does what is
+    // in a fixed box, which stays where the window is, nor what a transform
+    // moves, which transformed_bottom counts where it is drawn.
+    var left_out: bool[>..] = [];      // by node, in document order: parents first
+    for n, k in L.d.nodes {
+        let p = n.parent;
+        var out = p >= 0 && left_out[p];
+        if n.kind == NODE_ELEMENT && L.styles[k].position == K_FIXED { out = true; }
+        if transformed && transforms(L, k as i32) { out = true; }
+        left_out.push(out);
+    }
     for it in L.items {
+        let shadow = (it.kind == ITEM_RECT || it.kind == ITEM_BOX) && (it.font & BOX_SHADOW) != 0;
+        guard it.kind != ITEM_NONE && !shadow else { continue; }
+        guard it.node < 0 || !left_out[it.node] else { continue; }
         var bottom = it.y + it.h;
         if it.clip_w > 0.0 { bottom = min(bottom, it.clip_y + it.clip_h); }
         if it.oclip_w > 0.0 { bottom = min(bottom, it.oclip_y + it.oclip_h); }
