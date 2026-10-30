@@ -66,6 +66,10 @@ jobs:
         run: |
           "$GOOSE_BIN" tests/engine_test.goose
 
+      - name: Interface checks
+        run: |
+          "$GOOSE_BIN" tests/ui_test.goose
+
       - name: Snapshot of the M1 page
         run: |
           ./app/tusk snapshot tests/pages/focaccia.html > snapshot.txt

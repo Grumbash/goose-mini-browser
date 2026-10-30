@@ -126,17 +126,19 @@ let MAX_TABS: i64 = 60;          // tab k draws in layer k
 let LAYER_UI: i32 = 61;          // the interface, under the pages
 let LAYER_LOADER: i32 = 62;      // the boar on his rail, over them
 let LOAD_WAIT_MS: i64 = 60000;   // how long the modes without a window wait for a page
+let MAX_PAGE: f32 = 8000000.0;   // how far down a page scrolls (whole points in an f32: 2^23)
 let SHAPE_CACHE: i64 = 4 << 20;  // the interface's shaped text kept, in bytes
 let ERR_ARGUMENT: i32 = -4;      // platform/src/lib.rs
 let ERR_NO_DEVICE: i32 = -5;     // platform/src/lib.rs
 
 fn ms(from: i64, to: i64) -> f64 { return (to - from) / 1000000.0; }
 
+// A layer's place. One the compositor refuses (past its range) leaves the
+// layer where it was, and Tusk says so and goes on.
 fn place(layer: i32, p: Place) {
     let rc = tp_place_layer(layer, p);
     guard rc != 0 else { return; }
     write_stderr(str("tusk: the compositor refused layer ", layer, "'s place (error ", rc, ")\n"));
-    exit(1);
 }
 
 // Tab k's layer: scrolled by `scroll`, landing on its slot and shown (or not)
@@ -164,18 +166,28 @@ fn take_frame(tabs: Tab[>..]&, k: i64) -> bool {
     }
     guard got == 1 else { return false; }
     tabs[k].paint = ms(t0, clock_ns()) as f32;
-    if !tabs[k].ready { tabs[k].load_ms = ms_since(tabs[k].opened); }
+    // What loading the page took its worker; the wait to be shown isn't.
+    let i = tabs[k].info;
+    if !tabs[k].ready { tabs[k].load_ms = i.read + i.parse + i.style + i.measure + i.layout; }
     tabs[k].ready = true;
     return true;
 }
 
 // Reads tab k's waiting replies into its state; true if one changes what the
-// interface shows. A hit's pointer shape goes to `cursor` (-1: none came).
-fn read_replies(tabs: Tab[>..]&, k: i64, notes: u8[>..]&, head: ReplyHead&, text: u8[>..<]&, cursor: i32&) -> bool {
+// interface shows. A hit's pointer shape goes to `cursor` (-1: none came),
+// and `titled` says whether its title came, or why it failed.
+fn read_replies(tabs: Tab[>..]&, k: i64, notes: u8[>..]&, head: ReplyHead&, text: u8[>..<]&, cursor: i32&,
+                titled: bool&) -> bool {
     var changed = false;
     while take_reply(k, head, text) {
         if head.kind == REPLY_HIT { cursor = head.value; continue; }
         changed = true;
+        if head.kind == REPLY_READ {
+            // Known before its display list is: a hidden tab's weighs this too.
+            if !tabs[k].ready { tabs[k].info.bytes = head.value; }
+            continue;
+        }
+        if head.kind == REPLY_TITLE || head.kind == REPLY_FAILED { titled = true; }
         if head.kind == REPLY_TITLE {
             tabs[k].title_at = notes.len;
             tabs[k].title_len = text.len;
@@ -185,7 +197,6 @@ fn read_replies(tabs: Tab[>..]&, k: i64, notes: u8[>..]&, head: ReplyHead&, text
         } else if head.kind == REPLY_FAILED {
             write_stderr(str("tusk: ", text, "\n"));
             tabs[k].failed = true;
-            tabs[k].load_ms = ms_since(tabs[k].opened);
             tabs[k].why_at = notes.len;
             tabs[k].why_len = text.len;
             // "Can't read…", as a sentence.
@@ -200,8 +211,10 @@ fn read_replies(tabs: Tab[>..]&, k: i64, notes: u8[>..]&, head: ReplyHead&, text
     return changed;
 }
 
+// A scroll kept within the page; and within MAX_PAGE, where a point's place
+// still holds in an f32, which the compositor's range takes in too.
 fn clamp_scroll(y: f32, page_h: f32, view_h: f32) -> f32 {
-    return max(min(y, page_h - view_h), 0.0);
+    return max(min(y, min(page_h, MAX_PAGE) - view_h), 0.0);
 }
 
 fn post(tab: i64, kind: i32, a: f32, b: f32, c: f32) {
@@ -224,6 +237,7 @@ fn wait_for_frame(tabs: Tab[>..]&, notes: u8[>..]&) {
     var head = ReplyHead { kind: 0, value: 0, len: 0 };
     var text: u8[>..<] = [];
     var cursor: i32 = -1;
+    var titled = false;
     loop {
         let got = tp_wait_tab(0, LOAD_WAIT_MS);
         guard got == 1 || got == 2 else {
@@ -233,10 +247,10 @@ fn wait_for_frame(tabs: Tab[>..]&, notes: u8[>..]&) {
         }
         if got == 1 && take_frame(tabs, 0) {
             // Its title and elements came before it.
-            read_replies(tabs, 0, notes, head, text, cursor);
+            read_replies(tabs, 0, notes, head, text, cursor, titled);
             return;
         }
-        read_replies(tabs, 0, notes, head, text, cursor);
+        read_replies(tabs, 0, notes, head, text, cursor, titled);
         guard !tabs[0].failed else { exit(1); return; }
     }
 }
@@ -483,6 +497,7 @@ fn main() {
         return;
     }
     U.lights = tp_lights_end() as f32;
+    U.oil = tp_memory_footprint() / 1048576.0;
 
     var worker: i64 = -1;
     if mode == MODE_WAKE_TEST { worker = thread_spawn_contained(wake_after, 300, 42); }
@@ -496,6 +511,8 @@ fn main() {
     var e = Event { kind: 0, code: 0, x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
     var ui_ms: f32 = 0.0;            // what laying the interface out took last
     var sized = Rect { x: 0.0, y: 0.0, w: -1.0, h: -1.0 };   // the slot the tabs were laid out for
+    var sized_scale: f32 = 0.0;      // and the backing scale
+    var last_step: i64 = 0;          // the boar's last step
     // The window's line: frames drawn for what changed on screen since it
     // was measured, when it was, and the CPU time then.
     var content_frames: i64 = 0;
@@ -514,7 +531,7 @@ fn main() {
         var wait: i64 = -1;
         let t = tabs[U.cur];
         if !t.ready && !t.failed {
-            let due = if U.running { STEP_MS } else { RUN_AFTER_MS - (ms(t.opened, now) as i64) };
+            let due = if U.running { STEP_MS - (ms(last_step, now) as i64) } else { RUN_AFTER_MS - (ms(t.opened, now) as i64) };
             wait = max(due, 0);
         }
         if ticking { wait = soonest(wait, TICK_MS - (ms(tick_from, now) as i64)); }
@@ -558,9 +575,10 @@ fn main() {
                 } else if e.kind == EV_REPLY && e.code >= 0 && e.code < tabs.len {
                     let k: i64 = e.code;
                     var shape: i32 = -1;
-                    if read_replies(tabs, k, notes, head, text, shape) && k == U.cur { redo = true; }
+                    var titled = false;
+                    if read_replies(tabs, k, notes, head, text, shape, titled) && k == U.cur { redo = true; }
                     if k == U.cur && shape >= 0 { cursor = shape; }
-                    if k == U.cur { tp_set_title(title_of(tabs[k], T, k)); }
+                    if k == U.cur && titled { tp_set_title(title_of(tabs[k], T, k)); }
                 } else if e.kind == EV_SCROLL {
                     pointer_x = e.w as f32;
                     pointer_y = e.h as f32;
@@ -651,36 +669,53 @@ fn main() {
             content_frames = 0;
         }
         // Drawing allocates memory the system only settles later: a while
-        // after the last frame the oil is weighed again, once.
+        // after the last frame the oil is weighed again, once, and the CPU,
+        // which was last measured while frames still came.
         if settle && ms(settle_at, clock_ns()) >= SETTLE_MS {
             settle = false;
+            let now = clock_ns();
+            let cpu = tp_cpu_ns();
+            let load = ((cpu - cpu_from) / 10000000.0 / (ms(tick_from, now) / 1000.0) / max(tp_cores(), 1)) as f32;
             let oil = tp_memory_footprint() / 1048576.0;
-            if abs(oil - U.oil) >= 0.1 {
+            if abs(oil - U.oil) >= 0.1 || abs(load - U.cpu) >= 0.1 {
                 U.oil = oil;
+                U.cpu = load;
                 redo = true;
                 drawn_line = true;
             }
+            tick_from = now;
+            cpu_from = cpu;
         }
         if redo && U.w > 0.0 && scale > 0.0 {
             ui_ms = show_ui(F, U, tabs, T, ui_ms, scale, slot);
             // Every tab lays out again for a new slot at once, each on its own
             // core, so showing another is instant.
-            if slot.w != sized.w || slot.h != sized.h {
+            // And for a new backing scale: a display list carries the scale
+            // it was made for.
+            if slot.w != sized.w || slot.h != sized.h || scale != sized_scale {
                 for t, k in tabs { post(k, MSG_SIZE, slot.w, slot.h, scale); }
                 sized = slot;
+                sized_scale = scale;
             }
         }
-        if U.running && scale > 0.0 { show_loader(F, U, ms(shown.opened, clock_ns()) as f32 / 1000.0, scale); }
+        // His next step, every STEP_MS whatever else happens meanwhile.
+        var stepped = false;
+        if U.running && scale > 0.0 && (redo || ms(last_step, clock_ns()) >= STEP_MS) {
+            show_loader(F, U, ms(shown.opened, clock_ns()) as f32 / 1000.0, scale);
+            last_step = clock_ns();
+            stepped = true;
+        }
         tabs[U.cur].scroll = clamp_scroll(tabs[U.cur].scroll, tabs[U.cur].info.height, slot.h);
         let scrolled = tabs[U.cur].scroll != before;
         // A frame only when what is on screen changed.
-        if redo || arrived || scrolled || U.running {
+        if redo || arrived || scrolled || stepped {
             if tabs[U.cur].ready { place_tab(U.cur, true, tabs[U.cur].scroll, slot); }
             tp_render(STEEL);
-            settle = true;
-            settle_at = clock_ns();
-            // The window line's own frames aren't what it counts.
+            // The window line's own frames aren't what it counts, nor what
+            // the oil settles after.
             if !drawn_line || arrived || scrolled || switched {
+                settle = true;
+                settle_at = clock_ns();
                 content_frames += 1;
                 if !ticking {
                     ticking = true;

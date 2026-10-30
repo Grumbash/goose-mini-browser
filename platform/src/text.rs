@@ -1279,11 +1279,6 @@ pub extern "C" fn tp_font_metrics(font: i32, size: f32, out: *mut GpMetrics) -> 
     })
 }
 
-/// Shapes `text` in font `font` at `size` points and writes the pen position
-/// before each byte to `carets`, which holds `text.len + 1` numbers: the last is
-/// the advance of the whole text. Goose breaks lines with these: a word's width
-/// is the difference of two positions, so each text is shaped once however
-/// often the window's width changes.
 /// Keeps the runs this thread shapes, about `limit_bytes` of them at most, so
 /// that the same text in the same font is shaped once; 0 keeps none, the
 /// default. Worth it on a thread that lays out the same text again and again,
@@ -1297,6 +1292,11 @@ pub extern "C" fn tp_text_cache(limit_bytes: i64) -> i32 {
     })
 }
 
+/// Shapes `text` in font `font` at `size` points and writes the pen position
+/// before each byte to `carets`, which holds `text.len + 1` numbers: the last is
+/// the advance of the whole text. Goose breaks lines with these: a word's width
+/// is the difference of two positions, so each text is shaped once however
+/// often the window's width changes.
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_text_carets(
     font: i32,

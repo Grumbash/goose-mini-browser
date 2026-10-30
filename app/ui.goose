@@ -158,14 +158,24 @@ fn bar(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
     icon(out, "i-chev-l");
     icon(out, "i-chev-r");
     icon(out, "i-reload");
+    let url_w = max(U.w - 290.0 - shift - 190.0, 120.0);
     out.append("</span><span class=\"url\" data-nodrag style=\"left:");
     px(out, 290.0 + shift);
     out.append("; width:");
-    px(out, max(U.w - 290.0 - shift - 190.0, 120.0));
+    px(out, url_w);
     out.append("\"><span class=\"env\">FILE</span><span class=\"u\"><i>file://</i>");
     let p = path_of(T, U.cur);
     let name = T.names[U.cur] - (if U.cur == 0 { 0 } else { T.path_ends[U.cur - 1] });
-    esc(out, p[..name]);
+    // A long path loses its start, from a folder on, so that the file's name
+    // shows: about 7.5 points a character, after the badge and the scheme.
+    let room = ((url_w - 120.0) / 7.5) as i64;
+    var from: i64 = 0;
+    if p.len > room {
+        from = min(p.len - room, name);
+        while from < name && p[from - 1] != '/' { from += 1; }
+        out.append("…/");
+    }
+    esc(out, p[from..name]);
     out.append("<b>");
     esc(out, p[name..]);
     out.append("</b></span></span><span class=\"tools\" data-nodrag><span class=\"bv\">");
@@ -395,7 +405,7 @@ fn frame_graph(out: u8[>..]&, frames: const f32[:], dropped: i32, rebuild_ms: f3
     else { format(out, "The last ", frames.len, " frames · CPU"); }
     out.append("</span></div><div class=\"fr\"><div class=\"frh\"><span><b>");
     format(out, dropped);
-    out.append("</b> dropped</span><span>worst <b>");
+    out.append("</b> dropped since start</span><span>worst <b>");
     format_flt(out, worst, 2);
     out.append("</b> ms</span><span>interface <b>");
     format_flt(out, rebuild_ms, 1);

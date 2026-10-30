@@ -38,6 +38,13 @@ let REPLY_TITLE: i32 = 2;    // text: the page's title
 let REPLY_SNAPSHOT: i32 = 3; // text: the page as a tree for agents
 let REPLY_FAILED: i32 = 4;   // text: why the page didn't load
 let REPLY_ELEMENTS: i32 = 5; // text: its elements under <body>, a line each (elements_of)
+let REPLY_READ: i32 = 6;     // value: the file's size in bytes, once read
+
+// How much of a page's own text the interface takes: a page's title or an
+// element's id or class could be any length, and the interface is laid out
+// again whenever it changes.
+let TITLE_MAX: i64 = 256;
+let NAME_MAX: i64 = 80;
 
 // Pointer shapes, as numbered in platform/src/lib.rs.
 let CURSOR_ARROW: i32 = 0;
@@ -91,6 +98,7 @@ thread_fn tab_worker(tab: i32, path: u8[>..]) {
     }
     var info = FrameInfo { height: 0.0, background: 0xFFFFFFFF, nodes: 0, bytes: src.len as i32,
                            parse: 0.0, style: 0.0, measure: 0.0, layout: 0.0, scale: 1.0, read: ms_since(t) };
+    tp_post_reply(tab, REPLY_READ, src.len as i32, "");
     t = clock_ns();
     var nodes: Node[>..] = [];
     var attrs: Attr[>..] = [];
@@ -127,7 +135,7 @@ thread_fn tab_worker(tab: i32, path: u8[>..]) {
     var title: u8[>..] = [];
     for n, k in nodes {
         if n.kind == NODE_ELEMENT && n.first >= 0 && node_name(d, k as i32) == "title" && styles[k].svg == 0 {
-            title.append(node_text(d, n.first));
+            one_line(title, node_text(d, n.first), TITLE_MAX);
             break;
         }
     }
@@ -156,10 +164,10 @@ fn elements_of(d: Doc, out: u8[>..]&) {
         if d.nodes[n].kind == NODE_ELEMENT {
             format(out, depth, "\t", node_name(d, n), "\t");
             let id, has_id = attr_value(d, n, "id");
-            if has_id { one_line(out, id); }
+            if has_id { one_line(out, id, NAME_MAX); }
             out.push('\t');
             let classes, has_classes = attr_value(d, n, "class");
-            if has_classes { one_line(out, classes); }
+            if has_classes { one_line(out, classes, NAME_MAX); }
             out.push('\n');
             count += 1;
             guard count < 200 else { return; }
@@ -179,9 +187,29 @@ fn elements_of(d: Doc, out: u8[>..]&) {
     }
 }
 
-// s onto out with its tabs and line breaks as spaces.
-fn one_line(out: u8[>..]&, s: const u8[:]) {
-    for c in s { out.push(if c == '\t' || c == '\n' || c == '\r' { ' ' } else { c }); }
+// s onto out as one line, at most `max` bytes: its runs of white space as
+// one space, none at its ends, and cut before a character that wouldn't fit.
+fn one_line(out: u8[>..]&, s: const u8[:], max: i64) {
+    let start = out.len;
+    var space = false;
+    for c in s {
+        let blank = c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0c';
+        if blank {
+            space = out.len > start;
+            continue;
+        }
+        // A character's first byte: it and the rest of it must fit.
+        if (c & 0xC0) != 0x80 {
+            let n: i64 = if c >= 0xF0 { 4 } else if c >= 0xE0 { 3 } else if c >= 0xC0 { 2 } else { 1 };
+            let room = out.len - start + (if space { 1 } else { 0 }) + n;
+            if room > max { break; }
+            if space { out.push(' '); }
+            space = false;
+        } else if out.len - start >= max {
+            break;    // a byte that starts no character, past the end
+        }
+        out.push(c);
+    }
 }
 
 // Answers the main thread for page P until it says quit: a display list for
