@@ -417,6 +417,31 @@ struct Stats {
     max_cpu: f64,
     max_gpu: f64,
     last_present: Option<Instant>,
+    cpu: Vec<f32>, // the last frames' CPU times in ms, a ring of FRAME_TIMES
+    cpu_next: usize,
+    cpu_count: usize,
+}
+
+/// How many of the last frames' times tp_frame_times keeps.
+const FRAME_TIMES: usize = 64;
+
+impl Stats {
+    fn record_cpu(&mut self, seconds: f64) {
+        self.max_cpu = self.max_cpu.max(seconds);
+        self.cpu.resize(FRAME_TIMES, 0.0);
+        self.cpu[self.cpu_next] = (seconds * 1000.0) as f32;
+        self.cpu_next = (self.cpu_next + 1) % FRAME_TIMES;
+        self.cpu_count = (self.cpu_count + 1).min(FRAME_TIMES);
+    }
+
+    /// The last frames' CPU times, oldest first, as many as fit `out`.
+    fn last_cpu(&self, out: &mut [f32]) -> usize {
+        let n = out.len().min(self.cpu_count);
+        for (i, o) in out[..n].iter_mut().enumerate() {
+            *o = self.cpu[(self.cpu_next + FRAME_TIMES - n + i) % FRAME_TIMES];
+        }
+        n
+    }
 }
 
 #[derive(Default)]
@@ -716,7 +741,7 @@ impl Compositor {
         commands.commit();
         self.last_frame = Some(commands);
         self.stats.frames += 1;
-        self.stats.max_cpu = self.stats.max_cpu.max(start.elapsed().as_secs_f64());
+        self.stats.record_cpu(start.elapsed().as_secs_f64());
         self.stats.last_present = Some(start);
         Ok(())
     }
@@ -1343,6 +1368,24 @@ pub extern "C" fn tp_drop_layer(layer: i32) -> i32 {
             Ok(0)
         })
     })
+}
+
+/// Writes the CPU times of the last frames presented, in milliseconds and
+/// oldest first, to `out`, as many as fit and have been kept (at most 64); returns
+/// how many. They go with tp_frame_stats's reset.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_frame_times(out: GSlice<f32>) -> i64 {
+    let code = guarded(|| {
+        on_main_thread()?;
+        let n = out.count().ok_or(ERR_ARGUMENT)?;
+        let mut times = vec![0.0; n];
+        let got = with_compositor(|c| Ok(c.stats.last_cpu(&mut times) as i32))? as usize;
+        for (i, &t) in times[..got].iter().enumerate() {
+            unsafe { out.set(i, t) };
+        }
+        Ok(got as i32)
+    });
+    code as i64
 }
 
 /// Draws the layers offscreen where they are placed, `width` × `height`
@@ -2642,5 +2685,25 @@ mod tests {
         assert!(stale);
         assert!(built);
         assert!(shown > 50, "{shown} dark pixels");
+    }
+
+    #[test]
+    fn the_last_frames_times_are_kept_oldest_first() {
+        let mut s = Stats::default();
+        let mut out = [0.0f32; 4];
+        assert_eq!(s.last_cpu(&mut out), 0);
+        s.record_cpu(0.001);
+        s.record_cpu(0.002);
+        assert_eq!(s.last_cpu(&mut out), 2);
+        assert_eq!(&out[..2], &[1.0, 2.0]);
+        for k in 3..=70 {
+            s.record_cpu(k as f64 / 1000.0);
+        }
+        assert_eq!(s.last_cpu(&mut out), 4);
+        assert_eq!(out, [67.0, 68.0, 69.0, 70.0]);
+        let mut all = [0.0f32; 100];
+        assert_eq!(s.last_cpu(&mut all), FRAME_TIMES);
+        assert_eq!((all[0], all[FRAME_TIMES - 1]), (7.0, 70.0));
+        assert_eq!(s.max_cpu, 0.07);
     }
 }
