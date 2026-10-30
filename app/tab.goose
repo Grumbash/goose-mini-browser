@@ -3,7 +3,8 @@
 // lays a page out. The worker loads, parses, styles and measures the page,
 // then lays it out for each size the main thread posts, and hands the display
 // list over in one copy (platform/src/tabs.rs). It answers hit tests and
-// snapshot requests from the list as laid out last.
+// snapshot requests from the list as laid out last. It also lists the page's
+// elements once, for the dev panel.
 
 import std;
 import os;
@@ -23,11 +24,11 @@ let MSG_SNAPSHOT: i32 = 3;   // a: the width to lay the page out at, b: the view
 let MSG_QUIT: i32 = 4;
 
 // What a display list comes with: the page's height and canvas colour, its
-// size in nodes and bytes, what each stage took in milliseconds, and the
-// backing scale it is for.
+// size in nodes and bytes, what each stage took in milliseconds, the backing
+// scale it is for, and how long reading the file took.
 struct FrameInfo {
     height: f32, background: u32, nodes: i32, bytes: i32,
-    parse: f32, style: f32, measure: f32, layout: f32, scale: f32,
+    parse: f32, style: f32, measure: f32, layout: f32, scale: f32, read: f32,
 }
 
 // A reply's kind, number and length of text.
@@ -36,6 +37,7 @@ let REPLY_HIT: i32 = 1;      // value: the pointer shape over the point
 let REPLY_TITLE: i32 = 2;    // text: the page's title
 let REPLY_SNAPSHOT: i32 = 3; // text: the page as a tree for agents
 let REPLY_FAILED: i32 = 4;   // text: why the page didn't load
+let REPLY_ELEMENTS: i32 = 5; // text: its elements under <body>, a line each (elements_of)
 
 // Pointer shapes, as numbered in platform/src/lib.rs.
 let CURSOR_ARROW: i32 = 0;
@@ -65,19 +67,31 @@ struct Page {
     fonts: FontInfo[>..]&,
 }
 
+// What the main thread knows of a tab: its worker; what came with its last
+// display list (`ready` once one has) and what taking it cost there; whether
+// it failed; whether a display list waits to be taken when it is shown; how
+// far it is scrolled; when it opened and how long it took to
+// show; and spans of the main thread's notes: its title, why it failed, its
+// elements.
+struct Tab {
+    worker: i64, ready: bool, failed: bool, info: FrameInfo, paint: f32, waiting: bool, scroll: f32, opened: i64,
+    load_ms: f32, title_at: i64, title_len: i64, why_at: i64, why_len: i64, elems_at: i64, elems_len: i64,
+}
+
 fn ms_since(from: i64) -> f32 { return ((clock_ns() - from) / 1000000.0) as f32; }
 
 // Tab `tab`'s worker, for the page at `path`.
 thread_fn tab_worker(tab: i32, path: u8[>..]) {
     var src: u8[>..] = [];
+    var t = clock_ns();
     guard read_file(path[..], src) else {
         tp_post_reply(tab, REPLY_FAILED, 0, str("can't read ", path)[..]);
         serve_nothing(tab);
         return;
     }
     var info = FrameInfo { height: 0.0, background: 0xFFFFFFFF, nodes: 0, bytes: src.len as i32,
-                           parse: 0.0, style: 0.0, measure: 0.0, layout: 0.0, scale: 1.0 };
-    var t = clock_ns();
+                           parse: 0.0, style: 0.0, measure: 0.0, layout: 0.0, scale: 1.0, read: ms_since(t) };
+    t = clock_ns();
     var nodes: Node[>..] = [];
     var attrs: Attr[>..] = [];
     var bytes: u8[>..] = [];
@@ -118,7 +132,56 @@ thread_fn tab_worker(tab: i32, path: u8[>..]) {
         }
     }
     tp_post_reply(tab, REPLY_TITLE, 0, title[..]);
+    var elems: u8[>..] = [];
+    elements_of(d, elems);
+    tp_post_reply(tab, REPLY_ELEMENTS, 0, elems[..]);
     serve(tab, P, info);
+}
+
+// The elements under <body>, <body> first, in document order, at most 200, onto
+// `out`: a line each of its depth, name, id and classes, apart by tabs.
+fn elements_of(d: Doc, out: u8[>..]&) {
+    var body: i32 = -1;
+    for n, k in d.nodes {
+        if n.kind == NODE_ELEMENT && node_name(d, k as i32) == "body" {
+            body = k as i32;
+            break;
+        }
+    }
+    guard body >= 0 else { return; }
+    var n = body;
+    var depth = 0;
+    var count = 0;
+    loop {
+        if d.nodes[n].kind == NODE_ELEMENT {
+            format(out, depth, "\t", node_name(d, n), "\t");
+            let id, has_id = attr_value(d, n, "id");
+            if has_id { one_line(out, id); }
+            out.push('\t');
+            let classes, has_classes = attr_value(d, n, "class");
+            if has_classes { one_line(out, classes); }
+            out.push('\n');
+            count += 1;
+            guard count < 200 else { return; }
+        }
+        // On to the next node: down into an element, or on, or back up.
+        if d.nodes[n].kind == NODE_ELEMENT && d.nodes[n].first >= 0 {
+            n = d.nodes[n].first;
+            depth += 1;
+            continue;
+        }
+        while n != body && d.nodes[n].next < 0 {
+            n = d.nodes[n].parent;
+            depth -= 1;
+        }
+        guard n != body else { return; }
+        n = d.nodes[n].next;
+    }
+}
+
+// s onto out with its tabs and line breaks as spaces.
+fn one_line(out: u8[>..]&, s: const u8[:]) {
+    for c in s { out.push(if c == '\t' || c == '\n' || c == '\r' { ' ' } else { c }); }
 }
 
 // Answers the main thread for page P until it says quit: a display list for
