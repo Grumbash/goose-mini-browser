@@ -120,6 +120,39 @@ fn style_at(src: const u8[:], name: const u8[:], k: i64, font: bool) -> u8[>..] 
     return out;
 }
 
+// Element `name`'s display and color once styled again, into a fresh array,
+// as a document styled a second time is.
+fn restyled(src: const u8[:], name: const u8[:]) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes };
+    load_sheets(d, sh);
+    var first: Style[>..] = [];
+    compute_styles(d, sh, first);
+    var styles: Style[>..] = [];
+    compute_styles(d, sh, styles);
+    var out: u8[>..] = [];
+    for n, i in nodes {
+        guard n.kind == NODE_ELEMENT && node_name(d, i as i32) == name else { continue; }
+        format(out, "display=", styles[i].display, " color=");
+        format_uint(out, styles[i].color, 16, 8, '0');
+        return out;
+    }
+    return out;
+}
+
 // How many bytes of substituted custom properties styling `src` keeps.
 fn var_bytes_of(src: const u8[:]) -> i64 {
     var nodes: Node[>..] = [];
@@ -237,6 +270,13 @@ fn test_css_interface() {
           "display=2 size=17.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
     check(":first-child doesn't count a ::before", style_at(gen, "span", 0, false),
           "display=2 size=17.0 bold=0 italic=0 color=ff00ff00 mt=0.0 ml=0.0 auto_ml=0");
+    // Strings joined and curly quotes, alt text after a '/' left out, and a
+    // counter, not supported yet, makes nothing.
+    check("content joins strings and leaves alt text out",
+          styled_tree("""<style>p::before { content: "a" 'b' open-quote } p::after { content: close-quote "*" / "star" } i::before { content: counter(c) "." }</style><p>x</p><i>y</i>"""),
+          "body\n  p\n    ::before\n      \"ab“\"\n    \"x\"\n    ::after\n      \"”*\"\n  i\n    \"y\"\n");
+    check("styled again into a fresh array, a ::before keeps its style",
+          restyled("""<style>p::before { content: "g"; color: #ff0000 }</style><p>x</p>""", "::before"), "display=2 color=ffff0000");
 
     // :nth-child, attribute selectors and :root.
     let sel = """

@@ -680,16 +680,36 @@ fn longhands(name: const u8[:], out: i32[>..]&) {
     else if name == "font" { out.append([P_FONT_STYLE, P_FONT_WEIGHT, P_FONT_SIZE, P_LINE_HEIGHT, P_FONT_FAMILY]); }
 }
 
-// content: a string gives ::before or ::after their text; none and normal
-// mean there is none.
+// content: strings, joined, give ::before or ::after their text, with
+// open-quote and close-quote as curly quotes; what follows a '/' is alt text
+// for screen readers. none and normal mean there is none. A counter, attr()
+// or image isn't supported yet, so a value with one is skipped.
 fn add_content(value: const u8[:], important: i32, out: Decl[>..]&, bytes: u8[>..]&) {
-    if value.len >= 2 && (value[0] == '"' || value[0] == '\'') && value[value.len - 1] == value[0] {
-        var text: u8[>..] = [];
-        decode_css_string(value[1..value.len - 1], text);
-        push_decl(out, text_decl(P_CONTENT, V_STRING, important, text[..], "", bytes));
-    } else if value == "none" || value == "normal" {
+    if value == "none" || value == "normal" {
         push_decl(out, decl(P_CONTENT, V_KEYWORD, K_NONE, 0, 0, important));
+        return;
     }
+    var text: u8[>..] = [];
+    var i: i64 = 0;
+    while i < value.len {
+        let c = value[i];
+        if is_ws(c) { i += 1; continue; }
+        if c == '/' { break; }
+        if c == '"' || c == '\'' {
+            let end = skip_string(value, i);
+            guard end - 1 > i && value[end - 1] == c else { return; }
+            decode_css_string(value[i + 1..end - 1], text);
+            i = end;
+            continue;
+        }
+        let st = i;
+        while i < value.len && is_ident(value[i]) { i += 1; }
+        let w = value[st..i];
+        if w == "open-quote" { push_utf8(text, 0x201C); }
+        else if w == "close-quote" { push_utf8(text, 0x201D); }
+        else if w != "no-open-quote" && w != "no-close-quote" { return; }
+    }
+    push_decl(out, text_decl(P_CONTENT, V_STRING, important, text[..], "", bytes));
 }
 
 // A CSS string's contents with its escapes decoded: a backslash and up to six
@@ -1286,10 +1306,15 @@ recursive fn compute_subtree(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, par
 // holding the content as text, with its style already in `styles`.
 fn generate(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, s: Style, which: i32, w: Work) {
     let name = if which == 1 { "::before" } else { "::after" };
-    // Styled again, a document keeps the ones it has.
+    var ps = cascade(d, sh, n, s, which, w);
+    // Styled again, a document keeps the ones it has and styles them again
+    // (compute_subtree gives their text the same style).
     let edge = if which == 1 { d.nodes[n].first } else { d.nodes[n].last };
-    if edge >= 0 && d.nodes[edge].kind == NODE_ELEMENT && node_name(d, edge) == name { return; }
-    let ps = cascade(d, sh, n, s, which, w);
+    if edge >= 0 && d.nodes[edge].kind == NODE_ELEMENT && node_name(d, edge) == name {
+        if ps.content_len < 0 { ps.display = K_NONE; }
+        styles[edge] = ps;
+        return;
+    }
     guard ps.content_len >= 0;
     let g = add_element(d, name, n, which == 1);
     styles.push(ps);
