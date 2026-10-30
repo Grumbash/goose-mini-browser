@@ -449,6 +449,9 @@ pub extern "C" fn tp_wake(token: i64) -> i32 {
 /// Frames presented since the window opened. For the idle test.
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_frames() -> i64 {
+    if MainThreadMarker::new().is_none() {
+        return ERR_NOT_MAIN_THREAD as i64;
+    }
     match catch_unwind(|| PLATFORM.with(|cell| cell.borrow().as_ref().map_or(0, |p| p.frames))) {
         Ok(n) => n,
         Err(_) => ERR_PANIC as i64,
@@ -491,6 +494,7 @@ mod tests {
         let mut e = GpEvent::default();
         assert_eq!(tp_next_event(0, &mut e), ERR_NOT_MAIN_THREAD);
         assert_eq!(tp_render(0.0, 0xFFFF_FFFF), ERR_NOT_MAIN_THREAD);
+        assert_eq!(tp_frames(), ERR_NOT_MAIN_THREAD as i64);
     }
 
     #[test]

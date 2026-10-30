@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::ptr::{NonNull, null};
 use std::time::Instant;
 
+use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -24,7 +25,7 @@ use objc2_quartz_core::CAMetalDrawable;
 
 use crate::cg::*;
 use crate::text::{Atlas, PHASES, Text, with_text};
-use crate::{ERR_ARGUMENT, ERR_METAL, ERR_NO_DEVICE, GSlice, guarded};
+use crate::{ERR_ARGUMENT, ERR_METAL, ERR_NO_DEVICE, ERR_NOT_MAIN_THREAD, GSlice, guarded};
 
 // Display item kinds; engine/layout.goose mirrors these numbers.
 pub const ITEM_RECT: i32 = 1;
@@ -532,6 +533,15 @@ pub fn with_compositor<R>(f: impl FnOnce(&mut Compositor) -> Result<R, i32>) -> 
     })
 }
 
+/// Metal objects live on the main thread only (docs/adr/0005). Off it, the
+/// entry points here refuse rather than set up a second compositor, one the
+/// window never shows.
+fn on_main_thread() -> Result<(), i32> {
+    MainThreadMarker::new()
+        .map(|_| ())
+        .ok_or(ERR_NOT_MAIN_THREAD)
+}
+
 /// Hands layer `layer` (0, the page, or 1, the overlay) a new display list.
 /// Positions are in points; `scale` is device pixels per point. The lists are
 /// copied, so Goose may reuse its arrays at once.
@@ -543,6 +553,7 @@ pub extern "C" fn tp_set_layer(
     scale: f32,
 ) -> i32 {
     guarded(|| {
+        on_main_thread()?;
         let items = unsafe { items.as_slice() }.ok_or(ERR_ARGUMENT)?;
         let text = unsafe { text.as_slice() }.ok_or(ERR_ARGUMENT)?;
         if !(0..LAYERS as i32).contains(&layer) || !(scale > 0.0 && scale <= 8.0) {
@@ -565,6 +576,7 @@ pub extern "C" fn tp_screenshot(
     background: u32,
 ) -> i32 {
     guarded(|| {
+        on_main_thread()?;
         let path = unsafe { path.as_slice() }.ok_or(ERR_ARGUMENT)?;
         let (w, h) = ((width * scale).round(), (height * scale).round());
         if path.is_empty() || !(w >= 1.0 && h >= 1.0 && w <= 16384.0 && h <= 16384.0) {
@@ -614,6 +626,7 @@ fn write_png(path: &[u8], pixels: &mut [u8], width: usize, height: usize) -> Opt
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_frame_stats(out: *mut GpFrameStats, reset: bool) -> i32 {
     guarded(|| {
+        on_main_thread()?;
         if out.is_null() {
             return Err(ERR_ARGUMENT);
         }
@@ -718,5 +731,32 @@ mod tests {
         assert_eq!(at(3, 1), [0, 0, 255, 255]); // the red rect, scrolled up by one pixel (BGRA)
         assert_eq!(at(3, 5), [255, 255, 255, 255]); // below it, the background
         assert_eq!(at(0, 0), [255, 0, 0, 255]); // the overlay doesn't scroll
+    }
+
+    #[test]
+    fn calls_off_the_main_thread_are_refused() {
+        // Test threads are not the main thread, where Metal objects live: every
+        // entry point refuses, and none sets Metal up on this thread. The path
+        // is empty, so a check that stopped refusing writes no file.
+        let items = GSlice::<DItem> {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        let text = GSlice::<u8> {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        let path = GSlice::<u8> {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        let mut stats = GpFrameStats::default();
+        assert_eq!(tp_set_layer(0, items, text, 1.0), ERR_NOT_MAIN_THREAD);
+        assert_eq!(
+            tp_screenshot(path, 8.0, 8.0, 1.0, 0.0, 0xFFFF_FFFF),
+            ERR_NOT_MAIN_THREAD
+        );
+        assert_eq!(tp_frame_stats(&mut stats, false), ERR_NOT_MAIN_THREAD);
+        assert!(COMPOSITOR.with(|cell| cell.borrow().is_none()));
     }
 }
