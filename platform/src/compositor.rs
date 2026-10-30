@@ -44,7 +44,7 @@ const LAYERS: usize = 2; // 0: the page, scrolled; 1: the overlay, fixed
 /// clockwise) filled with `color`, and borders inside its edge in one colour
 /// and style: `border` points wide at the top, the others as they say. An
 /// item with a clip (`clip_w` above 0) shows only inside that rectangle, its
-/// corners rounded by `clip_r`.
+/// corners rounded by `clip_tl`, `clip_tr`, `clip_br` and `clip_bl`.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct DItem {
@@ -73,7 +73,10 @@ pub struct DItem {
     pub clip_y: f32,
     pub clip_w: f32,
     pub clip_h: f32,
-    pub clip_r: f32,
+    pub clip_tl: f32,
+    pub clip_tr: f32,
+    pub clip_br: f32,
+    pub clip_bl: f32,
 }
 
 /// One quad, in device pixels: solid when `uv[2]` is 0, otherwise the atlas
@@ -82,7 +85,7 @@ pub struct DItem {
 /// the top left, clockwise, and borders `widths` wide (top, right, bottom,
 /// left) in `border_color`, dashed when `border[1]` is 1, over its fill. Any
 /// quad with a `clip` (its width above 0) shows only inside it, its corners
-/// rounded by `border[3]`.
+/// rounded by `clip_radii`.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Instance {
@@ -94,6 +97,7 @@ pub struct Instance {
     pub border_color: [f32; 4],
     pub widths: [f32; 4],
     pub clip: [f32; 4],
+    pub clip_radii: [f32; 4],
 }
 
 #[repr(C)]
@@ -106,12 +110,12 @@ const SHADERS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-struct Instance { float4 rect; float4 uv; float4 color; float4 radii; float4 border; float4 border_color; float4 widths; float4 clip; };
+struct Instance { float4 rect; float4 uv; float4 color; float4 radii; float4 border; float4 border_color; float4 widths; float4 clip; float4 clip_radii; };
 struct Uniforms { float2 viewport; float2 scroll; };
 struct Out {
     float4 position [[position]];
     float2 uv; float4 color; float textured;
-    float2 local; float2 size; float4 radii; float4 border; float4 border_color; float4 widths; float4 clip;
+    float2 local; float2 size; float4 radii; float4 border; float4 border_color; float4 widths; float4 clip; float4 clip_radii;
 };
 
 vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
@@ -132,6 +136,7 @@ vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
     o.border_color = q.border_color;
     o.widths = q.widths;
     o.clip = float4(q.clip.xy - u.scroll, q.clip.zw);
+    o.clip_radii = q.clip_radii;
     return o;
 }
 
@@ -150,7 +155,7 @@ fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[text
     // Inside the clip, if there is one, blended over its edge's pixel.
     float cover = 1.0;
     if (in.clip.z > 0.0) {
-        cover = clamp(0.5 - rounded_rect(in.position.xy - in.clip.xy, in.clip.zw, float4(in.border.w)), 0.0, 1.0);
+        cover = clamp(0.5 - rounded_rect(in.position.xy - in.clip.xy, in.clip.zw, in.clip_radii), 0.0, 1.0);
     }
     if (in.textured > 0.5) {
         constexpr sampler s(coord::pixel, filter::nearest, address::clamp_to_edge);
@@ -556,7 +561,10 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
             clip_y,
             clip_w,
             clip_h,
-            clip_r,
+            clip_tl,
+            clip_tr,
+            clip_br,
+            clip_bl,
             ..
         } = item;
         let clip = if clip_w > 0.0 && clip_h > 0.0 {
@@ -564,7 +572,8 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
         } else {
             [0.0; 4]
         };
-        let clip_r = clip_r * scale as f32;
+        let k = scale as f32;
+        let clip_radii = [clip_tl * k, clip_tr * k, clip_br * k, clip_bl * k];
         let DItem {
             kind,
             x,
@@ -586,8 +595,8 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
             out.push(Instance {
                 rect: snapped(x, y, w, h, scale),
                 color,
-                border: [0.0, 0.0, 0.0, clip_r],
                 clip,
+                clip_radii,
                 ..Default::default()
             });
         } else if kind == ITEM_BOX {
@@ -620,7 +629,7 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
                 uv: [0.0; 4],
                 color,
                 radii: [rad_tl * s, rad_tr * s, rad_br * s, rad_bl * s],
-                border: [0.0, dashed, 1.0, clip_r],
+                border: [0.0, dashed, 1.0, 0.0],
                 border_color: premultiplied(border_color),
                 widths: [
                     width(border),
@@ -629,6 +638,7 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
                     width(border_left),
                 ],
                 clip,
+                clip_radii,
             });
         } else if kind == ITEM_TEXT {
             let (Ok(start), Ok(len)) = (usize::try_from(start), usize::try_from(text_len)) else {
@@ -667,8 +677,8 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
                     ],
                     uv: [e.x as f32, e.y as f32, e.w as f32, e.h as f32],
                     color,
-                    border: [0.0, 0.0, 0.0, clip_r],
                     clip,
+                    clip_radii,
                     ..Default::default()
                 });
             }
@@ -883,11 +893,11 @@ mod tests {
 
     #[test]
     fn items_match_the_goose_layout() {
-        assert_eq!(std::mem::size_of::<DItem>(), 104);
+        assert_eq!(std::mem::size_of::<DItem>(), 116);
         assert_eq!(std::mem::align_of::<DItem>(), 1);
         assert_eq!(std::mem::size_of::<GpFrameStats>(), 28);
-        // The shader reads instances as eight float4s.
-        assert_eq!(std::mem::size_of::<Instance>(), 128);
+        // The shader reads instances as nine float4s.
+        assert_eq!(std::mem::size_of::<Instance>(), 144);
     }
 
     /// The BGRA pixels of `items` drawn offscreen on white, `w` × `h` at one
@@ -1015,13 +1025,8 @@ mod tests {
         let mut half = rect(0.0, 0.0, 16.0, 16.0, 0xFFFF_0000);
         (half.clip_x, half.clip_y, half.clip_w, half.clip_h) = (0.0, 0.0, 8.0, 16.0);
         let mut round = rect(16.0, 0.0, 16.0, 16.0, 0xFF00_00FF);
-        (
-            round.clip_x,
-            round.clip_y,
-            round.clip_w,
-            round.clip_h,
-            round.clip_r,
-        ) = (16.0, 0.0, 16.0, 16.0, 8.0);
+        (round.clip_x, round.clip_y, round.clip_w, round.clip_h) = (16.0, 0.0, 16.0, 16.0);
+        (round.clip_tl, round.clip_tr, round.clip_br, round.clip_bl) = (8.0, 8.0, 8.0, 8.0);
         let Some(p) = drawn(&[half, round], 32, 16) else {
             eprintln!("no Metal device here: clips aren't checked");
             return;

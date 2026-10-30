@@ -429,7 +429,7 @@ fn print_snapshot(P: Page, cost: Cost, html_bytes: i64) {
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
                      fonts: P.fonts, boxes: boxes, items: items };
     let t0 = clock_ns();
-    let h = layout_page(L, WINDOW_W, WINDOW_H);
+    let h = layout_page(L, WINDOW_W, WINDOW_H - BAR_H);
     let t1 = clock_ns();
     var out: u8[>..] = [];
     let entries = snapshot(L, WINDOW_W, h, out);

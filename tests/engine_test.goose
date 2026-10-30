@@ -478,6 +478,65 @@ fn test_positioning() {
     check("overflow cuts to the padding box", layout_probe(clips, 400.0, PROBE_CLIP),
           "dot none\nbox none\nin clip 2,2,100,50 r 10\nout dropped\nhalf clip 2,2,100,50 r 10\nesc none\n");
 
+    // From a review. A positioned wrapper with nothing in the flow still has
+    // its box; a box out of the flow in an inline element in an empty run is
+    // where that run starts. Auto margins centre between insets both ways,
+    // after max-width, and percentage limits count in the containing block; a
+    // border-box width below the borders is still a width. An overflow on an
+    // inline element cuts nothing, nor does the body's, which is the
+    // viewport's.
+    let fixes = """
+        <style>body { margin: 0; padding: 0; max-width: none; overflow-x: hidden }
+        #rel { position: relative; margin-top: 100px } #a { position: absolute; top: 0; left: 20px; width: 10px; height: 10px }
+        #b { position: absolute; right: 0; top: 0; width: 40px; height: 10px } #gap { height: 30px }
+        #s { position: absolute; width: 5px; height: 5px }
+        #frame { position: relative; height: 300px } #h { position: absolute; left: 0; right: 0; top: 0; margin: 0 auto; max-width: 200px; height: 10px }
+        #v { position: absolute; inset: 0; margin: auto; width: 100px; height: 100px }
+        #mh { position: absolute; top: 0; left: 0; width: 10px; height: 400px; max-height: 50% }
+        #arrow { position: absolute; left: 0; right: 0; top: 0; margin: 0 auto; box-sizing: border-box; width: 0; border: 6px solid #000 }
+        #dd { position: absolute; top: 2000px; left: 0; width: 10px; height: 10px; background: #000 }</style>
+        <div id=rel><div id=a></div><div id=b></div></div><div id=gap></div><p style="margin: 0"><span><span id=s></span></span></p>
+        <div id=frame><div id=h></div><div id=v></div><div id=mh></div><div id=arrow></div></div><div style="position: relative"><div id=dd></div></div>
+        <p><a style="overflow: hidden; color: #f00">link<br>text</a></p><div style="overflow: hidden; height: 1px"></div>
+        """;
+    check("empty wrappers, static positions, auto margins, limits", layout_probe(fixes, 400.0, PROBE_GEOMETRY),
+          str("rel x 0.0 y 100.0 w 400.0 h 0.0\na x 20.0 y 100.0 w 10.0 h 10.0\nb x 360.0 y 100.0 w 40.0 h 10.0\n",
+              "gap x 0.0 y 100.0 w 400.0 h 30.0\ns x 0.0 y 130.0 w 5.0 h 5.0\n",
+              "frame x 0.0 y 130.0 w 400.0 h 300.0\nh x 100.0 y 130.0 w 200.0 h 10.0\nv x 150.0 y 230.0 w 100.0 h 100.0\n",
+              "mh x 0.0 y 130.0 w 10.0 h 150.0\narrow x 194.0 y 130.0 w 12.0 h 12.0\ndd x 0.0 y 2430.0 w 10.0 h 10.0\n")[..]);
+    check("an inline element's and the body's overflow cut nothing", layout_probe(fixes, 400.0, PROBE_CLIP),
+          "arrow none\narrow none\narrow none\narrow none\ndd none\n");
+    check("both lines of an inline element that says overflow: hidden", layout_probe(fixes, 400.0, PROBE_TEXT),
+          "\"link\" line 1 x 0\n\"text\" line 2 x 0\n");
+
+    // The body's background is the canvas's, under even a negative z-index.
+    check("the body's background is the canvas", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none; background: #f00 } #n { position: absolute; z-index: -1; top: 0; left: 0; width: 5px; height: 5px; background: #00f }</style><body id=bd><div id=n></div></body>""", 100.0, PROBE_PAINT),
+          "n rect 0,0,5,5 ff0000ff\n");
+
+    // Clip corners: a square wrapper filling a rounded card is cut round; one
+    // rounded on top only; a pill cut square by its parent is round only
+    // where its own corners are. A block's own "…" is cut by the block.
+    let corners = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        #card { position: relative; width: 100px; height: 60px; overflow: hidden; border-radius: 12px } #wrap { overflow: hidden; height: 60px }
+        #img { height: 60px; background: #f00 } #top { width: 100px; height: 20px; overflow: hidden; border-radius: 8px 8px 0 0 }
+        #topin { height: 30px; background: #0f0 } #sq { width: 40px; height: 20px; overflow: hidden }
+        #pill { width: 80px; height: 20px; overflow: hidden; border-radius: 10px } #pin { width: 80px; height: 20px; background: #00f }
+        #e0 { height: 0; width: 50px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis }</style>
+        <div id=card><div id=wrap><div id=img></div></div></div><div id=top><div id=topin></div></div>
+        <div id=sq><div id=pill><div id=pin></div></div></div><div id=e0>Some text much too long for it</div>
+        """;
+    check("clip corners, and a block's own ellipsis", layout_probe(corners, 400.0, PROBE_CLIP),
+          "topin clip 0,60,100,20 r 8,8,0,0\npin clip 0,80,40,20 r 10,0,0,10\ne0 dropped\nimg clip 0,0,100,60 r 12\n");
+
+    // No line breaks between texts that mustn't wrap; an absolute box with
+    // neither left nor right shrinks into the room from where it would have
+    // been to the far side.
+    check("nowrap across elements", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none }</style><p style="white-space: nowrap; width: 50px">aaaa <b>bbbb</b> cccc</p>""", 400.0, PROBE_TEXT),
+          "\"aaaa \" line 1 x 0\n\"bbbb\" line 1 right\n\" cccc\" line 1 right\n");
+    check("shrink-to-fit from the static position", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none }</style><div style="margin-left: 300px"><div id=e style="position: absolute; top: 0">Some words that need more than a hundred points</div></div>""", 400.0, PROBE_ROOM),
+          "fits the room");
+
     // An ellipsis: what is left ends in "…" inside the box. A box with no
     // width fits its text on one line.
     let cut = "<style>#e { width: 80px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }</style><p id=e>Some long text that will not fit in it</p>";
@@ -492,6 +551,7 @@ let PROBE_ORDER: i32 = 9;   // the elements with an id, in the order their items
 let PROBE_CLIP: i32 = 10;   // each item of an element with an id: its clip, none, or dropped
 let PROBE_ELLIPSIS: i32 = 11; // whether #e's text ends in "…" inside its box
 let PROBE_SHRINK: i32 = 12; // whether #s holds its text on one line, as wide as it
+let PROBE_ROOM: i32 = 13;   // whether #e is at most 100 wide, its text wrapped to fit
 let PROBE_GLUE: i32 = 5;    // "ok", or the first text that starts a line with , . [ or ]
 let PROBE_RAISE: i32 = 6;   // each text item and its height over the first one's baseline
 let PROBE_TEXT: i32 = 1;    // each text item: its text, its line, and where it starts: the
@@ -665,8 +725,19 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             format_flt(out, it.clip_w, 0); out.push(',');
             format_flt(out, it.clip_h, 0);
             out.append(" r ");
-            format_flt(out, it.clip_r, 0);
+            format_flt(out, it.clip_tl, 0);
+            if it.clip_tr != it.clip_tl || it.clip_br != it.clip_tl || it.clip_bl != it.clip_tl {
+                out.push(','); format_flt(out, it.clip_tr, 0);
+                out.push(','); format_flt(out, it.clip_br, 0);
+                out.push(','); format_flt(out, it.clip_bl, 0);
+            }
             out.push('\n');
+        }
+    } else if probe == PROBE_ROOM {
+        for n, i in nodes {
+            let id, has = attr_value(d, i as i32, "id");
+            guard n.kind == NODE_ELEMENT && has && id == "e" else { continue; }
+            out.append(if boxes[i].w <= 100.01 && boxes[i].w > 10.0 && boxes[i].x == 300.0 { "fits the room" } else { "doesn't" });
         }
     } else if probe == PROBE_ELLIPSIS || probe == PROBE_SHRINK {
         var e: i32 = -1;

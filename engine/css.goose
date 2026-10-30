@@ -214,7 +214,7 @@ struct Style {
     lh_mult: f32, lh_px: f32,            // line-height: a multiple of the font size, or pixels when lh_mult is 0
     align: i32, ws: i32, list: i32, deco: i32, valign: i32,
     mt: f32, mr: f32, mb: f32, ml: f32,
-    auto_ml: i32, auto_mr: i32,
+    auto_ml: i32, auto_mr: i32, auto_mt: i32, auto_mb: i32,
     pt: f32, pr: f32, pb: f32, pl: f32,
     width: f32, width_pct: f32,          // -1 when not set
     max_width: f32, max_width_pct: f32,  // -1 when not set
@@ -260,7 +260,7 @@ fn no_shadow() -> Shadow { return Shadow { ox: 0.0, oy: 0.0, blur: 0.0, spread: 
 fn root_style() -> Style {
     return Style { display: K_BLOCK, color: 0xFF000000, bg: 0, font_size: 16.0, bold: 0, italic: 0, family: FAMILY_SANS,
                    lh_mult: 1.2, lh_px: 0.0, align: K_LEFT, ws: K_NORMAL, list: K_DISC, deco: K_NONE, valign: K_BASELINE,
-                   mt: 0.0, mr: 0.0, mb: 0.0, ml: 0.0, auto_ml: 0, auto_mr: 0, pt: 0.0, pr: 0.0, pb: 0.0, pl: 0.0,
+                   mt: 0.0, mr: 0.0, mb: 0.0, ml: 0.0, auto_ml: 0, auto_mr: 0, auto_mt: 0, auto_mb: 0, pt: 0.0, pr: 0.0, pb: 0.0, pl: 0.0,
                    width: -1.0, width_pct: -1.0, max_width: -1.0, max_width_pct: -1.0,
                    bt: 3.0, bb: 3.0, bt_color: CURRENT_COLOR, bb_color: CURRENT_COLOR, indent: 0.0, root_size: 16.0,
                    vars: -1, content: 0, content_len: -1,
@@ -1452,6 +1452,27 @@ fn compute_styles(d: Doc, sh: Sheet, styles: Style[>..]&) {
     var text: u8[>..<] = [];
     let w = Work { offsets: offsets, order: order, customs: customs, prio: prio, text: text };
     compute_subtree(d, sh, styles, 0, root_style(), pseudo_rules[..], w);
+    viewport_overflow(d, styles);
+}
+
+// The root element's overflow belongs to the viewport, or the body's when the
+// root's is visible (CSS 2.2 §11.1.1); the element itself is then visible.
+// Tusk's page never scrolls sideways, so the viewport needs nothing more.
+fn viewport_overflow(d: Doc, styles: Style[>..]&) {
+    let html = d.nodes[0].first;
+    guard html >= 0 && d.nodes[html].kind == NODE_ELEMENT else { return; }
+    if styles[html].clips != 0 {
+        styles[html].clips = 0;
+        return;
+    }
+    var c = d.nodes[html].first;
+    while c >= 0 {
+        if is_element(d, c, "body") {
+            styles[c].clips = 0;
+            return;
+        }
+        c = d.nodes[c].next;
+    }
 }
 
 // Files every rule under one key of its last compound, so that an element
@@ -1909,7 +1930,7 @@ fn inherit_value(s: Style&, parent: Style, p: i32) {
     if p == P_BG { s.bg = parent.bg; }
     else if p == P_DISPLAY { s.display = parent.display; }
     else if p == P_VALIGN { s.valign = parent.valign; }
-    else if p == P_MT { s.mt = parent.mt; } else if p == P_MB { s.mb = parent.mb; }
+    else if p == P_MT { s.mt = parent.mt; s.auto_mt = parent.auto_mt; } else if p == P_MB { s.mb = parent.mb; s.auto_mb = parent.auto_mb; }
     else if p == P_ML { s.ml = parent.ml; s.auto_ml = parent.auto_ml; }
     else if p == P_MR { s.mr = parent.mr; s.auto_mr = parent.auto_mr; }
     else if p == P_PT { s.pt = parent.pt; } else if p == P_PR { s.pr = parent.pr; }
@@ -1935,6 +1956,20 @@ fn inherit_value(s: Style&, parent: Style, p: i32) {
     }
     else if p == P_BOX_SHADOW { s.shadows = parent.shadows; s.shadow_count = parent.shadow_count; }
     else if p == P_OPACITY { s.opacity = parent.opacity; }
+    else if p == P_POSITION { s.position = parent.position; }
+    else if p >= P_TOP && p <= P_LEFT {
+        let bit: i32 = 1 << (p - P_TOP);
+        if p == P_TOP { s.top = parent.top; } else if p == P_RIGHT { s.right = parent.right; }
+        else if p == P_BOTTOM { s.bottom = parent.bottom; } else { s.left = parent.left; }
+        s.inset_auto = (s.inset_auto & ~bit) | (parent.inset_auto & bit);
+        s.inset_pct = (s.inset_pct & ~bit) | (parent.inset_pct & bit);
+    }
+    else if p == P_Z_INDEX { s.z = parent.z; s.z_auto = parent.z_auto; }
+    else if p == P_OVERFLOW_X || p == P_OVERFLOW_Y {
+        let bit: i32 = if p == P_OVERFLOW_X { 1 } else { 2 };
+        s.clips = (s.clips & ~bit) | (parent.clips & bit);
+    }
+    else if p == P_TEXT_OVERFLOW { s.ellipsis = parent.ellipsis; }
 }
 
 // What an element starts from: the inherited properties of its parent, the
@@ -1988,7 +2023,8 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
     else if p >= P_MT && p <= P_ML {
         let auto = dc.kind == V_KEYWORD && k == K_AUTO;
         let v = if dc.kind == V_LENGTH { px(dc, s, parent) } else { 0.0 };
-        if p == P_MT { s.mt = v; } else if p == P_MB { s.mb = v; }
+        if p == P_MT { s.mt = v; s.auto_mt = if auto { 1 } else { 0 }; }
+        else if p == P_MB { s.mb = v; s.auto_mb = if auto { 1 } else { 0 }; }
         else if p == P_ML { s.ml = v; s.auto_ml = if auto { 1 } else { 0 }; }
         else { s.mr = v; s.auto_mr = if auto { 1 } else { 0 }; }
     }

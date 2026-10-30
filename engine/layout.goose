@@ -29,7 +29,7 @@ let BORDER_DASHED: i32 = 1;
 // filled with `color`, and borders inside its edge in one colour and style:
 // `border` wide at the top, the others as wide as they say. An item with a
 // clip (clip_w above 0) shows only inside that rectangle, its corners rounded
-// by clip_r.
+// by clip_tl, clip_tr, clip_br and clip_bl.
 struct DItem {
     kind: i32,
     x: f32, y: f32, w: f32, h: f32,
@@ -40,7 +40,8 @@ struct DItem {
     rad_tl: f32, rad_tr: f32, rad_br: f32, rad_bl: f32,   // a box's corner radii, top left first, clockwise
     border: f32, border_color: u32, border_style: i32,
     border_right: f32, border_bottom: f32, border_left: f32,
-    clip_x: f32, clip_y: f32, clip_w: f32, clip_h: f32, clip_r: f32,
+    clip_x: f32, clip_y: f32, clip_w: f32, clip_h: f32,
+    clip_tl: f32, clip_tr: f32, clip_br: f32, clip_bl: f32,
 }
 
 struct Rect { x: f32, y: f32, w: f32, h: f32 }
@@ -92,6 +93,7 @@ struct Line {
     align: i32,
     first_baseline: f32,         // the first line's baseline once it is closed; -1 before
     ellipsis: i32,               // the run of the "…" that ends a line too long for its box, or -1
+    soft: bool,                  // its last text wraps, so a break may follow it
 }
 
 // The platform's font id: the family, then bold and italic bits.
@@ -149,7 +151,7 @@ recursive fn measure_children(L: Layout, n: i32) {
             if s.display == K_LIST_ITEM {
                 add_marker_run(L, c, ordinal);
                 ordinal += 1;
-            } else if s.ellipsis != 0 && s.clips != 0 {
+            } else if s.ellipsis != 0 && s.clips != 0 && s.display != K_INLINE {
                 add_ellipsis_run(L, c);
             }
             measure_children(L, c);
@@ -272,7 +274,7 @@ fn layout_page(L: Layout, width: f32, height: f32) -> f32 {
         guard L.d.nodes[n].kind == NODE_ELEMENT && s.display != K_NONE else { continue; }
         if s.position != K_STATIC { positioned = true; }
         if s.position == K_RELATIVE { relative = true; }
-        if s.clips != 0 { clips = true; }
+        if s.clips != 0 && s.display != K_INLINE { clips = true; }
     }
     if positioned {
         place_positioned(L, 0, width, height);
@@ -317,7 +319,7 @@ fn is_out(L: Layout, n: i32) -> bool {
 // Whether block n keeps its children's margins inside it, so that they don't
 // collapse with its own: the root, a box out of the flow, and one that clips.
 fn keeps_margins(L: Layout, n: i32) -> bool {
-    return L.d.nodes[n].parent == 0 || is_out(L, n) || L.styles[n].clips != 0;
+    return L.d.nodes[n].parent == 0 || is_out(L, n) || clips_content(L, n);
 }
 
 // Whether n draws nothing: white space between blocks, a hidden element, or
@@ -405,7 +407,9 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
     // Its shadows, background and borders go under its content: their items
     // are kept here and written once its height is known.
     let paint_at = L.items.len;
-    for k in box_paint_count(s) { L.items.push(rect_item(n, bx, y, 0.0, 0.0, 0)); }
+    var ps = s;
+    if paints_canvas(L, n) { ps.bg = 0; }
+    for k in box_paint_count(ps) { L.items.push(rect_item(n, bx, y, 0.0, 0.0, 0)); }
     let contained = keeps_margins(L, n);
     let auto_height = s.height < 0.0 && s.min_height <= 0.0;
     let absorb_bottom = !contained && s.bb == 0.0 && s.pb == 0.0 && auto_height;
@@ -415,10 +419,20 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
     if absorb_bottom { mb = collapse(mb, trailing); } else { ch += trailing; }
     ch = content_height(s, ch, vt);
     let h = vt + ch;
-    box_paint(L, n, s, paint_at, bx, y, bw, h);
+    box_paint(L, n, ps, paint_at, bx, y, bw, h);
     if s.display == K_LIST_ITEM { paint_marker(L, n, bx + s.bl + s.pl, first); }
     L.boxes[n] = Rect { x: bx, y: y, w: bw, h: h };
     return h, first, mb;
+}
+
+// Whether element n's background is the canvas's, which the window is
+// cleared to instead of an item painting it: the root's, or the body's when
+// the root has none (CSS Backgrounds 3 §2.11.2).
+fn paints_canvas(L: Layout, n: i32) -> bool {
+    guard (L.styles[n].bg >> 24) != 0 else { return false; }
+    let p = L.d.nodes[n].parent;
+    if p == 0 { return true; }
+    return L.d.nodes[p].parent == 0 && (L.styles[p].bg >> 24) == 0 && node_name(L.d, n) == "body";
 }
 
 // A block's content width in a containing block `avail` wide: what its width
@@ -458,7 +472,7 @@ fn rect_item(n: i32, x: f32, y: f32, w: f32, h: f32, color: u32) -> DItem {
     return DItem { kind: ITEM_RECT, x: x, y: y, w: w, h: h, color: color, font: 0, size: 0.0, text: 0, text_len: 0, node: n,
                    rad_tl: 0.0, rad_tr: 0.0, rad_br: 0.0, rad_bl: 0.0, border: 0.0, border_color: 0, border_style: BORDER_SOLID,
                    border_right: 0.0, border_bottom: 0.0, border_left: 0.0,
-                   clip_x: 0.0, clip_y: 0.0, clip_w: 0.0, clip_h: 0.0, clip_r: 0.0 };
+                   clip_x: 0.0, clip_y: 0.0, clip_w: 0.0, clip_h: 0.0, clip_tl: 0.0, clip_tr: 0.0, clip_br: 0.0, clip_bl: 0.0 };
 }
 
 fn text_item(n: i32, x: f32, y: f32, w: f32, color: u32, font: i32, size: f32, text: i32, text_len: i32) -> DItem {
@@ -728,8 +742,11 @@ recursive fn layout_children(L: Layout, n: i32, x: f32, y: f32, w: f32, absorbed
         }
         if flow_block(L, c) && is_empty_block(L, c) {
             // Its margins collapse through it into the ones around it; at the
-            // top, top_margin has already passed them up to n.
+            // top, top_margin has already passed them up to n. It is still laid
+            // out, with no height, for its box and for what is out of the flow
+            // in it.
             if !at_top { margin = collapse(margin, collapse(L.styles[c].mt, L.styles[c].mb)); }
+            let eh, eb, em = layout_block(L, c, x, cy + (if at_top { 0.0 } else { margin }), w);
             c = L.d.nodes[c].next;
             continue;
         }
@@ -749,7 +766,7 @@ recursive fn layout_children(L: Layout, n: i32, x: f32, y: f32, w: f32, absorbed
         var blank = true;
         while end >= 0 && !flow_block(L, end) {
             if !is_blank(L, end) { blank = false; }
-            if is_out(L, end) { static_position(L, end, x, cy + (if at_top { 0.0 } else { margin })); }
+            note_static(L, end, x, cy + (if at_top { 0.0 } else { margin }));
             end = L.d.nodes[end].next;
         }
         if !blank {
@@ -780,7 +797,7 @@ fn layout_lines(L: Layout, parent: i32, from: i32, to: i32, x: f32, y: f32, w: f
     var line = Line { left: x, width: w, y: y, x: 0.0, first_item: L.items.len,
                       ascent: f.m.ascent + half, descent: f.m.descent + half,
                       strut_ascent: f.m.ascent + half, strut_descent: f.m.descent + half,
-                      content: false, space: false, trailing: 0.0, align: s.align, first_baseline: -1.0, ellipsis: -1 };
+                      content: false, space: false, trailing: 0.0, align: s.align, first_baseline: -1.0, ellipsis: -1, soft: true };
     // A block that clips with text-overflow: ellipsis has its "…" as its run.
     if s.ellipsis != 0 && s.clips != 0 && s.display != K_LIST_ITEM { line.ellipsis = L.run_of[parent]; }
     if from == L.d.nodes[parent].first { line.x = s.indent; }
@@ -862,8 +879,9 @@ fn flow_text(L: Layout, line: Line&, n: i32) {
         else { while word_end > i && L.text[t + word_end - 1] == ' ' { word_end -= 1; } }
         let own_w = L.carets[c + word_end] - L.carets[c + i];
         let unit_w = own_w + (if word_end == run.len { glued_after(L, n) } else { 0.0 });
-        // No break between this run and the text before it without a space.
-        let glued = i == 0 && line.content && !line.space;
+        // No break between this run and the text before it without a space, nor
+        // where neither may wrap.
+        let glued = i == 0 && line.content && (!line.space || (!wraps && !line.soft));
         if line.content && !glued && line.x + unit_w > line.width + 0.01 {
             if piece >= 0 { emit_text(L, line, run, s, piece, i, piece_x, raise); piece = -1; }
             close_line(L, line, false);
@@ -885,6 +903,7 @@ fn flow_text(L: Layout, line: Line&, n: i32) {
         }
         if piece < 0 { piece = i; piece_x = line.x; }
         place(line, L.carets[c + j] - L.carets[c + i], j > word_end, L.carets[c + j] - L.carets[c + word_end], above, below);
+        line.soft = wraps;
         i = j;
     }
     if piece >= 0 { emit_text(L, line, run, s, piece, run.len, piece_x, raise); }
@@ -1114,6 +1133,21 @@ recursive fn inline_boxes(L: Layout, n: i32) -> Rect {
 
 // ------------------------------------------------------------------ positioned boxes
 
+// Notes (x, y) as the static position of n if it is out of the flow, else of
+// those out of the flow in it, until lines place them better.
+recursive fn note_static(L: Layout, n: i32, x: f32, y: f32) {
+    guard L.d.nodes[n].kind == NODE_ELEMENT && L.styles[n].display != K_NONE;
+    if is_out(L, n) {
+        static_position(L, n, x, y);
+        return;
+    }
+    var c = L.d.nodes[n].first;
+    while c >= 0 {
+        note_static(L, c, x, y);
+        c = L.d.nodes[c].next;
+    }
+}
+
 // Notes where out-of-flow element n would have gone in the flow (its static
 // position), for place_box: in its box, which has no size yet.
 fn static_position(L: Layout, n: i32, x: f32, y: f32) { L.boxes[n] = Rect { x: x, y: y, w: 0.0, h: 0.0 }; }
@@ -1155,48 +1189,63 @@ fn place_box(L: Layout, e: i32, vw: f32, vh: f32) {
     let inside_w: f32 = if s.border_box != 0 { hz } else { 0.0 };
     let inside_h: f32 = if s.border_box != 0 { vt } else { 0.0 };
 
-    // Across.
-    var ml = s.ml;
-    var w: f32 = -1.0;
+    // Across: its width; with none, stretched between two insets, else shrunk
+    // to fit the room from its left inset (or where it would have been) to the
+    // far side. Then its limits.
+    var w: f32 = 0.0;
     if s.width >= 0.0 { w = s.width - inside_w; }
     else if s.width_pct >= 0.0 { w = cb.w * s.width_pct / 100.0 - inside_w; }
-    let given = w >= 0.0;
-    let room = cb.w - (if auto_l { 0.0 } else { left }) - (if auto_r { 0.0 } else { right }) - s.ml - s.mr;
-    if !given {
-        if !auto_l && !auto_r { w = room - hz; }
-        else {
-            let least, most = content_widths(L, e);
-            w = min(max(least, room), most) - hz;
-        }
+    else if !auto_l && !auto_r { w = cb.w - left - right - s.ml - s.mr - hz; }
+    else {
+        let from = if !auto_l { left } else if auto_r { stat.x - cb.x } else { 0.0 };
+        let room = cb.w - from - (if auto_r { 0.0 } else { right }) - s.ml - s.mr;
+        let least, most = content_widths(L, e);
+        w = min(max(least, room), most) - hz;
     }
     if s.max_width >= 0.0 { w = min(w, s.max_width - inside_w); }
     else if s.max_width_pct >= 0.0 { w = min(w, cb.w * s.max_width_pct / 100.0 - inside_w); }
-    w = max(w, (if s.min_width_pct >= 0.0 { cb.w * s.min_width_pct / 100.0 } else { s.min_width }) - inside_w);
-    w = max(w, 0.0);
-    // Auto margins on both sides centre a box between its insets.
-    if given && !auto_l && !auto_r && s.auto_ml != 0 && s.auto_mr != 0 { ml = max((cb.w - left - right - w - hz) / 2.0, 0.0); }
+    w = max(max(w, (if s.min_width_pct >= 0.0 { cb.w * s.min_width_pct / 100.0 } else { s.min_width }) - inside_w), 0.0);
+    // Room left between two insets goes to auto margins; two centre it.
+    var ml = s.ml;
+    if !auto_l && !auto_r {
+        let free = cb.w - left - right - s.ml - s.mr - w - hz;
+        if s.auto_ml != 0 && s.auto_mr != 0 { ml = max(free / 2.0, 0.0); }
+        else if s.auto_ml != 0 { ml = free; }
+    }
     var x = stat.x + ml;
     if !auto_l { x = cb.x + left + ml; }
     else if !auto_r { x = cb.x + cb.w - right - s.mr - w - hz; }
 
-    // Down.
+    // Down: its height, or stretched between top and bottom, within limits
+    // that may be percentages of the containing block's height; else its
+    // content's. Auto margins share what is left.
     var h: f32 = -1.0;
     if s.height >= 0.0 { h = s.height - inside_h; }
     else if s.height_pct >= 0.0 { h = cb.h * s.height_pct / 100.0 - inside_h; }
     else if !auto_t && !auto_b { h = cb.h - top - bottom - s.mt - s.mb - vt; }
-    let y = if auto_t { stat.y + s.mt } else { cb.y + top + s.mt };
+    let max_h = if s.max_height >= 0.0 { s.max_height - inside_h }
+                else if s.max_height_pct >= 0.0 { cb.h * s.max_height_pct / 100.0 - inside_h } else { -1.0 };
+    let min_h = max((if s.min_height_pct >= 0.0 { cb.h * s.min_height_pct / 100.0 } else { s.min_height }) - inside_h, 0.0);
+    if h >= 0.0 {
+        if max_h >= 0.0 { h = min(h, max_h); }
+        h = max(h, min_h);
+    }
+    var mt = s.mt;
+    if h >= 0.0 && !auto_t && !auto_b {
+        let free = cb.h - top - bottom - s.mt - s.mb - h - vt;
+        if s.auto_mt != 0 && s.auto_mb != 0 { mt = free / 2.0; }
+        else if s.auto_mt != 0 { mt = free; }
+    }
+    let y = if auto_t { stat.y + mt } else { cb.y + top + mt };
 
     var o = s;
     o.width = w; o.width_pct = -1.0; o.min_width = 0.0; o.min_width_pct = -1.0; o.max_width = -1.0; o.max_width_pct = -1.0;
     o.ml = 0.0; o.mr = 0.0; o.auto_ml = 0; o.auto_mr = 0; o.border_box = 0;
-    if h >= 0.0 {
-        if s.max_height >= 0.0 { h = min(h, s.max_height - inside_h); }
-        o.height = max(max(h, s.min_height - inside_h), 0.0);
-        o.height_pct = -1.0; o.min_height = 0.0; o.max_height = -1.0;
-    } else if s.border_box != 0 {
-        o.min_height = max(s.min_height - vt, 0.0);
-        if s.max_height >= 0.0 { o.max_height = max(s.max_height - vt, 0.0); }
-    }
+    o.height = h; o.height_pct = -1.0;
+    o.min_height = if h >= 0.0 { 0.0 } else { min_h };
+    o.max_height = if h >= 0.0 { -1.0 } else { max_h };
+    o.min_height_pct = -1.0;
+    o.max_height_pct = -1.0;
     L.styles[e] = o;
     let from = L.items.len;
     let bh, base, mb = layout_block(L, e, x, y, w + hz);
@@ -1245,15 +1294,38 @@ fn positioned_bottom(L: Layout) -> f32 {
     var bottom: f32 = 0.0;
     for n in L.d.nodes.len {
         guard L.d.nodes[n].kind == NODE_ELEMENT && L.styles[n].position == K_ABSOLUTE && L.boxes[n].h > 0.0 else { continue; }
-        var clipped = false;
-        var e = L.d.nodes[n].parent;
-        while e > 0 {
-            if L.styles[e].clips != 0 { clipped = true; }
-            e = L.d.nodes[e].parent;
-        }
-        if !clipped { bottom = max(bottom, L.boxes[n].y + L.boxes[n].h); }
+        if !is_clipped(L, n as i32) { bottom = max(bottom, L.boxes[n].y + L.boxes[n].h); }
     }
     return bottom;
+}
+
+// Whether an element that clips cuts element n, through the elements its
+// containing blocks are, as clip_items walks them.
+fn is_clipped(L: Layout, n: i32) -> bool {
+    var e = n;
+    loop {
+        let up = clip_parent(L, e);
+        if up <= 0 { return false; }
+        if clips_content(L, up) { return true; }
+        e = up;
+    }
+}
+
+// The next element up whose overflow could cut node e: its parent, an
+// absolute box's containing block element, none (0) above a fixed box.
+fn clip_parent(L: Layout, e: i32) -> i32 {
+    if L.d.nodes[e].kind == NODE_ELEMENT {
+        let p = L.styles[e].position;
+        if p == K_FIXED { return 0; }
+        if p == K_ABSOLUTE { return positioned_ancestor(L, e); }
+    }
+    return L.d.nodes[e].parent;
+}
+
+// Whether element n cuts what is in it: its overflow isn't visible, and it
+// holds blocks (overflow doesn't apply to inline boxes).
+fn clips_content(L: Layout, n: i32) -> bool {
+    return L.styles[n].clips != 0 && L.styles[n].display != K_INLINE;
 }
 
 // Moves each relatively positioned element, and everything in it, by its
@@ -1471,7 +1543,11 @@ recursive fn paint_context(L: Layout, P: Paint, n: i32) {
     let mark = P.scratch.len;
     gather(L, P, n);
     let end = P.scratch.len;
-    paint_stacked(L, P, mark, end, -1);
+    // Its stacking contexts again, above, sorted by z-index.
+    for i in mark..end { if stacks(L.styles[P.scratch[i]]) { P.scratch.push(P.scratch[i]); } }
+    let sorted = P.scratch.len;
+    sort_by_z(L, P, end, sorted);
+    for i in end..sorted { if L.styles[P.scratch[i]].z < 0 { paint_context(L, P, P.scratch[i]); } }
     paint_flow(L, P, n);
     for i in mark..end {
         let e = P.scratch[i];
@@ -1483,7 +1559,7 @@ recursive fn paint_context(L: Layout, P: Paint, n: i32) {
             paint_context(L, P, e);
         }
     }
-    paint_stacked(L, P, mark, end, 1);
+    for i in end..sorted { if L.styles[P.scratch[i]].z > 0 { paint_context(L, P, P.scratch[i]); } }
     P.scratch.resize(mark);
 }
 
@@ -1501,25 +1577,37 @@ recursive fn gather(L: Layout, P: Paint, n: i32) {
     }
 }
 
-// Paints the stacking contexts among P.scratch[mark..end] whose z-index has
-// the sign of `sign`, lowest first, in document order among equals.
-recursive fn paint_stacked(L: Layout, P: Paint, mark: i64, end: i64, sign: i32) {
-    var last: i32 = if sign < 0 { -2147483647 } else { 0 };
-    loop {
-        var z: i32 = 2147483647;
-        var found = false;
-        for i in mark..end {
-            let s = L.styles[P.scratch[i]];
-            guard stacks(s) && s.z > last && (if sign < 0 { s.z < 0 } else { s.z > 0 }) else { continue; }
-            if s.z < z { z = s.z; found = true; }
+// Sorts P.scratch[a..b] by z-index, document order kept among equals: a
+// merge sort, merging into room above b.
+fn sort_by_z(L: Layout, P: Paint, a: i64, b: i64) {
+    let n = b - a;
+    guard n > 1;
+    for i in n { P.scratch.push(0); }
+    var width: i64 = 1;
+    while width < n {
+        var lo: i64 = 0;
+        while lo < n {
+            let mid = min(lo + width, n);
+            let hi = min(lo + 2 * width, n);
+            var i = lo;
+            var j = mid;
+            var t = lo;
+            while i < mid || j < hi {
+                if j >= hi || (i < mid && L.styles[P.scratch[a + i]].z <= L.styles[P.scratch[a + j]].z) {
+                    P.scratch[b + t] = P.scratch[a + i];
+                    i += 1;
+                } else {
+                    P.scratch[b + t] = P.scratch[a + j];
+                    j += 1;
+                }
+                t += 1;
+            }
+            lo = hi;
         }
-        if !found { return; }
-        for i in mark..end {
-            let e = P.scratch[i];
-            if stacks(L.styles[e]) && L.styles[e].z == z { paint_context(L, P, e); }
-        }
-        last = z;
+        for k in n { P.scratch[a + k] = P.scratch[b + k]; }
+        width *= 2;
     }
+    P.scratch.resize(b);
 }
 
 // Paints what is in n and isn't positioned, in document order.
@@ -1538,10 +1626,12 @@ recursive fn paint_flow(L: Layout, P: Paint, n: i32) {
 // ------------------------------------------------------------------ clips
 
 // Cuts each item to the padding boxes of the elements around it whose
-// overflow isn't visible (CSS Overflow 3): to where they all meet, with the
-// inner corner radius of the innermost. An absolute box is cut only by those
-// around its containing block, a fixed one by none. An item wholly outside is
-// dropped; one wholly inside a square clip needs none.
+// overflow isn't visible (CSS Overflow 3), to where they all meet. A corner
+// of that is rounded when it is a clipping box's corner, as that box's inner
+// radius (the rounder, when two meet there). An absolute box is cut only by
+// those around its containing block, a fixed one by none; a block's own "…",
+// or a list item's marker, by the element itself too. An item wholly
+// outside is dropped; one wholly inside a square clip needs none.
 fn clip_items(L: Layout) {
     for k in L.items.len {
         let it = L.items[k];
@@ -1550,28 +1640,34 @@ fn clip_items(L: Layout) {
         var y0: f32 = -1000000000.0;
         var x1: f32 = 1000000000.0;
         var y1: f32 = 1000000000.0;
-        var r: f32 = 0.0;
+        var r = Radii { tl: 0.0, tr: 0.0, br: 0.0, bl: 0.0 };
         var any = false;
         var e = it.node;
+        var own = it.kind == ITEM_TEXT && L.d.nodes[e].kind == NODE_ELEMENT;
         loop {
-            var up = L.d.nodes[e].parent;
-            if L.d.nodes[e].kind == NODE_ELEMENT {
-                let p = L.styles[e].position;
-                if p == K_FIXED { break; }
-                if p == K_ABSOLUTE { up = positioned_ancestor(L, e); }
-            }
+            let up = if own { e } else { clip_parent(L, e) };
+            own = false;
             if up <= 0 { break; }
-            let s = L.styles[up];
-            if s.clips != 0 {
+            if clips_content(L, up) {
+                let s = L.styles[up];
                 let b = L.boxes[up];
-                if !any {
-                    let rr = radii_of(s, b.w, b.h);
-                    r = max(min(min(rr.tl, rr.tr), min(rr.br, rr.bl)) - max(max(s.bt, s.br), max(s.bb, s.bl)), 0.0);
-                }
-                x0 = max(x0, b.x + s.bl);
-                y0 = max(y0, b.y + s.bt);
-                x1 = min(x1, b.x + b.w - s.br);
-                y1 = min(y1, b.y + b.h - s.bb);
+                let px0 = b.x + s.bl;
+                let py0 = b.y + s.bt;
+                let px1 = b.x + b.w - s.br;
+                let py1 = b.y + b.h - s.bb;
+                let pr = inner_radii(radii_of(s, b.w, b.h), s);
+                let nx0 = max(x0, px0);
+                let ny0 = max(y0, py0);
+                let nx1 = min(x1, px1);
+                let ny1 = min(y1, py1);
+                r = Radii { tl: corner_radius(nx0, ny0, px0, py0, pr.tl, x0, y0, r.tl),
+                            tr: corner_radius(nx1, ny0, px1, py0, pr.tr, x1, y0, r.tr),
+                            br: corner_radius(nx1, ny1, px1, py1, pr.br, x1, y1, r.br),
+                            bl: corner_radius(nx0, ny1, px0, py1, pr.bl, x0, y1, r.bl) };
+                x0 = nx0;
+                y0 = ny0;
+                x1 = nx1;
+                y1 = ny1;
                 any = true;
             }
             e = up;
@@ -1584,11 +1680,26 @@ fn clip_items(L: Layout) {
             L.items[k].kind = ITEM_NONE;
             continue;
         }
-        if r == 0.0 && it.x >= x0 && ty >= y0 && it.x + it.w <= x1 && ty + th <= y1 { continue; }
+        let rounded = r.tl > 0.0 || r.tr > 0.0 || r.br > 0.0 || r.bl > 0.0;
+        if !rounded && it.x >= x0 && ty >= y0 && it.x + it.w <= x1 && ty + th <= y1 { continue; }
+        let fit = fit_radii(r, x1 - x0, y1 - y0);
         L.items[k].clip_x = x0;
         L.items[k].clip_y = y0;
         L.items[k].clip_w = x1 - x0;
         L.items[k].clip_h = y1 - y0;
-        L.items[k].clip_r = r;
+        L.items[k].clip_tl = fit.tl;
+        L.items[k].clip_tr = fit.tr;
+        L.items[k].clip_br = fit.br;
+        L.items[k].clip_bl = fit.bl;
     }
+}
+
+// The radius of the clip's corner at (x, y): a clipping box's corner radius
+// where that box's corner (bx, by) is it, the clip so far's where its corner
+// (px, py) is it, the rounder when both are; else square.
+fn corner_radius(x: f32, y: f32, bx: f32, by: f32, br: f32, px: f32, py: f32, pr: f32) -> f32 {
+    var out: f32 = 0.0;
+    if abs(x - bx) < 0.01 && abs(y - by) < 0.01 { out = br; }
+    if abs(x - px) < 0.01 && abs(y - py) < 0.01 { out = max(out, pr); }
+    return out;
 }
