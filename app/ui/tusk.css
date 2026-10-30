@@ -75,6 +75,9 @@ body { background:var(--bg); color:var(--ink); font:400 17px/1.5 var(--f-ui); -w
 .u i { font-style:normal; color:var(--steel-4) }
 .u b { font-weight:700; color:#F2F3F5 }
 .u em { font-style:normal; color:var(--hazard) }
+.url.editing { box-shadow:inset 0 0 0 1px var(--hazard) }
+.u mark { background:rgba(245,183,0,.35); color:#F2F3F5 }
+.u .caret { display:inline-block; width:2px; height:14px; margin:0 -1px; vertical-align:middle }
 .tools { right:14px; gap:8px; color:var(--steel-5) }
 .tools > span { display:flex; align-items:center; justify-content:center; width:28px; height:28px }
 .tools .i { width:16px; height:16px }

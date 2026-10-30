@@ -17,6 +17,7 @@ import app.tab;
 import app.ui;
 import app.net;
 import app.history;
+import app.address;
 
 var failures = 0;
 
@@ -77,7 +78,8 @@ fn doc_for(title: const u8[:], path: const u8[:], w: f32, out: u8[>..]&) {
     var notes: u8[>..] = [];
     notes.append(path);
     notes.append(title);
-    let T = UiText { notes: notes };
+    var edit: u8[>..] = [];
+    let T = UiText { notes: notes, edit: edit };
     let info = FrameInfo { height: 100.0, background: 0xFFFFFFFF, nodes: 10, bytes: 2000, parse: 1.0, style: 1.0,
                            measure: 1.0, layout: 1.0, scale: 2.0, read: 1.0 };
     var tabs: Tab[>..] = [];
@@ -86,7 +88,7 @@ fn doc_for(title: const u8[:], path: const u8[:], w: f32, out: u8[>..]&) {
                     title_at: path.len, title_len: title.len, why_at: 0, why_len: 0, log_at: 0, log_len: 0, elems_at: 0,
                     elems_len: 0 });
     let U = Ui { w: w, h: 760.0, lights: 0.0, cur: 0, dev: true, dev_tab: DEV_CONSOLE, oil: 50.0, mac_used: 12288.0, mac_total: 24576.0, cpu: 1.0, mac_cpu: 12.0, fps: 0,
-                 running: false, back: false, forward: false };
+                 running: false, back: false, forward: false, editing: false, caret: 0, all: false };
     ui_html(F, U, tabs, T, [], 0, 1.0, out);
 }
 
@@ -270,7 +272,47 @@ fn test_actions() {
           str(action_at(actions[..], 12.0, 12.0), action_at(actions[..], 16.0, 16.0), action_at(actions[..], 40.0, 12.0)), "130");
 }
 
+fn leads(typed: const u8[:]) -> u8[>..] {
+    var out: u8[>..] = [];
+    if !typed_loc(typed, out) { out.append("nothing"); }
+    return out;
+}
+
+fn test_address() {
+    check("a URL is itself, as WHATWG writes it", leads("  HTTPS://EN.Wikipedia.org/wiki/Focaccia "),
+          "https://en.wikipedia.org/wiki/Focaccia");
+    check("a host and path is https", leads("en.wikipedia.org/wiki/Focaccia"), "https://en.wikipedia.org/wiki/Focaccia");
+    check("this Mac is http", leads("localhost:5173/x"), "http://localhost:5173/x");
+    check("a path is a file", leads("/Users/v/page.html"), "/Users/v/page.html");
+    check("a file URL is its path", leads("file:///Users/v/My%20page.html"), "/Users/v/My page.html");
+    check("words are a search", leads("focaccia genovese & oil"),
+          "https://html.duckduckgo.com/html/?q=focaccia+genovese+%26+oil");
+    check("one word with no dot too", leads("focaccia"), "https://html.duckduckgo.com/html/?q=focaccia");
+    check("nothing leads nowhere", leads("   "), "nothing");
+    let s = "aé😀b";
+    check("the caret moves a character at a time, never into one",
+          str(char_after(s, 0), char_after(s, 1), char_after(s, 3), char_before(s, 7), char_before(s, 3), char_before(s, 1)),
+          "137310");
+    check("an edit splices", spliced("https://a.org/", 8, 13, "b.com")[..], "https://b.com/");
+    check("a pasted line keeps to one line", one_line_of("a\nb\tc")[..], "a b c");
+    var shown: u8[>..] = [];
+    typing(shown, "https://a.org/<x>", 8, false, 100);
+    check("being typed: the caret where it is, the text escaped", shown[..],
+          "<span class=\"u\">https://<i class=\"caret\"></i>a.org/&lt;x&gt;</span>");
+    var marked: u8[>..] = [];
+    typing(marked, "https://a.org/", 3, true, 100);
+    check("all of it selected", marked[..], "<span class=\"u\"><mark>https://a.org/</mark></span>");
+    var long: u8[>..] = [];
+    typing(long, "https://example.org/a/very/long/path", 36, false, 12);
+    check("a long text shows its end, up to the caret", long[..],
+          "<span class=\"u\">…/long/path<i class=\"caret\"></i></span>");
+    var html: u8[>..] = [];
+    doc_for("", "https://a.org/", 1200.0, html);
+    yes("a click on the address types in it", find(html[..], "data-action=\"address\"") >= 0);
+}
+
 fn main() {
+    test_address();
     test_links();
     test_history();
     test_actions();

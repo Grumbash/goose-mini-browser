@@ -29,12 +29,14 @@ struct UiFiles { css: u8[>..]&, sprite: u8[>..]&, rest: u8[>..]&, run: u8[>..]& 
 // traffic lights end in its bar (0: none), which tab is shown, the dev panel
 // and its tab, the window's oil (MB), the Mac's memory in use and in all
 // (MB), the window's CPU and the whole Mac's (%, of all its cores), its
-// frames a second, whether the boar is out running a load, and whether the
-// tab shown can go back and forward.
+// frames a second, whether the boar is out running a load, whether the tab
+// shown can go back and forward, and whether the address bar is being typed
+// in, where its caret is (a byte of UiText.edit) and whether all of it is
+// selected.
 struct Ui {
     w: f32, h: f32, lights: f32, cur: i64, dev: bool, dev_tab: i32,
     oil: f32, mac_used: f32, mac_total: f32, cpu: f32, mac_cpu: f32, fps: i32, running: bool,
-    back: bool, forward: bool,
+    back: bool, forward: bool, editing: bool, caret: i64, all: bool,
 }
 
 // What a click on the interface does: its elements' data-action.
@@ -42,17 +44,19 @@ let ACT_NONE: i32 = 0;
 let ACT_BACK: i32 = 1;
 let ACT_FORWARD: i32 = 2;
 let ACT_RELOAD: i32 = 3;
+let ACT_ADDRESS: i32 = 4;
 
 fn action_of(name: const u8[:]) -> i32 {
     if name == "back" { return ACT_BACK; }
     if name == "forward" { return ACT_FORWARD; }
     if name == "reload" { return ACT_RELOAD; }
+    if name == "address" { return ACT_ADDRESS; }
     return ACT_NONE;
 }
 
 // What it reads of the main thread's strings: the notes the tabs' spans
-// point into (Tab).
-struct UiText { notes: u8[>..]& }
+// point into (Tab), and the address bar's text while it is typed in.
+struct UiText { notes: u8[>..]&, edit: u8[>..]& }
 
 // The dev panel's tabs.
 let DEV_CONSOLE: i32 = 0;
@@ -237,12 +241,13 @@ fn bar(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText) {
     action_icon(out, "i-chev-r", "forward", U.forward);
     action_icon(out, "i-reload", "reload", true);
     let url_w = max(U.w - 290.0 - shift - 190.0, 120.0);
-    out.append("</span><span class=\"url\" data-nodrag style=\"left:");
+    format(out, "</span><span class=\"url", if U.editing { " editing" } else { "" }, "\" data-nodrag data-action=\"address\" style=\"left:");
     px(out, 290.0 + shift);
     out.append("; width:");
     px(out, url_w);
     out.append("\">");
-    address(out, loc_of(t, T), ((url_w - 120.0) / 7.5) as i64);
+    if U.editing { typing(out, T.edit[..], U.caret, U.all, ((url_w - 40.0) / 7.5) as i64); }
+    else { address(out, loc_of(t, T), ((url_w - 120.0) / 7.5) as i64); }
     out.append("</span><span class=\"tools\" data-nodrag><span class=\"bv\">");
     icon(out, "i-grid");
     out.append("<kbd>⌘B</kbd></span><kbd>⌘K</kbd><span");
@@ -309,6 +314,29 @@ fn address(out: u8[>..]&, p: const u8[:], room: i64) {
     out.append("<b>");
     esc(out, p[name..]);
     out.append("</b></span>");
+}
+
+// The address bar's text being typed: all of it selected, or a caret at byte
+// `caret`. When more than `room` characters, it shows the end up to the caret.
+fn typing(out: u8[>..]&, s: const u8[:], caret: i64, all: bool, room: i64) {
+    out.append("<span class=\"u\">");
+    var from: i64 = 0;
+    if s.len > room && room > 4 {
+        from = max(min(caret, s.len) - room + 2, 0);
+        while from < s.len && (s[from] & 0xC0) == 0x80 { from += 1; }
+        if from > 0 { out.append("…"); }
+    }
+    if all {
+        out.append("<mark>");
+        esc(out, s[from..]);
+        out.append("</mark>");
+    } else {
+        let c = max(min(caret, s.len), from);
+        esc(out, s[from..c]);
+        out.append("<i class=\"caret\"></i>");
+        esc(out, s[c..]);
+    }
+    out.append("</span>");
 }
 
 // The content: the page in focus, its header over its slot.

@@ -11,8 +11,10 @@
 //                                        (the Focaccia article by default); a click on a link
 //                                        follows it (⌘-click: in a new tab); ⌘[ and ⌘] go back
 //                                        and forward, ⌘R reloads (⌘⇧R past the cache), Esc stops
-//                                        a load; ⌘1 to ⌘9 show a tab, ⌘⌥I hides the dev panel,
-//                                        ⌘⇧S opens the page in Safari
+//                                        a load; ⌘L types where to go (Return opens it, ⌘Return in
+//                                        a new tab: a URL, a path, a host or a search), ⌘1 to ⌘9
+//                                        show a tab, ⌘⌥I hides the dev panel, ⌘⇧S opens the page
+//                                        in Safari
 //   tusk snapshot [page.html]            print the page as a tree for agents (docs/adr/0007)
 //   tusk --screenshot out.png [--at Y] [--size WxH] [--dev-tab NAME] [--bare] [page.html]
 //                                        draw the window offscreen into a PNG, W × H points
@@ -40,6 +42,7 @@ import .ui;
 import .net;
 import .sheets;
 import .history;
+import .address;
 
 struct Event { kind: i32, code: i32, x: f64, y: f64, w: f64, h: f64 }
 
@@ -100,6 +103,9 @@ extern "tusk_platform" {
     fn tp_set_title(title: const u8[:]) -> i32;
     fn tp_text_cache(limit_bytes: i64) -> i32;
     fn tp_dark_mode() -> i32;
+    fn tp_key_text(out: u8[:]) -> i32;
+    fn tp_paste(out: u8[:]) -> i32;
+    fn tp_copy(text: const u8[:]) -> i32;
 }
 
 // Event kinds, as numbered in platform/src/lib.rs.
@@ -120,6 +126,15 @@ let EV_REPLY: i32 = 11;          // code: a tab whose reply waits
 let KEY_Q: i32 = 12;
 let KEY_W: i32 = 13;
 let KEY_S: i32 = 1;
+let KEY_A: i32 = 0;
+let KEY_C: i32 = 8;
+let KEY_V: i32 = 9;
+let KEY_X: i32 = 7;
+let KEY_L: i32 = 37;
+let KEY_RETURN: i32 = 36;
+let KEY_ENTER: i32 = 76;           // the keypad's
+let KEY_DELETE: i32 = 51;          // ⌫
+let KEY_FORWARD_DELETE: i32 = 117; // ⌦
 let KEY_R: i32 = 15;
 let KEY_LEFT_BRACKET: i32 = 33;
 let KEY_RIGHT_BRACKET: i32 = 30;
@@ -594,12 +609,13 @@ fn main() {
         exit(1);
         return;
     }
-    let T = UiText { notes: notes };
+    var edit: u8[>..] = [];          // the address bar's text while it is typed in
+    let T = UiText { notes: notes, edit: edit };
     // Its text is mostly what it was, each time it is laid out.
     tp_text_cache(SHAPE_CACHE);
     var U = Ui { w: WINDOW_W, h: WINDOW_H, lights: 0.0, cur: 0, dev: dev, dev_tab: dev_tab,
                  oil: 0.0, mac_used: 0.0, mac_total: 0.0, cpu: 0.0, mac_cpu: 0.0, fps: 0, running: false,
-                 back: false, forward: false };
+                 back: false, forward: false, editing: false, caret: 0, all: false };
     weigh(U);
     var slot = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
     var actions: f32[>..<] = [];     // what clicks on the interface do: x, y, w, h and an ACT_ each
@@ -778,6 +794,11 @@ fn main() {
                     press_y = e.y as f32;
                     press_button = e.code;
                     press_mods = e.w as i64;
+                    // A press anywhere else leaves the address bar as it was.
+                    if U.editing && action_at(actions[..], press_x, press_y) != ACT_ADDRESS {
+                        U.editing = false;
+                        redo = true;
+                    }
                 } else if e.kind == EV_MOUSE_UP {
                     // A click: up where it went down. On the page, it asks the
                     // page what is there (a link with ⌘ or the middle button
@@ -794,6 +815,11 @@ fn main() {
                         if act == ACT_BACK { go(tabs, U.cur, entries, entries[tabs[U.cur].entry].prev, notes, pages, slot, scale); }
                         else if act == ACT_FORWARD { go(tabs, U.cur, entries, entries[tabs[U.cur].entry].next, notes, pages, slot, scale); }
                         else if act == ACT_RELOAD { reload(tabs, U.cur, notes, pages, slot, scale, false); }
+                        else if act == ACT_ADDRESS && !U.editing {
+                            var here: u8[>..] = [];
+                            here.append(loc_of(tabs[U.cur], T));
+                            start_typing(U, edit, here[..]);
+                        }
                         if act != ACT_NONE { redo = true; }
                     }
                 } else if e.kind == EV_SCROLL {
@@ -816,7 +842,34 @@ fn main() {
                     let mods = e.x as i64;
                     let page = slot.h - 40.0;
                     let cmd = (mods & MOD_COMMAND) != 0;
-                    if cmd && (e.code == KEY_Q || e.code == KEY_W) { quit = true; }
+                    var typed = false;           // the address bar took the key
+                    if U.editing { typed = type_key(U, edit, e.code, cmd); }
+                    if typed { redo = true; }
+                    else if U.editing && (e.code == KEY_RETURN || e.code == KEY_ENTER) {
+                        // Where the text leads, in this tab or with ⌘ a new one.
+                        var loc: u8[>..] = [];
+                        if typed_loc(edit[..], loc) {
+                            U.editing = false;
+                            let at = notes.len;
+                            notes.append(loc);
+                            if cmd {
+                                open_tab(tabs, entries, notes, at, loc.len, pages, slot, scale);
+                                U.cur = tabs.len - 1;
+                            } else {
+                                push_entry(tabs, U.cur, entries, at, loc.len);
+                                load(tabs, U.cur, notes, at, loc.len, -1.0, false, pages, slot, scale);
+                                tp_set_title(title_of(tabs[U.cur], T));
+                            }
+                        }
+                        redo = true;
+                    }
+                    else if cmd && e.code == KEY_L {
+                        var here: u8[>..] = [];
+                        here.append(loc_of(tabs[U.cur], T));
+                        start_typing(U, edit, here[..]);
+                        redo = true;
+                    }
+                    else if cmd && (e.code == KEY_Q || e.code == KEY_W) { quit = true; }
                     else if cmd && (e.code == KEY_LEFT_BRACKET || e.code == KEY_LEFT) {
                         go(tabs, U.cur, entries, entries[tabs[U.cur].entry].prev, notes, pages, slot, scale);
                         redo = true;
@@ -1043,6 +1096,80 @@ fn full_path(p: const u8[:], out: u8[>..]&) {
         i = j;
     }
     if out.len == start { out.push('/'); }
+}
+
+// The address bar is typed in, starting from where the tab is, all of it
+// selected.
+fn start_typing(U: Ui&, edit: u8[>..]&, loc: const u8[:]) {
+    edit = [];
+    edit.append(loc);
+    U.editing = true;
+    U.caret = edit.len;
+    U.all = true;
+}
+
+// What key `code` (⌘ held: `cmd`) does to the address bar's text `edit`:
+// Esc leaves it as it was; ⌫ and ⌦ delete; ←, →, ⌘←, ⌘→, Home and End move
+// the caret; ⌘A selects all; ⌘C copies all, ⌘X cuts all, ⌘V pastes; and a
+// key that types, types. True if it took the key: Return, and ⌘ with the
+// rest, are left to the window.
+fn type_key(U: Ui&, edit: u8[>..]&, code: i32, cmd: bool) -> bool {
+    if code == KEY_ESCAPE { U.editing = false; return true; }
+    if code == KEY_DELETE || code == KEY_FORWARD_DELETE {
+        if U.all { edit = []; U.caret = 0; U.all = false; return true; }
+        if code == KEY_DELETE && U.caret > 0 {
+            let b = char_before(edit[..], U.caret);
+            let left = spliced(edit[..], b, U.caret, "");
+            edit = copy(left);
+            U.caret = b;
+        } else if code == KEY_FORWARD_DELETE && U.caret < edit.len {
+            let left = spliced(edit[..], U.caret, char_after(edit[..], U.caret), "");
+            edit = copy(left);
+        }
+        return true;
+    }
+    if code == KEY_LEFT || code == KEY_HOME {
+        U.caret = if U.all || cmd || code == KEY_HOME { 0 } else { char_before(edit[..], U.caret) };
+        U.all = false;
+        return true;
+    }
+    if code == KEY_RIGHT || code == KEY_END {
+        U.caret = if U.all || cmd || code == KEY_END { edit.len } else { char_after(edit[..], U.caret) };
+        U.all = false;
+        return true;
+    }
+    if cmd && code == KEY_A { U.all = true; return true; }
+    if cmd && (code == KEY_C || code == KEY_X) {
+        tp_copy(edit[..]);
+        if code == KEY_X { edit = []; U.caret = 0; U.all = false; }
+        return true;
+    }
+    var text: u8[>..] = [];
+    if cmd && code == KEY_V {
+        let n = tp_paste(text[..]);
+        guard n > 0 else { return true; }
+        for i in n { text.push(0); }
+        guard tp_paste(text[..]) == n else { return true; }
+        let line = one_line_of(text[..]);
+        text = copy(line);
+    } else if !cmd {
+        let n = tp_key_text(text[..]);
+        guard n > 0 else { return code != KEY_RETURN && code != KEY_ENTER; }
+        for i in n { text.push(0); }
+        guard tp_key_text(text[..]) == n else { return true; }
+    } else {
+        return false;
+    }
+    if U.all {
+        edit = copy(text);
+        U.caret = edit.len;
+        U.all = false;
+    } else {
+        let typed = spliced(edit[..], U.caret, U.caret, text[..]);
+        edit = copy(typed);
+        U.caret += text.len;
+    }
+    return true;
 }
 
 // Weighs the window's oil and the Mac's memory into U, in MB.
