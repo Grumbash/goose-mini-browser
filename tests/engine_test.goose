@@ -1011,6 +1011,43 @@ fn test_svg() {
               "fill ff000000 M90,20 L110,20 L110,40 L90,40 L90,20 Z clip 100.0,20.0 100.0,30.0 90.0,30.0 90.0,20.0\n",
               "fill ff000000 M120,0 L140,0 L140,20 L120,20 L120,0 Z\n")[..]);
 
+    // What each shape draws, every point: a circle's and an arc's quarter
+    // turns, a radius at most half a side, a polyline; the viewBox aligned
+    // and sliced; opacity; a shape's own colour in a <use>; groups deep in
+    // groups; a fill rule and caps as flags.
+    let details = """
+        <style>body { margin: 0; padding: 0; max-width: none } svg { display: block }</style>
+        <svg width=100 height=100><circle cx=50 cy=50 r=10 /><path d="M0 50 A10 10 0 0 1 20 50" />
+        <rect x=70 width=20 height=10 rx=50 /><polyline points="0,0 10,0 10,10" fill=none stroke="#000" /></svg>
+        """;
+    check("shapes, every point", layout_probe(details, 400.0, PROBE_CURVES),
+          str("M60,50 C60,55.5 55.5,60 50,60 C44.5,60 40,55.5 40,50 C40,44.5 44.5,40 50,40 C55.5,40 60,44.5 60,50 Z\n",
+              "M0,50 C0,44.5 4.5,40 10,40 C15.5,40 20,44.5 20,50\n",
+              "M80,0 L80,0 C85.5,0 90,2.2 90,5 L90,5 C90,7.8 85.5,10 80,10 L80,10 C74.5,10 70,7.8 70,5 L70,5 C70,2.2 74.5,0 80,0 Z\n",
+              "M0,0 L10,0 L10,10\n")[..]);
+    let fits = """
+        <style>body { margin: 0; padding: 0; max-width: none } svg { display: block }</style>
+        <svg width=40 height=20 viewBox="0 0 10 10" preserveAspectRatio="xMinYMid meet"><rect width=10 height=10 /></svg>
+        <svg width=40 height=20 viewBox="0 0 10 10" preserveAspectRatio="xMaxYMid"><rect width=10 height=10 /></svg>
+        <svg width=40 height=20 viewBox="0 0 10 10" preserveAspectRatio="xMidYMax slice"><rect width=10 height=10 /></svg>
+        <svg style="display: none"><symbol id=k><path d="M0 0 H5 V5 Z" style="color: #00f" fill="currentColor"/></symbol></svg>
+        <svg width=20 height=20 style="color: #f00"><g opacity=".5"><rect width=5 height=5 fill="#f00"/></g><use href="#k" x=10 />
+        <g><g><g><g><g><rect y=10 width=2 height=2 /></g></g></g></g></g>
+        <path fill-rule=evenodd d="M10 10 h5 v5 z" /><path d="M0 15 h5" stroke="#000" stroke-linecap=round /></svg>
+        """;
+    check("viewBox fits, opacity, own colour, depth, flags", layout_probe(fits, 400.0, PROBE_PATHS),
+          str("fill ff000000 M0,0 L20,0 L20,20 L0,20 L0,0 Z\nfill ff000000 M20,20 L40,20 L40,40 L20,40 L20,20 Z\n",
+              "fill ff000000 M0,20 L40,20 L40,60 L0,60 L0,20 Z\nfill 80ff0000 M0,60 L5,60 L5,65 L0,65 L0,60 Z\n",
+              "fill ff0000ff M10,60 L15,60 L15,65 Z\nfill ff000000 M0,70 L2,70 L2,72 L0,72 L0,70 Z\n",
+              "fill ff000000 flags 1 M10,70 L15,70 L15,75 Z\nfill ff000000 M0,75 L5,75\nstroke 1.0 ff000000 flags 2 M0,75 L5,75\n")[..]);
+    // Laying an <svg> out to measure it leaves no path data behind.
+    let measured = """
+        <div style="display: flex"><svg width=10 height=10><rect width=5 height=5 /></svg><span>a</span></div>
+        <div style="display: inline-block"><svg width=10 height=10><rect width=5 height=5 /></svg></div>
+        <div style="display: flex; flex-direction: column">a <svg width=10 height=10><rect width=5 height=5 /></svg></div>
+        """;
+    check("measuring leaves no path data", layout_probe(measured, 400.0, PROBE_PATH_LEFT), "0");
+
     // Path numbers as WebKit reads them: a point needs a digit after it, a
     // comma goes only after a number, once, and a big coordinate is a number.
     let numbers = """
@@ -1281,6 +1318,7 @@ let PROBE_CARETS: i32 = 18; // how much further each caret of #s's text is than 
 let PROBE_PATHS: i32 = 19;  // each path item: fill or stroke, its colour, and its path on the page, ends of curves only
 let PROBE_CURVES: i32 = 20; // each path item's path on the page, every point
 let PROBE_PATH_COUNT: i32 = 21; // how many path items there are
+let PROBE_PATH_LEFT: i32 = 22;  // how many floats of path data no path item draws
 let PROBE_PAGE: i32 = 17;   // the page's height
 let PROBE_XF: i32 = 15;     // each item of an element with an id: its matrix, or "none"; with a clip, how it is mapped
 let PROBE_ORDER: i32 = 9;   // the elements with an id, in the order their items paint
@@ -1508,6 +1546,16 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             }
             out.push('\n');
         }
+    } else if probe == PROBE_PATH_LEFT {
+        var used: bool[>..] = [];
+        for k in paths.len { used.push(false); }
+        for it in items {
+            guard it.kind == ITEM_PATH else { continue; }
+            for k in it.text..it.text + it.text_len { used[k] = true; }
+        }
+        var left = 0;
+        for u in used { if !u { left += 1; } }
+        format(out, left);
     } else if probe == PROBE_PATH_COUNT {
         var count = 0;
         for it in items { if it.kind == ITEM_PATH { count += 1; } }
@@ -1517,6 +1565,7 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             guard it.kind == ITEM_PATH else { continue; }
             if it.size > 0.0 { out.append("stroke "); format_flt(out, it.size, 1); out.push(' '); } else { out.append("fill "); }
             format_uint(out, it.color, 16, 8, '0');
+            if it.font != 0 { format(out, " flags ", it.font); }
             var k = it.text as i64;
             let end = k + it.text_len;
             while k < end {

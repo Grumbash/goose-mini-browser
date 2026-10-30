@@ -2741,10 +2741,8 @@ recursive fn measure_sized(L: Layout, c: i32, w: f32, h: f32) -> f32, f32 {
 // text from `from` up to `to` in n laid out `w` wide, painting nothing.
 fn measure_lines(L: Layout, n: i32, from: i32, to: i32, w: f32) -> f32, f32 {
     let mark = L.items.len;
-    let path_mark = L.paths.len;
     let h, b = layout_lines(L, n, from, to, 0.0, 0.0, w);
     L.items.resize(mark);
-    L.paths.resize(path_mark);
     var c = from;
     while c != to {
         clear_boxes(L, c);
