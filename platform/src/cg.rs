@@ -67,8 +67,18 @@ pub struct CFDictionaryValueCallBacks {
     equal: *const c_void,
 }
 
+#[repr(C)]
+pub struct CFArrayCallBacks {
+    version: CFIndex,
+    retain: *const c_void,
+    release: *const c_void,
+    copy_description: *const c_void,
+    equal: *const c_void,
+}
+
 pub const kCFStringEncodingUTF8: u32 = 0x0800_0100;
 pub const kCFNumberSInt32Type: CFIndex = 3;
+pub const kCFStringComposedCharacterCluster: CFIndex = 2;
 pub const kCFNumberFloat64Type: CFIndex = 6;
 pub const kCTFontManagerScopeProcess: u32 = 1;
 pub const kCTFontUIFontSystem: u32 = 2;
@@ -84,6 +94,19 @@ pub const kCGImageByteOrder32Little: u32 = 2 << 12;
 unsafe extern "C" {
     pub static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
     pub static kCFTypeDictionaryValueCallBacks: CFDictionaryValueCallBacks;
+    pub static kCFTypeArrayCallBacks: CFArrayCallBacks;
+    pub fn CFArrayCreate(
+        alloc: CFTypeRef,
+        values: *const CFTypeRef,
+        n: CFIndex,
+        callbacks: *const CFArrayCallBacks,
+    ) -> CFTypeRef;
+    pub fn CFStringGetLength(s: CFTypeRef) -> CFIndex;
+    pub fn CFStringGetRangeOfCharacterClusterAtIndex(
+        s: CFTypeRef,
+        index: CFIndex,
+        kind: CFIndex,
+    ) -> CFRange;
     pub fn CFRelease(cf: CFTypeRef);
     pub fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
     pub fn CFEqual(a: CFTypeRef, b: CFTypeRef) -> u8;
@@ -133,6 +156,9 @@ unsafe extern "C" {
     pub static kCTFontWeightTrait: CFTypeRef;
     pub static kCTFontSymbolicTrait: CFTypeRef;
     pub static kCTFontVariationAttribute: CFTypeRef;
+    pub static kCTFontFeatureSettingsAttribute: CFTypeRef;
+    pub static kCTFontOpenTypeFeatureTag: CFTypeRef;
+    pub static kCTFontOpenTypeFeatureValue: CFTypeRef;
     pub fn CTFontDescriptorCreateWithAttributes(attributes: CFTypeRef) -> CFTypeRef;
     pub fn CTFontCreateWithFontDescriptor(
         descriptor: CFTypeRef,

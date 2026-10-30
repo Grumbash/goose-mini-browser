@@ -24,7 +24,7 @@ use objc2_metal::{
 use objc2_quartz_core::CAMetalDrawable;
 
 use crate::cg::*;
-use crate::text::{Atlas, PHASES, Text, with_text};
+use crate::text::{Atlas, PHASES, Text, unit_starts, with_text};
 use crate::{ERR_ARGUMENT, ERR_METAL, ERR_NO_DEVICE, ERR_NOT_MAIN_THREAD, GSlice, guarded};
 
 // Display item kinds; engine/layout.goose mirrors these numbers.
@@ -625,7 +625,8 @@ fn snapped(x: f32, y: f32, w: f32, h: f32, scale: f64) -> [f32; 4] {
 /// phases. Clips snap like rects.
 pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut Vec<Instance>) {
     let mut glyphs = Vec::new();
-    let mut before = Vec::new(); // per byte of a spaced text, the characters before it
+    let mut before = Vec::new(); // per byte of a spaced text, the units done before it
+    let mut starts = Vec::new();
     for &item in items {
         let DItem {
             clip_x,
@@ -777,13 +778,17 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
             }
             let spacing = item.spacing;
             if spacing != 0.0 {
+                // A unit's spacing comes after it: its own marks don't move.
+                unit_starts(span, &mut starts);
                 before.clear();
-                let mut n = 0u32;
-                for &b in span {
-                    before.push(n);
-                    if b & 0xC0 != 0x80 {
-                        n += 1;
-                    }
+                let mut started = 0u32;
+                for &s in &starts {
+                    before.push(if s != 0 {
+                        started
+                    } else {
+                        started.saturating_sub(1)
+                    });
+                    started += u32::from(s);
                 }
             }
             let baseline = y as f64 * scale;
@@ -1285,27 +1290,32 @@ mod tests {
 
     #[test]
     fn letter_spacing_goes_after_each_character() {
-        // "éb" twice, the second 10 points apart per character: its b, one
-        // character (two bytes) in, is 20 device pixels (at 2x) further on.
+        // x with a combining circumflex, then b: twice, the second 10 points
+        // apart per character. Its x and circumflex stay where they were, the
+        // circumflex on its letter; its b, one character in, is 20 device
+        // pixels (at 2x) further on.
         let plain = DItem {
             kind: ITEM_TEXT,
             y: 20.0,
             color: 0xFF1C_1C1C,
             size: 17.0,
             text: 0,
-            text_len: 3,
+            text_len: 4,
             ..Default::default()
         };
         let spaced = DItem {
             spacing: 10.0,
             ..plain
         };
-        let gap = |item: DItem| {
+        let lefts = |item: DItem| {
             let mut out = Vec::new();
-            with_text(|t| build(&[item], "éb".as_bytes(), 2.0, t, &mut out));
-            out[1].rect[0] - out[0].rect[0]
+            with_text(|t| build(&[item], "x\u{302}b".as_bytes(), 2.0, t, &mut out));
+            out.iter().map(|q| q.rect[0]).collect::<Vec<_>>()
         };
-        assert_eq!(gap(spaced) - gap(plain), 20.0);
+        let (a, b) = (lefts(plain), lefts(spaced));
+        assert_eq!(a.len(), 3, "{a:?}");
+        assert_eq!((b[0], b[1]), (a[0], a[1]));
+        assert_eq!(b[2] - a[2], 20.0);
     }
 
     #[test]

@@ -1264,6 +1264,36 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
         push_decl(out, d);
         return;
     }
+    if prop == P_LETTER_SPACING {
+        // normal, or a length, below zero too.
+        if value == "normal" { d.kind = V_LENGTH; d.unit = U_PX; push_decl(out, d); return; }
+        let n, u, ok = parse_length(value);
+        guard ok && u != U_PCT else { return; }
+        d.kind = V_LENGTH;
+        d.num = n;
+        d.unit = u;
+        push_decl(out, d);
+        return;
+    }
+    if prop == P_TEXT_TRANSFORM {
+        // none, or a case with full-width or full-size-kana, which Tusk
+        // doesn't draw.
+        var case = K_NONE;
+        var words = 0;
+        var ok = true;
+        each_word(value) {
+            let k = keyword(it);
+            if k == K_UPPERCASE || k == K_LOWERCASE || k == K_CAPITALIZE { ok = ok && case == K_NONE; case = k; }
+            else if it == "none" { ok = ok && value == "none"; }
+            else if it != "full-width" && it != "full-size-kana" { ok = false; }
+            words += 1;
+        };
+        guard ok && words > 0 else { return; }
+        d.kind = V_KEYWORD;
+        d.num = case;
+        push_decl(out, d);
+        return;
+    }
     if prop == P_FONT_SIZE {
         // Keywords, as multiples of the 16 px medium or of the parent.
         let scale: f32 = if value == "xx-small" { 0.6 } else if value == "x-small" { 0.75 } else if value == "small" { 0.89 }
@@ -2358,8 +2388,8 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
         else if k == K_LIGHTER { w = if w < 100 { w } else if w < 550 { 100 } else if w < 750 { 400 } else { 700 }; }
         s.weight = w;
     }
-    else if p == P_LETTER_SPACING { s.spacing = if dc.kind == V_LENGTH { px(dc, s, parent) } else { 0.0 }; }
-    else if p == P_TEXT_TRANSFORM { if k == K_NONE || k == K_UPPERCASE || k == K_LOWERCASE || k == K_CAPITALIZE { s.text_case = k; } }
+    else if p == P_LETTER_SPACING { s.spacing = px(dc, s, parent); }
+    else if p == P_TEXT_TRANSFORM { s.text_case = k; }
     else if p == P_FONT_STYLE { s.italic = if k == K_ITALIC { 1 } else { 0 }; }
     else if p == P_FONT_FAMILY { s.family = k; }
     else if p == P_LINE_HEIGHT {

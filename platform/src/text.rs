@@ -6,12 +6,14 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr::null;
+use std::sync::Mutex;
 
 use crate::cg::*;
 use crate::{ERR_ARGUMENT, GSlice, guarded};
 
 // Font ids, as Goose writes them: the family in the low four bits, the weight
-// over 100 in the next four (0 is 400, normal), then whether it is italic.
+// over 100 in the next four (0 is 400, normal), whether it is italic, and
+// whether its optional ligatures are off, for letter-spaced text.
 pub const FAMILY_SANS: i32 = 0;
 pub const FAMILY_SERIF: i32 = 1;
 pub const FAMILY_MONO: i32 = 2;
@@ -20,6 +22,7 @@ pub const FAMILY_CODE: i32 = 4; // JetBrains Mono, bundled
 pub const FONT_WEIGHT_SHIFT: i32 = 4;
 pub const FONT_BOLD: i32 = 7 << FONT_WEIGHT_SHIFT;
 pub const FONT_ITALIC: i32 = 1 << 8;
+pub const FONT_NO_LIGATURES: i32 = 1 << 9;
 
 /// Horizontal subpixel positions a glyph is rasterized at, per device pixel.
 pub const PHASES: u32 = 4;
@@ -81,12 +84,8 @@ impl Fonts {
     }
 }
 
-/// Generic families map to fonts every Mac has: the system font for sans-serif,
-/// Georgia for serif, Menlo for monospace, a weight or italic picking the
-/// family's nearest face. The bundled families (tp_register_fonts) are Barlow
-/// Condensed, by its nearest face, and JetBrains Mono, by its variable weight
-/// axis; neither has italics, and until they are registered the system font
-/// and Menlo stand in for them.
+/// The font for id `id` at `size` points: its family's face for its weight
+/// and style, with optional ligatures off when the id says so.
 fn create_font(id: i32, size: f64) -> Option<Cf> {
     if !(size > 0.0 && size < 10_000.0) {
         return None;
@@ -95,15 +94,30 @@ fn create_font(id: i32, size: f64) -> Option<Cf> {
         0 => 400,
         w => w * 100,
     };
-    let italic = id & FONT_ITALIC != 0;
+    let font = face(id & 0xF, weight, id & FONT_ITALIC != 0, size)?;
+    if id & FONT_NO_LIGATURES != 0 {
+        return without_ligatures(&font).or(Some(font));
+    }
+    Some(font)
+}
+
+/// Generic families map to fonts every Mac has: the system font for
+/// sans-serif, matched to the weight trait, as it has every weight; Georgia
+/// for serif and Menlo for monospace, which have a regular and a bold face,
+/// bold from 600 on as CSS matches faces (Fonts 4 §5.2). The bundled families
+/// (tp_register_fonts) are Barlow Condensed, by its nearest face, and
+/// JetBrains Mono, by its variable weight axis; neither has italics, and
+/// without them the system font and Menlo stand in.
+fn face(family: i32, weight: i32, italic: bool, size: f64) -> Option<Cf> {
     let named =
         |name: &str| Cf::take(unsafe { CTFontCreateWithName(cf_str(name)?.get(), size, null()) });
     let system =
         || Cf::take(unsafe { CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, size, null()) });
-    let base = match id & 0xF {
-        FAMILY_SERIF => named("Georgia"),
-        FAMILY_MONO => named("Menlo"),
+    let (base, two_faces) = match family {
+        FAMILY_SERIF => (named("Georgia")?, true),
+        FAMILY_MONO => (named("Menlo")?, true),
         FAMILY_CONDENSED => {
+            register_bundled();
             // Medium is the lightest face bundled, Black the heaviest.
             let face = match weight {
                 ..=550 => "BarlowCondensed-Medium",
@@ -114,19 +128,72 @@ fn create_font(id: i32, size: f64) -> Option<Cf> {
             };
             match registered(face, "Barlow Condensed", size) {
                 Some(font) => return Some(font),
-                None => system(),
+                None => (system()?, false),
             }
         }
-        FAMILY_CODE => match registered("JetBrainsMono-Regular", "JetBrains Mono", size) {
-            Some(font) => return Some(at_weight(&font, weight.clamp(100, 800)).unwrap_or(font)),
-            None => named("Menlo"),
-        },
-        _ => system(),
-    }?;
+        FAMILY_CODE => {
+            register_bundled();
+            match registered("JetBrainsMono-Regular", "JetBrains Mono", size) {
+                Some(font) => {
+                    return Some(at_weight(&font, weight.clamp(100, 800)).unwrap_or(font));
+                }
+                None => (named("Menlo")?, true),
+            }
+        }
+        _ => (system()?, false),
+    };
     if weight == 400 && !italic {
         return Some(base);
     }
+    if two_faces {
+        return bold_or_italic(&base, weight >= 600, italic).or(Some(base));
+    }
     styled(&base, size, weight, italic).or(Some(base))
+}
+
+/// `base` in its bold or italic face, or both.
+fn bold_or_italic(base: &Cf, bold: bool, italic: bool) -> Option<Cf> {
+    let mut traits = 0;
+    if bold {
+        traits |= kCTFontTraitBold;
+    }
+    if italic {
+        traits |= kCTFontTraitItalic;
+    }
+    if traits == 0 {
+        return None;
+    }
+    // A size of 0 keeps the base font's size.
+    Cf::take(unsafe { CTFontCreateCopyWithSymbolicTraits(base.get(), 0.0, null(), traits, traits) })
+}
+
+/// `font` with its optional ligatures and contextual alternates (liga, clig,
+/// calt) off, as CSS has for letter-spaced text (Text 3 §9.2).
+fn without_ligatures(font: &Cf) -> Option<Cf> {
+    let off = integer(0)?;
+    let mut settings = Vec::new();
+    for tag in ["liga", "clig", "calt"] {
+        let tag = cf_str(tag)?;
+        settings.push(dictionary(
+            &[unsafe { kCTFontOpenTypeFeatureTag }, unsafe {
+                kCTFontOpenTypeFeatureValue
+            }],
+            &[tag.get(), off.get()],
+        )?);
+    }
+    let values: Vec<CFTypeRef> = settings.iter().map(|s| s.get()).collect();
+    let list = Cf::take(unsafe {
+        CFArrayCreate(
+            null(),
+            values.as_ptr(),
+            values.len() as CFIndex,
+            &kCFTypeArrayCallBacks,
+        )
+    })?;
+    let attributes = dictionary(&[unsafe { kCTFontFeatureSettingsAttribute }], &[list.get()])?;
+    let descriptor = Cf::take(unsafe { CTFontDescriptorCreateWithAttributes(attributes.get()) })?;
+    // A size of 0 keeps the font's size.
+    Cf::take(unsafe { CTFontCreateCopyWithAttributes(font.get(), 0.0, null(), descriptor.get()) })
 }
 
 /// Font `name` at `size`, only when it is of family `family`: Core Text gives
@@ -211,45 +278,161 @@ fn dictionary(keys: &[CFTypeRef], values: &[CFTypeRef]) -> Option<Cf> {
     })
 }
 
-/// Registers the fonts in directory `dir` (its .ttf and .otf files) for this
-/// process, so that the bundled families are there. Returns how many it
-/// registered; one already registered doesn't count again.
+/// The bundled fonts: the files tp_register_fonts found, registered for the
+/// process the first time a bundled family is asked for.
+struct Bundled {
+    files: Vec<std::path::PathBuf>,
+    registered: bool,
+}
+
+static BUNDLED: Mutex<Bundled> = Mutex::new(Bundled {
+    files: Vec::new(),
+    registered: false,
+});
+
+/// Names directory `dir` as where the bundled fonts are (its .ttf and .otf
+/// files). They are registered when first needed, so a page that doesn't use
+/// them doesn't pay for them. Returns how many there are.
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_register_fonts(dir: GSlice<u8>) -> i32 {
     guarded(|| {
         let dir = unsafe { dir.as_slice() }.ok_or(ERR_ARGUMENT)?;
         let dir = std::str::from_utf8(dir).map_err(|_| ERR_ARGUMENT)?;
         let entries = std::fs::read_dir(dir).map_err(|_| ERR_ARGUMENT)?;
-        let mut count = 0;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if !ext.eq_ignore_ascii_case("ttf") && !ext.eq_ignore_ascii_case("otf") {
-                continue;
-            }
-            let bytes = path.as_os_str().as_encoded_bytes();
-            let Some(url) = Cf::take(unsafe {
-                CFURLCreateFromFileSystemRepresentation(
-                    null(),
-                    bytes.as_ptr(),
-                    bytes.len() as CFIndex,
-                    0,
-                )
-            }) else {
-                continue;
-            };
-            let ok = unsafe {
-                CTFontManagerRegisterFontsForURL(
-                    url.get(),
-                    kCTFontManagerScopeProcess,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok {
-                count += 1;
-            }
+        let mut files: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                ext.eq_ignore_ascii_case("ttf") || ext.eq_ignore_ascii_case("otf")
+            })
+            .collect();
+        files.sort();
+        let count = files.len() as i32;
+        let mut bundled = BUNDLED.lock().map_err(|_| ERR_ARGUMENT)?;
+        if !bundled.registered {
+            bundled.files = files;
         }
         Ok(count)
+    })
+}
+
+/// Registers the bundled fonts for this process, once.
+fn register_bundled() {
+    let Ok(mut bundled) = BUNDLED.lock() else {
+        return;
+    };
+    if bundled.registered || bundled.files.is_empty() {
+        return;
+    }
+    for path in &bundled.files {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        let Some(url) = Cf::take(unsafe {
+            CFURLCreateFromFileSystemRepresentation(
+                null(),
+                bytes.as_ptr(),
+                bytes.len() as CFIndex,
+                0,
+            )
+        }) else {
+            continue;
+        };
+        unsafe {
+            CTFontManagerRegisterFontsForURL(
+                url.get(),
+                kCTFontManagerScopeProcess,
+                std::ptr::null_mut(),
+            )
+        };
+    }
+    bundled.registered = true;
+}
+
+/// Where each typographic character unit of `text` starts (CSS Text 3 §9.2),
+/// one flag per byte: a letter with its marks, spacing ones too, an emoji with
+/// its modifiers, as Core Foundation finds composed character sequences. A
+/// zero-width character (a soft hyphen, a zero-width space or joiner, a word
+/// joiner, a byte-order mark) starts none, so letter-spacing gives it no room.
+/// Text that isn't UTF-8 has one per character.
+pub fn unit_starts(text: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.extend(text.iter().map(|&b| u8::from(b & 0xC0 != 0x80)));
+    let Some(s) = Cf::take(unsafe {
+        CFStringCreateWithBytes(
+            null(),
+            text.as_ptr(),
+            text.len() as CFIndex,
+            kCFStringEncodingUTF8,
+            0,
+        )
+    }) else {
+        return;
+    };
+    // Each UTF-16 unit's character, as a byte offset: two for one past U+FFFF.
+    let mut byte_at = Vec::with_capacity(text.len() + 1);
+    let mut k = 0;
+    while k < text.len() {
+        let n = match text[k] {
+            0xF0.. => 4,
+            0xE0.. => 3,
+            0xC0.. => 2,
+            _ => 1,
+        };
+        byte_at.push(k);
+        if n == 4 {
+            byte_at.push(k);
+        }
+        k += n;
+    }
+    let len = unsafe { CFStringGetLength(s.get()) } as usize;
+    if len != byte_at.len() {
+        return;
+    }
+    out.fill(0);
+    let mut i = 0;
+    while i < len {
+        let r = unsafe {
+            CFStringGetRangeOfCharacterClusterAtIndex(
+                s.get(),
+                i as CFIndex,
+                kCFStringComposedCharacterCluster,
+            )
+        };
+        let start = byte_at[r.location as usize];
+        if !zero_width(&text[start..]) {
+            out[start] = 1;
+        }
+        i = ((r.location + r.length) as usize).max(i + 1);
+    }
+}
+
+/// Whether `text` starts with a character that takes no room: U+00AD,
+/// U+200B to U+200F, U+2060 to U+2064 or U+FEFF.
+fn zero_width(text: &[u8]) -> bool {
+    matches!(
+        text,
+        [0xC2, 0xAD, ..]
+            | [0xE2, 0x80, 0x8B..=0x8F, ..]
+            | [0xE2, 0x81, 0xA0..=0xA4, ..]
+            | [0xEF, 0xBB, 0xBF, ..]
+    )
+}
+
+/// Fills `units`, as long as `text`, with 1 where a typographic character
+/// unit of it starts and 0 elsewhere (see unit_starts), for letter-spacing.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_text_units(text: GSlice<u8>, units: GSlice<u8>) -> i32 {
+    guarded(|| {
+        let text = unsafe { text.as_slice() }.ok_or(ERR_ARGUMENT)?;
+        if units.count() != Some(text.len()) {
+            return Err(ERR_ARGUMENT);
+        }
+        let mut out = Vec::new();
+        unit_starts(text, &mut out);
+        for (i, &u) in out.iter().enumerate() {
+            unsafe { units.set(i, u) };
+        }
+        Ok(0)
     })
 }
 
@@ -736,8 +919,7 @@ mod tests {
             data: dir.as_ptr() as *mut u8,
             len: dir.len() as i64,
         };
-        // Six files the first time; nothing more if another test got there first.
-        assert!((0..=6).contains(&tp_register_fonts(dir)));
+        assert_eq!(tp_register_fonts(dir), 6);
         let w = |weight: i32| (weight / 100) << FONT_WEIGHT_SHIFT;
         assert_eq!(face_of(FAMILY_CONDENSED | w(500)), "BarlowCondensed-Medium");
         assert_eq!(face_of(FAMILY_CONDENSED | w(700)), "BarlowCondensed-Bold");
@@ -748,6 +930,62 @@ mod tests {
         let wide = |id: i32| *carets_of(id, 17.0, b"Focaccia bread").last().unwrap();
         assert!(wide(FAMILY_SANS) < wide(FAMILY_SANS | w(600)));
         assert!(wide(FAMILY_SANS | w(600)) < wide(FAMILY_SANS | w(900)));
+        // Georgia and Menlo have a regular and a bold face: bold from 600 on.
+        assert_eq!(face_of(FAMILY_SERIF | w(500)), "Georgia");
+        assert_eq!(face_of(FAMILY_SERIF | w(600)), "Georgia-Bold");
+        assert_eq!(
+            face_of(FAMILY_SERIF | w(500) | FONT_ITALIC),
+            "Georgia-Italic"
+        );
+        assert_eq!(face_of(FAMILY_MONO | w(500)), "Menlo-Regular");
+        assert_eq!(face_of(FAMILY_MONO | w(800)), "Menlo-Bold");
+    }
+
+    #[test]
+    fn spaced_text_has_no_optional_ligatures() {
+        // Barlow Condensed draws "ffi" as one glyph, unless the text is spaced.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../app/fonts");
+        let dir = GSlice::<u8> {
+            data: dir.as_ptr() as *mut u8,
+            len: dir.len() as i64,
+        };
+        assert_eq!(tp_register_fonts(dir), 6);
+        let glyphs = |id: i32| {
+            with_text(|t| {
+                let f = t.fonts.get(id, 20.0).unwrap();
+                let mut out = Vec::new();
+                t.shaper.shape(&mut t.fonts, f, b"ffi", &mut out).unwrap();
+                out.len()
+            })
+        };
+        assert_eq!(glyphs(FAMILY_CONDENSED), 1);
+        assert_eq!(glyphs(FAMILY_CONDENSED | FONT_NO_LIGATURES), 3);
+    }
+
+    #[test]
+    fn units_are_letters_with_their_marks() {
+        let units = |s: &str| {
+            let mut out = Vec::new();
+            unit_starts(s.as_bytes(), &mut out);
+            out
+        };
+        // x with a combining circumflex; a zero-width space between two letters;
+        // a thumbs up with its skin tone; the Devanagari सविता as स, वि and ता.
+        assert_eq!(units("x\u{302}b"), [1, 0, 0, 1]);
+        assert_eq!(units("a\u{200B}b"), [1, 0, 0, 0, 1]);
+        assert_eq!(units("\u{1F44D}\u{1F3FD}"), [1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            units("सविता"),
+            [1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]
+        );
+        // Bytes that aren't UTF-8: one per character still.
+        assert_eq!(units_of(&[b'a', 0xFF, b'b']), [1, 1, 1]);
+    }
+
+    fn units_of(text: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        unit_starts(text, &mut out);
+        out
     }
 
     #[test]
