@@ -51,7 +51,7 @@ fn test_html() {
     var depth = 0;
     var at: i32 = (dn.len - 1) as i32;       // the text, made last
     while at >= 0 { depth += 1; at = dn[at].parent; }
-    check("nesting stops at 512 open elements", if depth == 516 { "512 deep" } else { "not capped" }, "512 deep");
+    check("nesting stops at 200 open elements", str(depth - 4, " deep"), "200 deep");
     check("list items close each other; void elements don't nest",
           tree_of("<ul><li>a<li>b<br>c</ul>"),
           "#document\n  html\n    head\n    body\n      ul\n        li\n          \"a\"\n        li\n          \"b\"\n          br\n          \"c\"\n");
