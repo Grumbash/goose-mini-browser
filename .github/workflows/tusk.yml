@@ -80,6 +80,28 @@ jobs:
           ./app/tusk snapshot tests/pages/deep.html > deep.txt
           grep -q 'turned clips' deep.txt
 
+      - name: A page and its sheets over http, as from its file
+        run: |
+          # A server on this runner, not the web: the page, its linked sheets,
+          # an @import, a cycle and a missing sheet, over plain http.
+          (cd tests/pages && python3 -m http.server 8765 --bind 127.0.0.1 > /dev/null 2>&1 &)
+          for i in $(seq 50); do curl -sf -o /dev/null http://127.0.0.1:8765/linked/index.html && break; sleep 0.2; done
+          ./app/tusk snapshot http://127.0.0.1:8765/linked/index.html > linked-http.txt
+          ./app/tusk snapshot tests/pages/linked/index.html > linked-file.txt
+          diff linked-http.txt linked-file.txt
+          rc=0
+          ./app/tusk --screenshot linked-http.png --bare http://127.0.0.1:8765/linked/index.html || rc=$?
+          if [ "$rc" = 3 ]; then
+            echo "::notice::No Metal device on this runner: the screenshots are skipped."
+            exit 0
+          fi
+          test "$rc" = 0
+          ./app/tusk --screenshot linked-file.png --bare tests/pages/linked/index.html
+          cmp linked-http.png linked-file.png
+          # The page, three sheets and the missing one; print.css is not asked for.
+          ./app/tusk --load-test http://127.0.0.1:8765/linked/index.html | tee linked-load.txt
+          grep -q '5 requests' linked-load.txt
+
       - name: Screenshot of the window, drawn offscreen
         run: |
           rc=0
@@ -98,5 +120,6 @@ jobs:
           name: tusk-m1
           path: |
             snapshot.txt
+            linked-http.png
             focaccia.png
           if-no-files-found: ignore

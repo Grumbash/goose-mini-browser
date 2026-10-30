@@ -24,6 +24,8 @@
 //                                        console, network, elements, frames or oil, or
 //                                        off, the panel hidden as ⌘⌥I hides it
 //   tusk --scroll-test [page.html]       scroll the page for 10 s and print frame times
+//   tusk --load-test page                load a page with no window and print where the time went:
+//                                        the network's phases, its sheets, Tusk's own stages
 //   tusk --idle-exit MS [page.html ...]  quit after MS of quiet (the idle test)
 //   tusk --wake-test                     a worker wakes the sleeping main thread (the M0 test)
 //
@@ -159,6 +161,7 @@ let MODE_SNAPSHOT: i32 = 1;
 let MODE_SCREENSHOT: i32 = 2;
 let MODE_SCROLL_TEST: i32 = 3;
 let MODE_WAKE_TEST: i32 = 4;
+let MODE_LOAD_TEST: i32 = 5;
 
 let WINDOW_W: f32 = 1200.0;      // the design's window
 let WINDOW_H: f32 = 760.0;
@@ -471,7 +474,7 @@ thread_fn wake_after(ms: i64, token: i32) {
 }
 
 fn usage() {
-    write_stderr("usage: tusk [snapshot | --screenshot out.png [--at Y] [--size WxH] [--dev-tab NAME] [--bare] | --scroll-test | --idle-exit MS | --wake-test] [page.html | URL ...]\n");
+    write_stderr("usage: tusk [snapshot | --screenshot out.png [--at Y] [--size WxH] [--dev-tab NAME] [--bare] | --scroll-test | --load-test | --idle-exit MS | --wake-test] [page.html | URL ...]\n");
     exit(2);
 }
 
@@ -493,11 +496,13 @@ fn main() {
     while i < argv.len {
         let a = argv[i];
         let valued = i + 1 < argv.len;
-        if a == "snapshot" || a == "--scroll-test" || a == "--wake-test" || (a == "--screenshot" && valued) {
+        if a == "snapshot" || a == "--scroll-test" || a == "--wake-test" || a == "--load-test"
+           || (a == "--screenshot" && valued) {
             guard mode == MODE_WINDOW else { usage(); return; }   // one mode a run
             if a == "snapshot" { mode = MODE_SNAPSHOT; }
             else if a == "--scroll-test" { mode = MODE_SCROLL_TEST; }
             else if a == "--wake-test" { mode = MODE_WAKE_TEST; idle_exit_ms = 5000; }
+            else if a == "--load-test" { mode = MODE_LOAD_TEST; }
             else { mode = MODE_SCREENSHOT; i += 1; shot.append(argv[i]); }
         } else if a == "--at" && valued {
             i += 1;
@@ -550,7 +555,7 @@ fn main() {
     }
     guard !shot_only || mode == MODE_SCREENSHOT else { usage(); return; }
     // The modes without a window show one page.
-    guard (mode != MODE_SNAPSHOT && mode != MODE_SCREENSHOT) || path_ends.len <= 1 else { usage(); return; }
+    guard (mode != MODE_SNAPSHOT && mode != MODE_SCREENSHOT && mode != MODE_LOAD_TEST) || path_ends.len <= 1 else { usage(); return; }
     if path_ends.len == 0 {
         full_path(str(resource_dir(), "../tests/pages/focaccia.html")[..], paths);
         path_ends.push(paths.len);
@@ -637,6 +642,24 @@ fn main() {
     var actions: f32[>..<] = [];     // what clicks on the interface do: x, y, w, h and an ACT_ each
     var log_rows: NetRow[>..] = [];  // the shown page's network log, read for each interface
     var log_urls: u8[>..] = [];
+
+    if mode == MODE_LOAD_TEST {
+        guard tp_start_metal() == 0 else {
+            write_stderr("tusk: no load test: there is no Metal device\n");
+            exit(3);
+            return;
+        }
+        // The window's page slot, at 2x, as a first page would have it.
+        post(tabs[0].page, MSG_SIZE, WINDOW_W - DEV_W, WINDOW_H - BAR_H - PANEL_H, 2.0);
+        wait_for_frame(tabs, notes);
+        let shown = ms(tabs[0].opened, clock_ns());
+        read_log(tabs[0].page, log_rows, log_urls);
+        var line: u8[>..] = [];
+        load_report(tabs[0], T, log_rows[..], shown, line);
+        write_stdout(line);
+        end_tabs(tabs, pages);
+        return;
+    }
 
     if mode == MODE_SCREENSHOT {
         // Metal is set up before the page is timed, as tp_open does for the
@@ -1258,6 +1281,63 @@ fn weight(t: Tab, T: UiText, ui_ms: f32, line: u8[>..]&) {
     line.append(" ms · ");
     format_flt(line, tp_memory_footprint() / 1048576.0, 1);
     line.append(" MB");
+}
+
+// Where a page's load went, for --load-test, onto `line`: its requests, the
+// document's phases, its sheets, Tusk's own stages, and when it could be
+// shown, `shown` ms after it was asked for.
+fn load_report(t: Tab, T: UiText, rows: const NetRow[:], shown: f64, line: u8[>..]&) {
+    let i = t.info;
+    format(line, loc_of(t, T), "\n");
+    if rows.len > 0 {
+        var bytes: i64 = 0;
+        var wire: i64 = 0;
+        var last: f32 = 0.0;
+        for r in rows {
+            bytes += r.bytes;
+            wire += r.wire;
+            if r.kind == NET_STYLE { last = max(last, r.start + r.total); }
+        }
+        format(line, "  ", rows.len, if rows.len == 1 { " request, " } else { " requests, " });
+        format_flt(line, bytes / 1000.0, 1);
+        line.append(" KB (");
+        format_flt(line, wire / 1000.0, 1);
+        line.append(" KB over the wire)\n");
+        let d = rows[0];
+        format(line, "  document  ", d.status, if d.proto == 3 { " HTTP/3" } else if d.proto == 2 { " HTTP/2" } else if d.proto == 1 { " HTTP/1.1" } else { "" },
+               if (d.flags & ROW_REUSED) != 0 { " reused" } else { "" }, if (d.flags & ROW_CACHED) != 0 { " cached" } else { "" });
+        let names: const u8[:][5] = ["  look-up ", "  connect ", "  TLS ", "  wait ", "  download "];
+        let times: f32[5] = [d.dns, d.connect, d.tls, d.wait, d.download];
+        for name, k in names {
+            line.append(name);
+            format_flt(line, times[k], 1);
+        }
+        line.append("  = ");
+        format_flt(line, d.total, 1);
+        line.append(" ms\n");
+        format(line, "  sheets    ", rows.len - 1);
+        if rows.len > 1 {
+            line.append(", the last done ");
+            format_flt(line, last, 1);
+            line.append(" ms after the start");
+        }
+        line.append("\n");
+    } else {
+        line.append("  a file, read in ");
+        format_flt(line, i.read, 1);
+        line.append(" ms\n");
+    }
+    line.append("  Tusk      parse ");
+    format_flt(line, i.parse, 1);
+    line.append("  style ");
+    format_flt(line, i.style, 1);
+    line.append("  text ");
+    format_flt(line, i.measure, 1);
+    line.append("  layout ");
+    format_flt(line, i.layout, 1);
+    line.append(" ms\n  shown     ");
+    format_flt(line, shown, 1);
+    line.append(" ms after it was asked for\n");
 }
 
 // Tells every tab's page to quit, waits for its worker and closes its
