@@ -308,6 +308,15 @@ fn test_css_interface() {
     check("a rule for the seventieth class", style_at(many[..], "p", 0, false), "display=1 size=17.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
     check("classes and [attr~=word] split on a form feed",
           style_at(many[..], "b", 0, false), "display=2 size=17.0 bold=1 italic=0 color=ffff0000 mt=0.0 ml=4.0 auto_ml=0");
+
+    // What CSS calls invalid is dropped: a '>' with no compound after it,
+    // before it, or between two; a space inside a sign and its n, or between
+    // a number and its n; a second sign before b. A b too big counts as a
+    // billion, so -n+99999999999 matches every li.
+    let bad = """<style>p > { color: #ff0000 } > p { color: #ff0000 } p > > i { color: #ff0000 } li:nth-child(- n + 3) { color: #ff0000 } li:nth-child(2 n) { color: #ff0000 } li:nth-child(n+-99999999999) { color: #ff0000 } li:nth-child(-n+99999999999) { font-weight: bold }</style><p>x <i>i</i></p><ul><li>a</li><li>b</li></ul>""";
+    check("a dangling '>' drops the selector", style_at(bad, "p", 0, false), "display=1 size=17.0 bold=0 italic=0 color=ff1c1c1c mt=0.0 ml=0.0 auto_ml=0");
+    check("loose an+b is dropped, and a big b is a billion",
+          style_at(bad, "li", 1, false), "display=3 size=17.0 bold=1 italic=0 color=ff1c1c1c mt=0.0 ml=0.0 auto_ml=0");
 }
 
 fn test_css() {

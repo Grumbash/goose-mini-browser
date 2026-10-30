@@ -407,49 +407,45 @@ fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origi
 }
 
 // Whether a selector uses only what parse_selector handles, so it can be
-// written into the sheet in one pass with nothing to take back. A
-// pseudo-element may only come last.
+// written into the sheet in one pass with nothing to take back. A '>' needs
+// a compound on each side, and a pseudo-element may only come last.
 fn selector_supported(sel: const u8[:]) -> bool {
     var i: i64 = 0;
-    var parts = 0;
+    var last: i32 = 0;              // what came last: 0 nothing, 1 a simple selector, 2 a '>'
     var ended = false;
     while i < sel.len {
         let ch = sel[i];
         if is_ws(ch) { i += 1; continue; }
         guard !ended else { return false; }
-        if ch == '>' { i += 1; continue; }
-        if ch == '*' { i += 1; parts += 1; continue; }
-        if ch == '#' || ch == '.' {
+        if ch == '>' {
+            guard last == 1 else { return false; }
+            last = 2;
+            i += 1;
+            continue;
+        }
+        if ch == '*' { i += 1; }
+        else if ch == '#' || ch == '.' {
             i += 1;
             let st = i;
             while i < sel.len && is_ident(sel[i]) { i += 1; }
             guard i > st else { return false; }
-            parts += 1;
-            continue;
-        }
-        if ch == '[' {
+        } else if ch == '[' {
             let a = scan_attr(sel, i);
             guard a.ok else { return false; }
             i = a.end;
-            parts += 1;
-            continue;
-        }
-        if ch == ':' {
+        } else if ch == ':' {
             let p = scan_pseudo(sel, i);
             guard p.ok else { return false; }
             if p.kind == PS_BEFORE || p.kind == PS_AFTER { ended = true; }
             i = p.end;
-            parts += 1;
-            continue;
-        }
-        if is_ident(ch) {
+        } else if is_ident(ch) {
             while i < sel.len && is_ident(sel[i]) { i += 1; }
-            parts += 1;
-            continue;
+        } else {
+            return false;
         }
-        return false;
+        last = 1;
     }
-    return parts > 0;
+    return last == 1;
 }
 
 // What scan_pseudo found.
@@ -506,37 +502,52 @@ fn scan_pseudo(sel: const u8[:], i: i64) -> Pseudo {
     return r;
 }
 
-// The a and b of :nth-child(an+b): "odd", "even", "3", "n", "-n+3", "2n+1",
-// "2n - 1".
+// The a and b of :nth-child(an+b) as CSS writes them: "odd", "even", "3",
+// "n", "-n+3", "2n+1", "2n - 1". A sign sticks to what follows it; only the
+// sign before b may stand apart. Numbers over a billion count as a billion.
 fn parse_nth(args: const u8[:]) -> i32, i32, bool {
     var t: u8[>..] = [];
-    for c in args { if !is_ws(c) { t.push(lower(c)); } }
+    for c in trim(args) { t.push(lower(c)); }
     let s = t[..];
     if s == "odd" { return 2, 1, true; }
     if s == "even" { return 2, 0, true; }
-    let k = find(s, "n");
-    if k < 0 {
-        let b, ok = parse_int(s);
-        guard ok && b > -100000 && b < 100000 else { return 0, 0, false; }
-        return 0, b as i32, true;
+    var i: i64 = 0;
+    var sign: i64 = 1;
+    if i < s.len && (s[i] == '+' || s[i] == '-') {
+        if s[i] == '-' { sign = -1; }
+        i += 1;
     }
-    let head = s[..k];
-    var a: i64 = 1;
-    if head == "-" { a = -1; }
-    else if head.len > 0 && head != "+" {
-        let x, ok = parse_int(head);
-        guard ok && x > -100000 && x < 100000 else { return 0, 0, false; }
-        a = x;
+    let st = i;
+    let x, after = nth_digits(s, i);
+    i = after;
+    if i == s.len {
+        guard i > st else { return 0, 0, false; }
+        return 0, (sign * x) as i32, true;
     }
-    let tail = s[k + 1..];
-    var b: i64 = 0;
-    if tail.len > 0 {
-        guard tail[0] == '+' || tail[0] == '-' else { return 0, 0, false; }
-        let x, ok = parse_int(tail[1..]);
-        guard ok && x < 100000 else { return 0, 0, false; }
-        b = if tail[0] == '-' { -x } else { x };
+    guard s[i] == 'n' else { return 0, 0, false; }
+    let a = sign * (if i > st { x } else { 1 });
+    i += 1;
+    while i < s.len && is_ws(s[i]) { i += 1; }
+    if i == s.len { return a as i32, 0, true; }
+    guard s[i] == '+' || s[i] == '-' else { return 0, 0, false; }
+    let bsign: i64 = if s[i] == '-' { -1 } else { 1 };
+    i += 1;
+    while i < s.len && is_ws(s[i]) { i += 1; }
+    let bst = i;
+    let y, end = nth_digits(s, i);
+    guard end > bst && end == s.len else { return 0, 0, false; }
+    return a as i32, (bsign * y) as i32, true;
+}
+
+// The digits from s[i] on as a number, a billion at most, and the index after them.
+fn nth_digits(s: const u8[:], i: i64) -> i64, i64 {
+    var j = i;
+    var v: i64 = 0;
+    while j < s.len && s[j] >= '0' && s[j] <= '9' {
+        v = min(v * 10 + (s[j] - '0'), 1000000000);
+        j += 1;
     }
-    return a as i32, b as i32, true;
+    return v, j;
 }
 
 struct AttrScan { ok: bool, name_start: i64, name_end: i64, op: i32, value_start: i64, value_end: i64, end: i64 }
