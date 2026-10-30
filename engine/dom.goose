@@ -55,6 +55,47 @@ fn append_node(d: Doc, kind: i32, parent: i32) -> i32 {
     return id;
 }
 
+// Inserts a node as the first child of `parent` and returns its index. The
+// node goes at the end of the array like any other; only the links put it
+// first.
+fn prepend_node(d: Doc, kind: i32, parent: i32) -> i32 {
+    let id = d.nodes.len as i32;
+    var n = new_node(kind);
+    n.parent = parent;
+    n.next = d.nodes[parent].first;
+    d.nodes.push(n);
+    let p .= d.nodes[parent];
+    p.first = id;
+    if p.last < 0 { p.last = id; }
+    return id;
+}
+
+// An element named `name` (lowercase already) as the last child of `parent`,
+// or the first when `first`; returns its index.
+fn add_element(d: Doc, name: const u8[:], parent: i32, first: bool) -> i32 {
+    let id = if first { prepend_node(d, NODE_ELEMENT, parent) } else { append_node(d, NODE_ELEMENT, parent) };
+    d.nodes[id].name = d.bytes.len as i32;
+    d.nodes[id].name_len = name.len as i32;
+    d.bytes.append(name);
+    return id;
+}
+
+// A text node holding `text`, as the last child of `parent`; returns its index.
+fn add_text(d: Doc, text: const u8[:], parent: i32) -> i32 {
+    let id = append_node(d, NODE_TEXT, parent);
+    d.nodes[id].text = d.bytes.len as i32;
+    d.nodes[id].text_len = text.len as i32;
+    d.bytes.append(text);
+    return id;
+}
+
+// Whether element n is a ::before or ::after that the cascade made
+// (css.goose). No element the parser makes has a name starting with ':'.
+fn is_generated(d: Doc, n: i32) -> bool {
+    let node = d.nodes[n];
+    return node.kind == NODE_ELEMENT && node.name_len > 2 && d.bytes[node.name as i64] == ':';
+}
+
 fn span(d: Doc, start: i32, len: i32) -> const u8[:] {
     let a: i64 = start;
     let b: i64 = start + len;

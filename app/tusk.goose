@@ -263,7 +263,11 @@ fn main() {
     var classes: Span[>..] = [];
     var decls: Decl[>..] = [];
     var sheet_bytes: u8[>..] = [];
-    let sh = Sheet { rules: rules, comps: comps, classes: classes, decls: decls, bytes: sheet_bytes };
+    var sel_attrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sel_attrs, decls: decls, bytes: sheet_bytes,
+                     vars: vars, var_bytes: var_bytes };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);

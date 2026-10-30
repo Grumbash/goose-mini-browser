@@ -1,9 +1,11 @@
-// CSS (docs/adr/0004): a parser for the part of CSS documents use, selector
-// matching, the cascade and computed style. Selectors: type, class, id,
-// universal, descendant and child, :first-child and :last-child. A selector
-// with anything else (attributes, siblings, :not, pseudo-elements) is dropped,
-// as is every at-rule. Values compute to pixels at style time, except the
-// percentages of widths, which layout resolves.
+// CSS (docs/adr/0004): a parser for the part of CSS that documents and Tusk's
+// own interface (docs/adr/0010) use, selector matching, the cascade and
+// computed style. Selectors: type, class, id, universal, attributes,
+// descendant and child, :root, :first-child, :last-child, :nth-child, :link,
+// and ::before and ::after. A selector with anything else (siblings, :not,
+// :hover) is dropped, as is every at-rule. Custom properties inherit, and the
+// cascade substitutes var() for each element. Values compute to pixels at
+// style time, except the percentages of widths, which layout resolves.
 
 import std;
 import .dom;
@@ -37,7 +39,9 @@ let P_BB_WIDTH: i32 = 24;
 let P_BT_COLOR: i32 = 25;
 let P_BB_COLOR: i32 = 26;
 let P_TEXT_INDENT: i32 = 27;
-let NPROPS: i64 = 28;
+let P_CONTENT: i32 = 28;
+let NPROPS: i64 = 29;
+let P_CUSTOM: i32 = -2;   // a custom property, --name, which the cascade keeps apart
 
 // Kinds of value.
 let V_KEYWORD: i32 = 1;   // Decl.num holds a K_* id
@@ -45,6 +49,8 @@ let V_LENGTH: i32 = 2;    // Decl.num in Decl.unit
 let V_NUMBER: i32 = 3;
 let V_COLOR: i32 = 4;
 let V_INHERIT: i32 = 5;
+let V_VAR: i32 = 6;       // has var() in it, so it waits as Decl.text until the cascade
+let V_STRING: i32 = 7;    // a string, in Decl.text
 
 // Units.
 let U_PX: i32 = 0;
@@ -95,18 +101,34 @@ let ORIGIN_UA: i32 = 0;
 let ORIGIN_AUTHOR: i32 = 1;
 let ORIGIN_INLINE: i32 = 2;
 
-// One compound selector, e.g. `div.note#x`, and how it joins the one to its
-// left: 0 for the first, 1 descendant, 2 child.
+// One compound selector, e.g. `li.note[data-a]:nth-child(2n)`, and how it
+// joins the one to its left: 0 for the first, 1 descendant, 2 child.
 struct Compound {
     join: i32,
     tag: i32, tag_len: i32,            // a span into Sheet.bytes; 0 length for none or *
     id: i32, id_len: i32,
     cls: i32, cls_count: i32,          // classes, in Sheet.classes
+    attr: i32, attr_count: i32,        // attribute selectors, in Sheet.attrs
     first_child: i32, last_child: i32,
+    nth: i32, nth_a: i32, nth_b: i32,  // :nth-child(an+b) when nth is 1
+    root: i32,                         // 1 for :root
     link: i32,                         // 1 for :link and :any-link, 2 for :visited
+    pseudo: i32,                       // the last compound only: 1 for ::before, 2 for ::after
 }
 
 struct Span { start: i32, len: i32 }
+
+// An attribute selector, [name] or [name op value], as spans into Sheet.bytes.
+struct AttrSel { name: i32, name_len: i32, value: i32, value_len: i32, op: i32 }
+
+// Attribute selector operators.
+let A_HAS: i32 = 0;       // [name]
+let A_EQ: i32 = 1;        // =
+let A_WORD: i32 = 2;      // ~=, one of the space-separated words
+let A_PREFIX: i32 = 3;    // ^=
+let A_SUFFIX: i32 = 4;    // $=
+let A_SUB: i32 = 5;       // *=
+let A_DASH: i32 = 6;      // |=, the value or the value and a hyphen
 
 // One selector of a rule with its declarations. A group `a, b { }` becomes
 // two rules sharing their declarations.
@@ -116,17 +138,32 @@ struct Rule {
     spec: i32,                         // specificity, packed as ids << 16 | classes << 8 | types
     order: i32,
     origin: i32,
+    pseudo: i32,                       // its last compound's: 1 for ::before, 2 for ::after
 }
 
-struct Decl { prop: i32, kind: i32, num: f32, unit: i32, color: u32, important: i32 }
+// One declaration. Custom properties, values that wait on var() and strings
+// keep their text, as spans into Sheet.bytes: `text` is the value, and `name`
+// the custom property's name or, for var(), the property or shorthand it was
+// written as.
+struct Decl { prop: i32, kind: i32, num: f32, unit: i32, color: u32, important: i32,
+              text: i32, text_len: i32, name: i32, name_len: i32 }
 
 struct Sheet {
     rules: Rule[>..]&,
     comps: Compound[>..]&,
     classes: Span[>..]&,
+    attrs: AttrSel[>..]&,
     decls: Decl[>..]&,
     bytes: u8[>..]&,
+    vars: Var[>..]&,          // every element's own custom properties, see Var
+    var_bytes: u8[>..]&,      // their names and their values, substituted
 }
+
+// One custom property of one element, in a chain: an element's own come
+// first, and `next` leads on to its parent's. Spans are into Sheet.var_bytes.
+// A value_len of -1 is one that couldn't be substituted (a cycle, or a var()
+// with no value and no fallback): var() treats it as missing.
+struct Var { name: i32, name_len: i32, value: i32, value_len: i32, next: i32 }
 
 // Computed style for one element; text nodes use their parent's.
 struct Style {
@@ -143,6 +180,8 @@ struct Style {
     bt: f32, bb: f32, bt_color: u32, bb_color: u32,   // a colour of CURRENT_COLOR is the text's
     indent: f32,
     root_size: f32,                      // the root element's font size, which rem counts in
+    vars: i32,                           // the head of the element's custom properties in Sheet.vars; -1 for none
+    content: i32, content_len: i32,      // ::before and ::after: the content, a span into Sheet.bytes; -1 length for none
 }
 
 // currentColor until layout paints with the text's colour. Its alpha is 0 and
@@ -158,7 +197,8 @@ fn root_style() -> Style {
                    lh_mult: 1.2, lh_px: 0.0, align: K_LEFT, ws: K_NORMAL, list: K_DISC, deco: K_NONE, valign: K_BASELINE,
                    mt: 0.0, mr: 0.0, mb: 0.0, ml: 0.0, auto_ml: 0, auto_mr: 0, pt: 0.0, pr: 0.0, pb: 0.0, pl: 0.0,
                    width: -1.0, width_pct: -1.0, max_width: -1.0, max_width_pct: -1.0,
-                   bt: 0.0, bb: 0.0, bt_color: CURRENT_COLOR, bb_color: CURRENT_COLOR, indent: 0.0, root_size: 16.0 };
+                   bt: 0.0, bb: 0.0, bt_color: CURRENT_COLOR, bb_color: CURRENT_COLOR, indent: 0.0, root_size: 16.0,
+                   vars: -1, content: 0, content_len: -1 };
 }
 
 // ------------------------------------------------------------------ parsing
@@ -259,7 +299,7 @@ fn parse_sheet(src: const u8[:], sh: Sheet, origin: i32, order: i32) -> i32 {
         without_comments(src[bstart..min(l.pos, src.len)], body_text);
         l.pos = min(l.pos + 1, src.len);
         let decl_start = sh.decls.len as i32;
-        parse_declarations(body_text[..], sh.decls);
+        parse_declarations(body_text[..], sh.decls, sh.bytes);
         let decl_count = sh.decls.len as i32 - decl_start;
         guard decl_count > 0 else { continue; }
         each_split(prelude, ',') {
@@ -273,7 +313,6 @@ fn parse_sheet(src: const u8[:], sh: Sheet, origin: i32, order: i32) -> i32 {
 fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origin: i32, order: i32) -> bool {
     guard sel.len > 0 && selector_supported(sel) else { return false; }
     let comp_start = sh.comps.len;
-    let cls_start = sh.classes.len;
     var ids = 0;
     var classes = 0;
     var types = 0;
@@ -282,7 +321,8 @@ fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origi
     var ok = true;
     while i < sel.len && ok {
         var c = Compound { join: join, tag: 0, tag_len: 0, id: 0, id_len: 0, cls: sh.classes.len as i32, cls_count: 0,
-                           first_child: 0, last_child: 0, link: 0 };
+                           attr: sh.attrs.len as i32, attr_count: 0, first_child: 0, last_child: 0,
+                           nth: 0, nth_a: 0, nth_b: 0, root: 0, link: 0, pseudo: 0 };
         var any = false;
         while i < sel.len && !is_ws(sel[i]) && sel[i] != '>' {
             let ch = sel[i];
@@ -299,16 +339,32 @@ fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origi
                 any = true;
                 continue;
             }
+            if ch == '[' {
+                let a = scan_attr(sel, i);
+                guard a.ok else { ok = false; break; }
+                var at = AttrSel { name: sh.bytes.len as i32, name_len: (a.name_end - a.name_start) as i32,
+                                   value: 0, value_len: (a.value_end - a.value_start) as i32, op: a.op };
+                for k in a.name_start..a.name_end { sh.bytes.push(lower(sel[k])); }
+                at.value = sh.bytes.len as i32;
+                sh.bytes.append(sel[a.value_start..a.value_end]);
+                sh.attrs.push(at);
+                c.attr_count += 1;
+                classes += 1;
+                i = a.end;
+                any = true;
+                continue;
+            }
             if ch == ':' {
-                i += 1;
-                let st = i;
-                while i < sel.len && (is_ident(sel[i]) || sel[i] == ':') { i += 1; }
-                let pc = sel[st..i];
-                if pc == "first-child" { c.first_child = 1; classes += 1; }
-                else if pc == "last-child" { c.last_child = 1; classes += 1; }
-                else if pc == "link" || pc == "any-link" { c.link = 1; classes += 1; }
-                else if pc == "visited" { c.link = 2; classes += 1; }
-                else { ok = false; break; }
+                let p = scan_pseudo(sel, i);
+                guard p.ok else { ok = false; break; }
+                if p.kind == PS_FIRST { c.first_child = 1; classes += 1; }
+                else if p.kind == PS_LAST { c.last_child = 1; classes += 1; }
+                else if p.kind == PS_LINK { c.link = 1; classes += 1; }
+                else if p.kind == PS_VISITED { c.link = 2; classes += 1; }
+                else if p.kind == PS_ROOT { c.root = 1; classes += 1; }
+                else if p.kind == PS_NTH { c.nth = 1; c.nth_a = p.a; c.nth_b = p.b; classes += 1; }
+                else { c.pseudo = if p.kind == PS_BEFORE { 1 } else { 2 }; types += 1; }
+                i = p.end;
                 any = true;
                 continue;
             }
@@ -342,19 +398,25 @@ fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origi
     }
     guard ok && sh.comps.len > comp_start else { return false; }
     let spec = (min(ids, 255) << 16) | (min(classes, 255) << 8) | min(types, 255);
+    let pseudo = sh.comps[sh.comps.len - 1].pseudo;
     sh.rules.push(Rule { comp: comp_start as i32, comp_count: (sh.comps.len - comp_start) as i32, decl: decl, decl_count: decl_count,
-                         spec: spec as i32, order: order, origin: origin });
+                         spec: spec as i32, order: order, origin: origin, pseudo: pseudo });
     return true;
 }
 
 // Whether a selector uses only what parse_selector handles, so it can be
-// written into the sheet in one pass with nothing to take back.
+// written into the sheet in one pass with nothing to take back. A
+// pseudo-element may only come last.
 fn selector_supported(sel: const u8[:]) -> bool {
     var i: i64 = 0;
     var parts = 0;
+    var ended = false;
     while i < sel.len {
         let ch = sel[i];
-        if is_ws(ch) || ch == '>' || ch == '*' { i += 1; continue; }
+        if is_ws(ch) { i += 1; continue; }
+        guard !ended else { return false; }
+        if ch == '>' { i += 1; continue; }
+        if ch == '*' { i += 1; parts += 1; continue; }
         if ch == '#' || ch == '.' {
             i += 1;
             let st = i;
@@ -363,12 +425,19 @@ fn selector_supported(sel: const u8[:]) -> bool {
             parts += 1;
             continue;
         }
+        if ch == '[' {
+            let a = scan_attr(sel, i);
+            guard a.ok else { return false; }
+            i = a.end;
+            parts += 1;
+            continue;
+        }
         if ch == ':' {
-            i += 1;
-            let st = i;
-            while i < sel.len && (is_ident(sel[i]) || sel[i] == ':') { i += 1; }
-            let pc = sel[st..i];
-            guard pc == "first-child" || pc == "last-child" || pc == "link" || pc == "visited" || pc == "any-link" else { return false; }
+            let p = scan_pseudo(sel, i);
+            guard p.ok else { return false; }
+            if p.kind == PS_BEFORE || p.kind == PS_AFTER { ended = true; }
+            i = p.end;
+            parts += 1;
             continue;
         }
         if is_ident(ch) {
@@ -378,7 +447,143 @@ fn selector_supported(sel: const u8[:]) -> bool {
         }
         return false;
     }
-    return parts > 0 || find(sel, "*") >= 0;
+    return parts > 0;
+}
+
+// What scan_pseudo found.
+let PS_FIRST: i32 = 1;
+let PS_LAST: i32 = 2;
+let PS_LINK: i32 = 3;
+let PS_VISITED: i32 = 4;
+let PS_ROOT: i32 = 5;
+let PS_NTH: i32 = 6;
+let PS_BEFORE: i32 = 7;
+let PS_AFTER: i32 = 8;
+
+struct Pseudo { ok: bool, kind: i32, a: i32, b: i32, end: i64 }
+
+// The pseudo-class or pseudo-element at sel[i], a ':', and the index after it.
+fn scan_pseudo(sel: const u8[:], i: i64) -> Pseudo {
+    var r = Pseudo { ok: false, kind: 0, a: 0, b: 0, end: i };
+    var j = i + 1;
+    let element = j < sel.len && sel[j] == ':';
+    if element { j += 1; }
+    let st = j;
+    while j < sel.len && is_ident(sel[j]) { j += 1; }
+    var name: u8[>..] = [];
+    for k in st..j { name.push(lower(sel[k])); }
+    let n = name[..];
+    r.end = j;
+    // ::before and ::after, or the old single-colon spelling.
+    if n == "before" || n == "after" {
+        r.kind = if n == "before" { PS_BEFORE } else { PS_AFTER };
+        r.ok = true;
+        return r;
+    }
+    guard !element else { return r; }
+    if n == "nth-child" {
+        guard j < sel.len && sel[j] == '(' else { return r; }
+        let close = find(sel[j..], ")");
+        guard close > 0 else { return r; }
+        let a, b, ok = parse_nth(sel[j + 1..j + close]);
+        guard ok else { return r; }
+        r.kind = PS_NTH;
+        r.a = a;
+        r.b = b;
+        r.end = j + close + 1;
+        r.ok = true;
+        return r;
+    }
+    if n == "first-child" { r.kind = PS_FIRST; }
+    else if n == "last-child" { r.kind = PS_LAST; }
+    else if n == "link" || n == "any-link" { r.kind = PS_LINK; }
+    else if n == "visited" { r.kind = PS_VISITED; }
+    else if n == "root" { r.kind = PS_ROOT; }
+    else { return r; }
+    r.ok = true;
+    return r;
+}
+
+// The a and b of :nth-child(an+b): "odd", "even", "3", "n", "-n+3", "2n+1",
+// "2n - 1".
+fn parse_nth(args: const u8[:]) -> i32, i32, bool {
+    var t: u8[>..] = [];
+    for c in args { if !is_ws(c) { t.push(lower(c)); } }
+    let s = t[..];
+    if s == "odd" { return 2, 1, true; }
+    if s == "even" { return 2, 0, true; }
+    let k = find(s, "n");
+    if k < 0 {
+        let b, ok = parse_int(s);
+        guard ok && b > -100000 && b < 100000 else { return 0, 0, false; }
+        return 0, b as i32, true;
+    }
+    let head = s[..k];
+    var a: i64 = 1;
+    if head == "-" { a = -1; }
+    else if head.len > 0 && head != "+" {
+        let x, ok = parse_int(head);
+        guard ok && x > -100000 && x < 100000 else { return 0, 0, false; }
+        a = x;
+    }
+    let tail = s[k + 1..];
+    var b: i64 = 0;
+    if tail.len > 0 {
+        guard tail[0] == '+' || tail[0] == '-' else { return 0, 0, false; }
+        let x, ok = parse_int(tail[1..]);
+        guard ok && x < 100000 else { return 0, 0, false; }
+        b = if tail[0] == '-' { -x } else { x };
+    }
+    return a as i32, b as i32, true;
+}
+
+struct AttrScan { ok: bool, name_start: i64, name_end: i64, op: i32, value_start: i64, value_end: i64, end: i64 }
+
+// The attribute selector at sel[i], a '[': [name], [name=value] or
+// [name op "value"], and the index after its ']'.
+fn scan_attr(sel: const u8[:], i: i64) -> AttrScan {
+    var r = AttrScan { ok: false, name_start: 0, name_end: 0, op: A_HAS, value_start: 0, value_end: 0, end: i };
+    var j = i + 1;
+    while j < sel.len && is_ws(sel[j]) { j += 1; }
+    r.name_start = j;
+    while j < sel.len && is_ident(sel[j]) { j += 1; }
+    r.name_end = j;
+    guard r.name_end > r.name_start else { return r; }
+    while j < sel.len && is_ws(sel[j]) { j += 1; }
+    guard j < sel.len else { return r; }
+    if sel[j] != ']' {
+        var op: i32 = -1;
+        if sel[j] == '=' { op = A_EQ; j += 1; }
+        else if j + 1 < sel.len && sel[j + 1] == '=' {
+            let o = sel[j];
+            op = if o == '~' { A_WORD } else if o == '^' { A_PREFIX } else if o == '$' { A_SUFFIX }
+                 else if o == '*' { A_SUB } else if o == '|' { A_DASH } else { -1 };
+            j += 2;
+        }
+        guard op >= 0 else { return r; }
+        r.op = op;
+        while j < sel.len && is_ws(sel[j]) { j += 1; }
+        guard j < sel.len else { return r; }
+        if sel[j] == '"' || sel[j] == '\'' {
+            let q = sel[j];
+            r.value_start = j + 1;
+            j += 1;
+            while j < sel.len && sel[j] != q { j += 1; }
+            guard j < sel.len else { return r; }
+            r.value_end = j;
+            j += 1;
+        } else {
+            r.value_start = j;
+            while j < sel.len && is_ident(sel[j]) { j += 1; }
+            r.value_end = j;
+            guard r.value_end > r.value_start else { return r; }
+        }
+        while j < sel.len && is_ws(sel[j]) { j += 1; }
+        guard j < sel.len && sel[j] == ']' else { return r; }
+    }
+    r.end = j + 1;
+    r.ok = true;
+    return r;
 }
 
 fn is_ident(c: u8) -> bool {
@@ -386,7 +591,9 @@ fn is_ident(c: u8) -> bool {
 }
 
 // Declarations `prop: value; ...`, shorthands expanded, unknown ones skipped.
-fn parse_declarations(body: const u8[:], out: Decl[>..]&) {
+// What keeps its text (custom properties, values that wait on var(), strings)
+// keeps it in `bytes`.
+fn parse_declarations(body: const u8[:], out: Decl[>..]&, bytes: u8[>..]&) {
     var i: i64 = 0;
     while i < body.len {
         // One declaration runs to the next ';' outside quotes and brackets.
@@ -403,21 +610,166 @@ fn parse_declarations(body: const u8[:], out: Decl[>..]&) {
         i += 1;
         let colon = find(one, ":");
         if colon <= 0 { continue; }
-        var name: u8[>..] = [];
-        name.append(trim(one[..colon]));
-        to_lower(name[..]);
+        let raw_name = trim(one[..colon]);
         var value = trim(one[colon + 1..]);
         var important: i32 = 0;
-        let bang = find(value, "!");
-        if bang >= 0 {
-            if trim(value[bang + 1..]) == "important" { important = 1; }
+        var bang: i64 = -1;
+        for k in value.len { if value[k] == '!' { bang = k; } }
+        if bang >= 0 && trim(value[bang + 1..]) == "important" {
+            important = 1;
             value = trim(value[..bang]);
         }
-        add_declaration(name[..], value, important, out);
+        // A custom property keeps the case of its name, and its value as text.
+        if starts_with(raw_name, "--") {
+            push_decl(out, text_decl(P_CUSTOM, 0, important, value, raw_name, bytes));
+            continue;
+        }
+        var name: u8[>..] = [];
+        name.append(raw_name);
+        to_lower(name[..]);
+        if find(value, "var(") >= 0 { add_pending(name[..], value, important, out, bytes); continue; }
+        add_declaration(name[..], value, important, out, bytes);
     }
 }
 
-fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: Decl[>..]&) {
+fn decl(prop: i32, kind: i32, num: f32, unit: i32, color: u32, important: i32) -> Decl {
+    return Decl { prop: prop, kind: kind, num: num, unit: unit, color: color, important: important,
+                  text: 0, text_len: 0, name: 0, name_len: 0 };
+}
+
+// A declaration that keeps `value`, and `name` if it has one, as text in `bytes`.
+fn text_decl(prop: i32, kind: i32, important: i32, value: const u8[:], name: const u8[:], bytes: u8[>..]&) -> Decl {
+    var dc = decl(prop, kind, 0.0, 0, 0, important);
+    dc.text = bytes.len as i32;
+    dc.text_len = value.len as i32;
+    bytes.append(value);
+    dc.name = bytes.len as i32;
+    dc.name_len = name.len as i32;
+    bytes.append(name);
+    return dc;
+}
+
+// A declaration with var() in it can't be parsed until the cascade knows the
+// variables, so it waits as text: once for its property, or once for each
+// longhand of its shorthand.
+fn add_pending(name: const u8[:], value: const u8[:], important: i32, out: Decl[>..]&, bytes: u8[>..]&) {
+    var props: i32[>..] = [];
+    let p = property_id(name);
+    if p >= 0 { props.push(p); } else { longhands(name, props); }
+    guard props.len > 0;
+    let dc = text_decl(0, V_VAR, important, value, name, bytes);
+    for lp in props {
+        var one = dc;
+        one.prop = lp;
+        push_decl(out, one);
+    }
+}
+
+// The longhands a shorthand sets.
+fn longhands(name: const u8[:], out: i32[>..]&) {
+    if name == "margin" { out.append([P_MT, P_MR, P_MB, P_ML]); }
+    else if name == "padding" { out.append([P_PT, P_PR, P_PB, P_PL]); }
+    else if name == "border" { out.append([P_BT_WIDTH, P_BT_COLOR, P_BB_WIDTH, P_BB_COLOR]); }
+    else if name == "border-top" { out.append([P_BT_WIDTH, P_BT_COLOR]); }
+    else if name == "border-bottom" { out.append([P_BB_WIDTH, P_BB_COLOR]); }
+    else if name == "background" { out.push(P_BG); }
+    else if name == "list-style" { out.push(P_LIST); }
+    else if name == "text-decoration" || name == "text-decoration-line" { out.push(P_DECO); }
+    else if name == "font" { out.append([P_FONT_STYLE, P_FONT_WEIGHT, P_FONT_SIZE, P_LINE_HEIGHT, P_FONT_FAMILY]); }
+}
+
+// content: a string gives ::before or ::after their text; none and normal
+// mean there is none.
+fn add_content(value: const u8[:], important: i32, out: Decl[>..]&, bytes: u8[>..]&) {
+    if value.len >= 2 && (value[0] == '"' || value[0] == '\'') && value[value.len - 1] == value[0] {
+        var text: u8[>..] = [];
+        decode_css_string(value[1..value.len - 1], text);
+        push_decl(out, text_decl(P_CONTENT, V_STRING, important, text[..], "", bytes));
+    } else if value == "none" || value == "normal" {
+        push_decl(out, decl(P_CONTENT, V_KEYWORD, K_NONE, 0, 0, important));
+    }
+}
+
+// A CSS string's contents with its escapes decoded: a backslash and up to six
+// hex digits (and one space after them) is that character, before a newline
+// it joins the lines, and before anything else it is that character.
+fn decode_css_string(s: const u8[:], out: u8[>..]&) {
+    var i: i64 = 0;
+    while i < s.len {
+        let c = s[i];
+        if c != '\\' || i + 1 >= s.len { out.push(c); i += 1; continue; }
+        let st = i + 1;
+        var j = st;
+        while j < s.len && j - st < 6 && is_hex_digit(s[j]) { j += 1; }
+        if j > st {
+            let cp, ok = parse_int(s[st..j], 16);
+            push_utf8(out, if ok && cp > 0 && cp <= 0x10FFFF { cp } else { 0xFFFD });
+            if j < s.len && is_ws(s[j]) { j += 1; }
+            i = j;
+            continue;
+        }
+        if s[st] != '\n' { out.push(s[st]); }
+        i = st + 1;
+    }
+}
+
+fn is_hex_digit(c: u8) -> bool { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+
+// The font shorthand: [style] [weight] size[/line-height] family. What it
+// leaves out goes back to its initial value, as CSS says.
+fn add_font(value: const u8[:], important: i32, out: Decl[>..]&) {
+    var italic = false;
+    var weight: u8[>..] = [];
+    var i: i64 = 0;
+    var size_start: i64 = -1;
+    var size_end: i64 = -1;
+    while i < value.len {
+        while i < value.len && is_ws(value[i]) { i += 1; }
+        let st = i;
+        while i < value.len && !is_ws(value[i]) && value[i] != '/' { i += 1; }
+        let w = value[st..i];
+        guard w.len > 0 else { return; }
+        if is_font_size(w) { size_start = st; size_end = i; break; }
+        if w == "italic" || w == "oblique" { italic = true; }
+        else if w == "bold" || w == "bolder" || w == "lighter" || (w[0] >= '1' && w[0] <= '9') {
+            weight.clear();
+            weight.append(w);
+        }
+        else if w != "normal" && w != "small-caps" { return; }
+    }
+    guard size_start >= 0;
+    var lh_start: i64 = -1;
+    var lh_end: i64 = -1;
+    var j = i;
+    while j < value.len && is_ws(value[j]) { j += 1; }
+    if j < value.len && value[j] == '/' {
+        j += 1;
+        while j < value.len && is_ws(value[j]) { j += 1; }
+        lh_start = j;
+        while j < value.len && !is_ws(value[j]) { j += 1; }
+        lh_end = j;
+        i = j;
+    }
+    let family = trim(value[i..]);
+    guard family.len > 0;
+    add_value(P_FONT_STYLE, if italic { "italic" } else { "normal" }, important, out);
+    add_value(P_FONT_WEIGHT, if weight.len > 0 { weight[..] } else { "normal" }, important, out);
+    add_value(P_FONT_SIZE, value[size_start..size_end], important, out);
+    add_value(P_LINE_HEIGHT, if lh_start >= 0 { value[lh_start..lh_end] } else { "normal" }, important, out);
+    add_value(P_FONT_FAMILY, family, important, out);
+}
+
+// Whether a word of the font shorthand is its size: a length, or a size keyword.
+fn is_font_size(w: const u8[:]) -> bool {
+    if w == "xx-small" || w == "x-small" || w == "small" || w == "medium" || w == "large" || w == "x-large"
+        || w == "xx-large" || w == "smaller" || w == "larger" { return true; }
+    let n, u, ok = parse_length(w);
+    return ok && (w[w.len - 1] < '0' || w[w.len - 1] > '9');
+}
+
+fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: Decl[>..]&, bytes: u8[>..]&) {
+    if name == "font" { add_font(value, important, out); return; }
+    if name == "content" { add_content(value, important, out, bytes); return; }
     if name == "margin" || name == "padding" {
         let base = if name == "margin" { P_MT } else { P_PT };
         let parts = words(value);
@@ -456,19 +808,19 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
         };
         if none { width = 0.0; }
         if name == "border-top" || name == "border" {
-            push_decl(out, Decl { prop: P_BT_WIDTH, kind: V_LENGTH, num: width, unit: U_PX, color: 0, important: important });
-            push_decl(out, Decl { prop: P_BT_COLOR, kind: V_COLOR, num: 0.0, unit: 0, color: color, important: important });
+            push_decl(out, decl(P_BT_WIDTH, V_LENGTH, width, U_PX, 0, important));
+            push_decl(out, decl(P_BT_COLOR, V_COLOR, 0.0, 0, color, important));
         }
         if name == "border-bottom" || name == "border" {
-            push_decl(out, Decl { prop: P_BB_WIDTH, kind: V_LENGTH, num: width, unit: U_PX, color: 0, important: important });
-            push_decl(out, Decl { prop: P_BB_COLOR, kind: V_COLOR, num: 0.0, unit: 0, color: color, important: important });
+            push_decl(out, decl(P_BB_WIDTH, V_LENGTH, width, U_PX, 0, important));
+            push_decl(out, decl(P_BB_COLOR, V_COLOR, 0.0, 0, color, important));
         }
         return;
     }
     if name == "background" {
         each_word(value) {
             let col, ok = parse_color(it);
-            if ok { push_decl(out, Decl { prop: P_BG, kind: V_COLOR, num: 0.0, unit: 0, color: col, important: important }); }
+            if ok { push_decl(out, decl(P_BG, V_COLOR, 0.0, 0, col, important)); }
         };
         return;
     }
@@ -476,7 +828,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
         each_word(value) {
             let k = keyword(it);
             if k == K_NONE || (k >= K_DISC && k <= K_UPPER_ALPHA) || k == K_LOWER_ROMAN || k == K_UPPER_ROMAN {
-                push_decl(out, Decl { prop: P_LIST, kind: V_KEYWORD, num: k as f32, unit: 0, color: 0, important: important });
+                push_decl(out, decl(P_LIST, V_KEYWORD, k as f32, 0, 0, important));
             }
         };
         return;
@@ -484,7 +836,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
     if name == "text-decoration" || name == "text-decoration-line" {
         var k = K_NONE;
         each_word(value) { let w = keyword(it); if w == K_UNDERLINE || w == K_LINE_THROUGH { k = w; } };
-        push_decl(out, Decl { prop: P_DECO, kind: V_KEYWORD, num: k, unit: 0, color: 0, important: important });
+        push_decl(out, decl(P_DECO, V_KEYWORD, k, 0, 0, important));
         return;
     }
     let prop = property_id(name);
@@ -495,7 +847,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
 fn push_decl(out: Decl[>..]&, d: Decl) { out.push(d); }
 
 fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
-    var d = Decl { prop: prop, kind: 0, num: 0.0, unit: 0, color: 0, important: important };
+    var d = decl(prop, 0, 0.0, 0, 0, important);
     if value == "inherit" { d.kind = V_INHERIT; push_decl(out, d); return; }
     if prop == P_COLOR || prop == P_BG || prop == P_BT_COLOR || prop == P_BB_COLOR {
         let c, ok = parse_color(value);
@@ -565,7 +917,7 @@ fn property_id(n: const u8[:]) -> i32 {
     if n == "list-style-type" { return P_LIST; } if n == "vertical-align" { return P_VALIGN; }
     if n == "border-top-width" { return P_BT_WIDTH; } if n == "border-bottom-width" { return P_BB_WIDTH; }
     if n == "border-top-color" { return P_BT_COLOR; } if n == "border-bottom-color" { return P_BB_COLOR; }
-    if n == "text-indent" { return P_TEXT_INDENT; }
+    if n == "text-indent" { return P_TEXT_INDENT; } if n == "content" { return P_CONTENT; }
     return -1;
 }
 
@@ -736,8 +1088,13 @@ fn compound_matches(sh: Sheet, d: Doc, c: Compound, e: i32) -> bool {
         let s = sh.classes[k];
         guard has_class(d, e, span_of(sh, s.start, s.len)) else { return false; }
     }
+    for k in c.attr..c.attr + c.attr_count {
+        guard attr_matches(sh, d, sh.attrs[k], e) else { return false; }
+    }
+    if c.root == 1 && (n.parent < 0 || d.nodes[n.parent].kind != NODE_DOCUMENT) { return false; }
     if c.first_child == 1 && first_element_child(d, n.parent) != e { return false; }
     if c.last_child == 1 && last_element_child(d, n.parent) != e { return false; }
+    if c.nth == 1 && !nth_matches(c.nth_a, c.nth_b, element_index(d, e)) { return false; }
     // Tusk keeps no history, and :visited mustn't reveal it anyway.
     if c.link == 2 { return false; }
     if c.link == 1 {
@@ -754,10 +1111,55 @@ fn span_of(sh: Sheet, start: i32, len: i32) -> const u8[:] {
     return sh.bytes[a..b];
 }
 
+fn var_span(sh: Sheet, start: i32, len: i32) -> const u8[:] {
+    let a: i64 = start;
+    let b: i64 = start + len;
+    return sh.var_bytes[a..b];
+}
+
+fn attr_matches(sh: Sheet, d: Doc, a: AttrSel, e: i32) -> bool {
+    let v, has = attr_value(d, e, span_of(sh, a.name, a.name_len));
+    guard has else { return false; }
+    let want = span_of(sh, a.value, a.value_len);
+    if a.op == A_HAS { return true; }
+    if a.op == A_EQ { return v == want; }
+    if a.op == A_PREFIX { return want.len > 0 && starts_with(v, want); }
+    if a.op == A_SUFFIX { return want.len > 0 && v.len >= want.len && v[v.len - want.len..] == want; }
+    if a.op == A_SUB { return want.len > 0 && find(v, want) >= 0; }
+    if a.op == A_DASH { return v == want || (starts_with(v, want) && v.len > want.len && v[want.len] == '-'); }
+    var found = false;
+    each_word(v) { if it == want { found = true; } };
+    return found;
+}
+
+// Whether position i (counting from 1) is a·k + b for some k ≥ 0.
+fn nth_matches(a: i32, b: i32, i: i32) -> bool {
+    if a == 0 { return i == b; }
+    let gap = i - b;
+    return gap % a == 0 && gap / a >= 0;
+}
+
+// Element e's position among its parent's elements, from 1. The ::before and
+// ::after the cascade makes don't count, here or in the two below.
+fn element_index(d: Doc, e: i32) -> i32 {
+    let p = d.nodes[e].parent;
+    guard p >= 0 else { return 1; }
+    var i: i32 = 0;
+    var c = d.nodes[p].first;
+    while c >= 0 {
+        if d.nodes[c].kind == NODE_ELEMENT && !is_generated(d, c) {
+            i += 1;
+            if c == e { return i; }
+        }
+        c = d.nodes[c].next;
+    }
+    return i;
+}
+
 fn first_element_child(d: Doc, p: i32) -> i32 {
     guard p >= 0 else { return -1; }
     var c = d.nodes[p].first;
-    while c >= 0 && d.nodes[c].kind != NODE_ELEMENT { c = d.nodes[c].next; }
+    while c >= 0 && (d.nodes[c].kind != NODE_ELEMENT || is_generated(d, c)) { c = d.nodes[c].next; }
     return c;
 }
 
@@ -765,72 +1167,267 @@ fn last_element_child(d: Doc, p: i32) -> i32 {
     guard p >= 0 else { return -1; }
     var last: i32 = -1;
     var c = d.nodes[p].first;
-    while c >= 0 { if d.nodes[c].kind == NODE_ELEMENT { last = c; } c = d.nodes[c].next; }
+    while c >= 0 {
+        if d.nodes[c].kind == NODE_ELEMENT && !is_generated(d, c) { last = c; }
+        c = d.nodes[c].next;
+    }
     return last;
 }
 
-// Computes the style of every element into `styles`, indexed like d.nodes.
-// `sh` holds the user-agent sheet and the document's own sheets; the style
-// attributes are parsed here, one element at a time, into `scratch`.
+// Scratch the cascade shares across all elements, so that styling makes no
+// arrays per element: each call pushes above what is there and takes it back
+// before it returns.
+struct Work { customs: Decl[>..<]&, prio: i64[>..<]&, text: u8[>..<]& }
+
+// Computes the style of every element into `styles`, indexed like d.nodes,
+// and makes the ::before and ::after that rules give content to.
 fn compute_styles(d: Doc, sh: Sheet, styles: Style[>..]&) {
     while styles.len < d.nodes.len { styles.push(root_style()); }
-    compute_subtree(d, sh, styles, 0, root_style());
+    // The rules that style ::before or ::after. Only an element one of them
+    // matches gets the cascade for its pseudo-elements, so that the rest
+    // don't pay for looking.
+    var pseudo_rules: i32[>..] = [];
+    for r, i in sh.rules { if r.pseudo != 0 { pseudo_rules.push(i as i32); } }
+    var customs: Decl[>..<] = [];
+    var prio: i64[>..<] = [];
+    var text: u8[>..<] = [];
+    let w = Work { customs: customs, prio: prio, text: text };
+    compute_subtree(d, sh, styles, 0, root_style(), pseudo_rules[..], w);
 }
 
-recursive fn compute_subtree(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, parent: Style) {
+recursive fn compute_subtree(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, parent: Style, pseudo_rules: const i32[:], w: Work) {
     var s = parent;
-    if d.nodes[n].kind == NODE_ELEMENT {
-        s = cascade(d, sh, n, parent);
+    let element = d.nodes[n].kind == NODE_ELEMENT;
+    if element {
+        // A ::before or ::after keeps the style it was made with.
+        s = if is_generated(d, n) { styles[n] } else { cascade(d, sh, n, parent, 0, w) };
     }
     styles[n] = s;
+    if element && pseudo_rules.len > 0 && s.display != K_NONE && !is_generated(d, n) {
+        // Which of its pseudo-elements a rule styles: 1 ::before, 2 ::after.
+        var styled: i32 = 0;
+        for k in pseudo_rules {
+            let r = sh.rules[k];
+            if (styled & r.pseudo) == 0 && rule_matches(sh, d, r, n) { styled |= r.pseudo; }
+        }
+        if (styled & 1) != 0 { generate(d, sh, styles, n, s, 1, w); }
+        if (styled & 2) != 0 { generate(d, sh, styles, n, s, 2, w); }
+    }
     var c = d.nodes[n].first;
     while c >= 0 {
-        if d.nodes[c].kind == NODE_ELEMENT { compute_subtree(d, sh, styles, c, s); }
+        if d.nodes[c].kind == NODE_ELEMENT { compute_subtree(d, sh, styles, c, s, pseudo_rules, w); }
         else { styles[c] = s; }
         c = d.nodes[c].next;
     }
 }
 
-// The cascade for one element: for each property the declaration with the
-// highest (importance, origin, specificity, order) wins.
-fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style) -> Style {
-    var win_prio: i64[28];
-    var win: Decl[28];
+// Makes element n's ::before (`which` 1) or ::after (2), when the cascade
+// gives it content: an element named after it as n's first or last child,
+// holding the content as text, with its style already in `styles`.
+fn generate(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, s: Style, which: i32, w: Work) {
+    let name = if which == 1 { "::before" } else { "::after" };
+    // Styled again, a document keeps the ones it has.
+    let edge = if which == 1 { d.nodes[n].first } else { d.nodes[n].last };
+    if edge >= 0 && d.nodes[edge].kind == NODE_ELEMENT && node_name(d, edge) == name { return; }
+    let ps = cascade(d, sh, n, s, which, w);
+    guard ps.content_len >= 0;
+    let g = add_element(d, name, n, which == 1);
+    styles.push(ps);
+    if ps.content_len > 0 {
+        add_text(d, span_of(sh, ps.content, ps.content_len), g);
+        styles.push(ps);
+    }
+}
+
+// The cascade for element e, or for its ::before (`pseudo` 1) or ::after (2):
+// for each property the declaration with the highest (importance, origin,
+// specificity, order) wins. Custom properties win by name, and var() is
+// substituted before a declaration that waits on it applies.
+fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> Style {
+    var win_prio: i64[NPROPS];
+    var win: Decl[NPROPS];
     fill(win_prio[..], -1);
+    let mark = w.customs.len;
     for r in sh.rules {
-        guard rule_matches(sh, d, r, e) else { continue; }
-        for k in r.decl..r.decl + r.decl_count {
-            let dc = sh.decls[k];
+        guard r.pseudo == pseudo && rule_matches(sh, d, r, e) else { continue; }
+        for j in r.decl..r.decl + r.decl_count {
+            let dc = sh.decls[j];
             let prio = (dc.important as i64) << 62 | (r.origin as i64) << 56 | (r.spec as i64) << 32 | r.order;
+            if dc.prop == P_CUSTOM { keep_custom(sh, w, mark, dc, prio); continue; }
             if prio >= win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
         }
     }
     // The style attribute beats every sheet, at its own importance.
     let style_attr, has_style = attr_value(d, e, "style");
-    if has_style {
+    if has_style && pseudo == 0 {
         var inline: Decl[>..] = [];
         var text: u8[>..] = [];
         without_comments(style_attr, text);
-        parse_declarations(text[..], inline);
+        parse_declarations(text[..], inline, sh.bytes);
         for dc in inline {
             let prio = (dc.important as i64) << 62 | (ORIGIN_INLINE as i64) << 56;
+            if dc.prop == P_CUSTOM { keep_custom(sh, w, mark, dc, prio); continue; }
             if prio >= win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
         }
     }
 
     var s = inherit(parent);
+    if w.customs.len > mark { s.vars = own_vars(sh, w.customs[mark..], parent.vars, w.text); }
     // Font size first: em lengths everywhere else depend on it.
-    if win_prio[P_FONT_SIZE] >= 0 { apply(s, parent, win[P_FONT_SIZE]); }
+    if win_prio[P_FONT_SIZE] >= 0 { apply_decl(s, parent, win[P_FONT_SIZE], sh, w.text); }
     for p in NPROPS {
         if p == P_FONT_SIZE || win_prio[p] < 0 { continue; }
-        apply(s, parent, win[p]);
+        apply_decl(s, parent, win[p], sh, w.text);
     }
-    let hidden, is_hidden = attr_value(d, e, "hidden");
-    if is_hidden { s.display = K_NONE; }
-    // rem counts in the root element's font size, from its children on.
-    let up = d.nodes[e].parent;
-    if up >= 0 && d.nodes[up].kind == NODE_DOCUMENT { s.root_size = s.font_size; }
+    if pseudo == 0 {
+        let hidden, is_hidden = attr_value(d, e, "hidden");
+        if is_hidden { s.display = K_NONE; }
+        // rem counts in the root element's font size, from its children on.
+        let up = d.nodes[e].parent;
+        if up >= 0 && d.nodes[up].kind == NODE_DOCUMENT { s.root_size = s.font_size; }
+    }
+    w.customs.resize(mark);
+    w.prio.resize(mark);
     return s;
+}
+
+// Keeps the winning declaration of each custom property, by name, in
+// w.customs from `from` on.
+fn keep_custom(sh: Sheet, w: Work, from: i64, dc: Decl, p: i64) {
+    let name = span_of(sh, dc.name, dc.name_len);
+    for i in from..w.customs.len {
+        if span_of(sh, w.customs[i].name, w.customs[i].name_len) == name {
+            if p >= w.prio[i] { w.customs[i] = dc; w.prio[i] = p; }
+            return;
+        }
+    }
+    w.customs.push(dc);
+    w.prio.push(p);
+}
+
+// Puts an element's own custom properties in front of the chain its parent's
+// start at, each substituted (it may use the others, or inherited ones), and
+// returns the new head. Substituted here, a value is inherited as it came out
+// where it was set.
+fn own_vars(sh: Sheet, own: const Decl[:], head: i32, scratch: u8[>..<]&) -> i32 {
+    var at = head;
+    for dc in own {
+        let mark = scratch.len;
+        let ok = substitute(sh, span_of(sh, dc.text, dc.text_len), own, head, 0, scratch);
+        var v = Var { name: sh.var_bytes.len as i32, name_len: dc.name_len, value: 0, value_len: -1, next: at };
+        sh.var_bytes.append(span_of(sh, dc.name, dc.name_len));
+        if ok {
+            v.value = sh.var_bytes.len as i32;
+            v.value_len = (scratch.len - mark) as i32;
+            sh.var_bytes.append(scratch[mark..]);
+        }
+        scratch.resize(mark);
+        at = sh.vars.len as i32;
+        sh.vars.push(v);
+    }
+    return at;
+}
+
+// Appends `text` to `out` with each var() replaced by its custom property:
+// the element's own (`own`, still text, so substituted in turn), else the one
+// inherited from `head` on, else the var()'s fallback. False, with `out` as it
+// was, when one has none of those, or when references go 8 deep, as a cycle's
+// do.
+recursive fn substitute(sh: Sheet, text: const u8[:], own: const Decl[:], head: i32, depth: i32, out: u8[>..<]&) -> bool {
+    guard depth < 8 else { return false; }
+    let mark = out.len;
+    var i: i64 = 0;
+    while i < text.len {
+        let k = find(text[i..], "var(");
+        if k < 0 { out.append(text[i..]); return true; }
+        out.append(text[i..i + k]);
+        let open = i + k + 4;
+        let close = close_paren(text, open);
+        if close < 0 { out.resize(mark); return false; }
+        let inside = text[open..close];
+        let comma = top_comma(inside);
+        let name = trim(if comma >= 0 { inside[..comma] } else { inside });
+        if !lookup_var(sh, name, own, head, depth, out) {
+            if comma < 0 || !substitute(sh, trim(inside[comma + 1..]), own, head, depth + 1, out) {
+                out.resize(mark);
+                return false;
+            }
+        }
+        i = close + 1;
+    }
+    return true;
+}
+
+// Appends the value of custom property `name`, found as substitute says;
+// false, with `out` as it was, when there is none.
+recursive fn lookup_var(sh: Sheet, name: const u8[:], own: const Decl[:], head: i32, depth: i32, out: u8[>..<]&) -> bool {
+    for dc in own {
+        if span_of(sh, dc.name, dc.name_len) == name {
+            return substitute(sh, span_of(sh, dc.text, dc.text_len), own, head, depth + 1, out);
+        }
+    }
+    var at = head;
+    while at >= 0 {
+        let v = sh.vars[at];
+        if var_span(sh, v.name, v.name_len) == name {
+            guard v.value_len >= 0 else { return false; }
+            out.append(var_span(sh, v.value, v.value_len));
+            return true;
+        }
+        at = v.next;
+    }
+    return false;
+}
+
+// The index of the ')' that closes a '(' just before s[i], nesting and quotes
+// allowed for; -1 when there is none.
+fn close_paren(s: const u8[:], i: i64) -> i64 {
+    var depth = 1;
+    var j = i;
+    while j < s.len {
+        let c = s[j];
+        if c == '"' || c == '\'' { j = skip_string(s, j); continue; }
+        if c == '(' { depth += 1; }
+        else if c == ')' { depth -= 1; if depth == 0 { return j; } }
+        j += 1;
+    }
+    return -1;
+}
+
+// The index of the first comma outside brackets and quotes; -1 when there is none.
+fn top_comma(s: const u8[:]) -> i64 {
+    var depth = 0;
+    var j: i64 = 0;
+    while j < s.len {
+        let c = s[j];
+        if c == '"' || c == '\'' { j = skip_string(s, j); continue; }
+        if c == '(' { depth += 1; }
+        else if c == ')' { depth -= 1; }
+        else if c == ',' && depth == 0 { return j; }
+        j += 1;
+    }
+    return -1;
+}
+
+// Applies a declaration, substituting var() first when it waits on one: the
+// text is then parsed as the property or shorthand it was written as, and
+// this longhand applied. When a variable has no value and its var() no
+// fallback, the property stays as it was: inherited, or initial.
+fn apply_decl(s: Style&, parent: Style, dc: Decl, sh: Sheet, scratch: u8[>..<]&) {
+    if dc.kind != V_VAR { apply(s, parent, dc); return; }
+    let mark = scratch.len;
+    if substitute(sh, span_of(sh, dc.text, dc.text_len), sh.decls[0..0], s.vars, 0, scratch) {
+        var name: u8[>..] = [];
+        name.append(span_of(sh, dc.name, dc.name_len));
+        // Shorthands keep slices of their value (words), so it goes into an array
+        // that only grows.
+        var value: u8[>..] = [];
+        value.append(scratch[mark..]);
+        var parsed: Decl[>..] = [];
+        add_declaration(name[..], value[..], dc.important, parsed, sh.bytes);
+        for one in parsed { if one.prop == dc.prop { apply(s, parent, one); } }
+    }
+    scratch.resize(mark);
 }
 
 // What an element starts from: the inherited properties of its parent, the
@@ -839,7 +1436,7 @@ fn inherit(p: Style) -> Style {
     var s = root_style();
     s.color = p.color; s.font_size = p.font_size; s.bold = p.bold; s.italic = p.italic; s.family = p.family;
     s.lh_mult = p.lh_mult; s.lh_px = p.lh_px; s.align = p.align; s.ws = p.ws; s.list = p.list; s.deco = p.deco;
-    s.indent = p.indent; s.root_size = p.root_size;
+    s.indent = p.indent; s.root_size = p.root_size; s.vars = p.vars;
     s.display = K_INLINE;
     return s;
 }
@@ -907,6 +1504,10 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
     else if p == P_BT_COLOR { s.bt_color = if dc.color == CURRENT_COLOR { s.color } else { dc.color }; }
     else if p == P_BB_COLOR { s.bb_color = if dc.color == CURRENT_COLOR { s.color } else { dc.color }; }
     else if p == P_TEXT_INDENT { if dc.kind == V_LENGTH { s.indent = px(dc, s, parent); } }
+    else if p == P_CONTENT {
+        s.content = dc.text;
+        s.content_len = if dc.kind == V_STRING { dc.text_len } else { -1 };
+    }
 }
 
 // ------------------------------------------------------------------ Tusk's own style sheet
