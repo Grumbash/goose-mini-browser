@@ -157,10 +157,8 @@ fn show_bar(P: Page, name: const u8[:], cost: Cost, width: f32, height: f32, sca
     var line: u8[>..] = [];
     weight(P, name, cost, line);
     var items: DItem[>..] = [];
-    items.push(DItem { kind: ITEM_RECT, x: 0.0, y: height - BAR_H, w: width, h: BAR_H, color: 0xFF1B1C1E,
-                       font: 0, size: 0.0, text: 0, text_len: 0, node: -1 });
-    items.push(DItem { kind: ITEM_TEXT, x: 12.0, y: height - 9.5, w: 0.0, h: 0.0, color: 0xFFC9CBCF,
-                       font: FAMILY_MONO, size: 11.0, text: 0, text_len: line.len as i32, node: -1 });
+    items.push(rect_item(-1, 0.0, height - BAR_H, width, BAR_H, 0xFF1B1C1E));
+    items.push(text_item(-1, 12.0, height - 9.5, 0.0, 0xFFC9CBCF, FAMILY_MONO, 11.0, 0, line.len as i32));
     set_layer(LAYER_BAR, items, line, scale);
 }
 

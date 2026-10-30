@@ -355,6 +355,35 @@ fn test_css() {
     check("headings", style_of("<h2>T</h2>", "h2"), "display=1 size=24.7 bold=1 italic=0 color=ff1c1c1c mt=32.0 ml=0.0 auto_ml=0");
 }
 
+fn test_box() {
+    // Sizes: box-sizing both ways, a minimum width over a width, a maximum
+    // height over a height, a minimum height on an empty block, and a left
+    // border with padding moving the content.
+    let sizes = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        #a { width: 100px; padding: 10px; border: 5px solid #000; box-sizing: border-box }
+        #b { width: 100px; padding: 10px; border: 5px solid #000 } #c { height: 40px; width: 10px; min-width: 50px }
+        #d { height: 100px; max-height: 20px } #e { min-height: 30px } #f { border-left: 7px solid #000; padding-left: 3px }
+        #g { height: 5px }</style><div id=a>a</div><div id=b>b</div><div id=c></div><div id=d></div><div id=e></div><div id=f><div id=g></div></div>
+        """;
+    check("widths and heights, their limits, and box-sizing", layout_probe(sizes, 400.0, PROBE_GEOMETRY),
+          "a x 0.0 y 0.0 w 100.0 h 57.2\nb x 0.0 y 57.2 w 130.0 h 57.2\nc x 0.0 y 114.4 w 50.0 h 40.0\nd x 0.0 y 154.4 w 400.0 h 20.0\ne x 0.0 y 174.4 w 400.0 h 30.0\nf x 0.0 y 204.4 w 400.0 h 5.0\ng x 10.0 y 204.4 w 390.0 h 5.0\n");
+
+    // Paint: a rounded background, a pill from 50%, a dashed border, borders
+    // without a style (none), a ring and an inset bar, opacity, and corners
+    // rounded on top only.
+    let paint = """
+        <style>body { margin: 0; padding: 0; max-width: none } div { height: 20px }
+        #r { background: #ff0000; border-radius: 4px } #p { width: 40px; border-radius: 50%; background: #00ff00 }
+        #u { border: 2px dashed #0000ff } #n { border-top: 3px #000; border-bottom-width: 4px }
+        #s { box-shadow: 0 0 0 1px #000, inset 3px 0 0 #00f } #o { background: #ff0000; opacity: 0.5 }
+        #t { height: 10px; background: #000; border-radius: 6px 6px 0 0 }</style>
+        <div id=r></div><div id=p></div><div id=u></div><div id=n></div><div id=s></div><div id=o></div><div id=t></div>
+        """;
+    check("rounded boxes, dashes, rings and bars, opacity", layout_probe(paint, 100.0, PROBE_PAINT),
+          "r box 0,0,100,20 ffff0000 r 4,4,4,4 b 0 00000000 solid\np box 0,20,40,20 ff00ff00 r 10,10,10,10 b 0 00000000 solid\nu box 0,40,100,24 00000000 r 0,0,0,0 b 2 ff0000ff dashed\ns box -1,83,102,22 00000000 r 0,0,0,0 b 1 ff000000 solid\ns rect 0,84,3,20 ff0000ff\no rect 0,104,100,20 80ff0000\nt box 0,124,100,10 ff000000 r 6,6,0,0 b 0 00000000 solid\n");
+}
+
 // ------------------------------------------------------------------ layout
 
 let PROBE_GLUE: i32 = 5;    // "ok", or the first text that starts a line with , . [ or ]
@@ -364,6 +393,8 @@ let PROBE_TEXT: i32 = 1;    // each text item: its text, its line, and where it 
 let PROBE_BOXES: i32 = 2;   // each element's box, top and height
 let PROBE_FIT: i32 = 3;     // whether every text item's ink stays in the column
 let PROBE_SNAPSHOT: i32 = 4; // the snapshot, without boxes and size, which depend on fonts
+let PROBE_GEOMETRY: i32 = 7; // each element with an id: its border box
+let PROBE_PAINT: i32 = 8;   // each rect and box item of an element with an id
 
 // Lays `src` out `width` points wide and describes the result as `probe` asks.
 fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
@@ -435,6 +466,47 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             if out.len == 0 { base = it.y; }
             format(out, "\"", text[it.text..it.text + it.text_len], "\" ");
             format_flt(out, it.y - base, 1);
+            out.push('\n');
+        }
+    } else if probe == PROBE_GEOMETRY {
+        for n, i in nodes {
+            guard n.kind == NODE_ELEMENT else { continue; }
+            let id, has = attr_value(d, i as i32, "id");
+            guard has else { continue; }
+            let b = boxes[i];
+            format(out, id, " x ");
+            format_flt(out, b.x, 1);
+            out.append(" y ");
+            format_flt(out, b.y, 1);
+            out.append(" w ");
+            format_flt(out, b.w, 1);
+            out.append(" h ");
+            format_flt(out, b.h, 1);
+            out.push('\n');
+        }
+    } else if probe == PROBE_PAINT {
+        for it in items {
+            guard it.kind != ITEM_TEXT && it.node >= 0 else { continue; }
+            let id, has = attr_value(d, it.node, "id");
+            guard has else { continue; }
+            format(out, id, if it.kind == ITEM_BOX { " box " } else { " rect " });
+            format_flt(out, it.x, 0); out.push(',');
+            format_flt(out, it.y, 0); out.push(',');
+            format_flt(out, it.w, 0); out.push(',');
+            format_flt(out, it.h, 0); out.push(' ');
+            format_uint(out, it.color, 16, 8, '0');
+            if it.kind == ITEM_BOX {
+                out.append(" r ");
+                format_flt(out, it.rad_tl, 0); out.push(',');
+                format_flt(out, it.rad_tr, 0); out.push(',');
+                format_flt(out, it.rad_br, 0); out.push(',');
+                format_flt(out, it.rad_bl, 0);
+                out.append(" b ");
+                format_flt(out, it.border, 0);
+                out.push(' ');
+                format_uint(out, it.border_color, 16, 8, '0');
+                out.append(if it.border_style == BORDER_DASHED { " dashed" } else { " solid" });
+            }
             out.push('\n');
         }
     } else if probe == PROBE_BOXES {
@@ -573,6 +645,7 @@ fn main() {
     test_html();
     test_css();
     test_css_interface();
+    test_box();
     test_layout();
     test_snapshot();
     test_page();
