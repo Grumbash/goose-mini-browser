@@ -16,6 +16,7 @@ replacement.
 | [0007](0007-ai-tools-are-users.md) | AI tools are users | Proposed |
 | [0008](0008-boards-carry-profiles.md) | Boards carry profiles | Proposed |
 | [0009](0009-name-tusk.md) | The browser is called Tusk | Proposed |
+| [0010](0010-interface-as-a-document.md) | The interface is a document Goose rebuilds; pages run in tab workers | Proposed |
 
-All nine start as *Proposed*: Vlad made them on 29 and 30 October 2026, and they
+All ten start as *Proposed*: Vlad made them on 29 and 30 October 2026, and they
 become *Accepted* when Gleb merges them.

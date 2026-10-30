@@ -17,7 +17,8 @@ perfectly.
 
 ## Consequences
 
-- The interface waits for the layout it needs: flex and positioning (M2–M3).
+- The interface waits for the layout it needs: flex and positioning, moved into
+  M2 for it (ADR 0010).
   M1 ships the engine with a page and a minimal overlay, not the interface.
 - The design work lives outside this repository; it comes in as the HTML and CSS
   of the interface when the engine can draw it.
