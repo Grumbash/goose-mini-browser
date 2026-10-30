@@ -33,6 +33,7 @@ extern "tusk_platform" {
     fn tp_open(width: f64, height: f64, title: const u8&, title_len: i64) -> i32;
     fn tp_next_event(timeout_ms: i64, out: Event&) -> i32;
     fn tp_render(scroll: f32, background: u32) -> i32;
+    fn tp_start_metal() -> i32;
     fn tp_set_layer(layer: i32, items: const DItem[:], text: const u8[:], scale: f32) -> i32;
     fn tp_screenshot(path: const u8[:], width: f32, height: f32, scale: f32, scroll: f32, background: u32) -> i32;
     fn tp_frame_stats(out: FrameStats&, reset: bool) -> i32;
@@ -75,6 +76,7 @@ let SETTLE_MS: i64 = 5000;       // how long after a frame the bar weighs the pa
 let WHEEL_LINE: f32 = 40.0;      // points one line of a mouse wheel scrolls
 let LAYER_PAGE: i32 = 0;
 let LAYER_BAR: i32 = 1;
+let ERR_ARGUMENT: i32 = -4;      // platform/src/lib.rs
 let ERR_NO_DEVICE: i32 = -5;     // platform/src/lib.rs
 
 // The page once parsed, styled and measured: what layout at any width needs.
@@ -267,17 +269,29 @@ fn main() {
     let bg = background_of(P);
 
     if mode == MODE_SCREENSHOT {
+        // Metal is set up before the page is timed, as tp_open does for the
+        // window, so paint is the page's cost and not the setup's.
+        let metal = tp_start_metal();
+        guard metal == 0 else {
+            if metal == ERR_NO_DEVICE {
+                write_stderr("tusk: no screenshot: there is no Metal device\n");
+                exit(3);
+            }
+            write_stderr(str("tusk: no screenshot: Metal didn't start (error ", metal, ")\n"));
+            exit(1);
+            return;
+        }
         let scale: f32 = 2.0;
         let page_h = show_page(P, WINDOW_W, scale, cost);
         show_bar(P, path[name_start..], cost, WINDOW_W, WINDOW_H, scale);
         let y = clamp_scroll(at, page_h, WINDOW_H - BAR_H);
         let rc = tp_screenshot(shot, WINDOW_W, WINDOW_H, scale, y, bg);
         guard rc == 0 else {
-            if rc == ERR_NO_DEVICE {
-                write_stderr("tusk: no screenshot: there is no Metal device\n");
-                exit(3);
+            if rc == ERR_ARGUMENT {
+                write_stderr("tusk: no screenshot: the file can't be written\n");
+            } else {
+                write_stderr(str("tusk: no screenshot: drawing it failed (error ", rc, ")\n"));
             }
-            write_stderr("tusk: no screenshot: the file can't be written\n");
             exit(1);
             return;
         }
