@@ -446,7 +446,8 @@ pub struct Glyph {
     pub byte: u32, // the first byte of the character it came from
 }
 
-/// Shapes UTF-8 text with Core Text. Holds scratch space reused across calls.
+/// Shapes UTF-8 text with Core Text. Holds scratch space reused across calls,
+/// and, when a thread asks for one (tp_text_cache), the runs it has shaped.
 #[derive(Default)]
 pub struct Shaper {
     units: Vec<u16>,     // the text as UTF-16, which Core Text indexes by
@@ -455,6 +456,33 @@ pub struct Shaper {
     position_buf: Vec<CGPoint>,
     index_buf: Vec<CFIndex>,
     glyphs: Vec<Glyph>,
+    pub cache: ShapeCache,
+}
+
+/// Runs shaped before, by font and text: the interface is laid out again
+/// whenever it changes, and most of its text is what it was. Off (a limit of
+/// 0) unless a thread turns it on; when what it keeps would pass its limit,
+/// it starts again empty.
+#[derive(Default)]
+pub struct ShapeCache {
+    limit: usize,
+    bytes: usize,
+    runs: HashMap<Box<[u8]>, Shaped>, // by the font's index (4 bytes), then the text
+    key: Vec<u8>,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+/// A shaped run: its glyphs and its advance.
+type Shaped = (Box<[Glyph]>, f32);
+
+impl ShapeCache {
+    /// Keeps at most about `limit` bytes of runs from now on; 0 keeps none.
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+        self.runs.clear();
+        self.bytes = 0;
+    }
 }
 
 impl Shaper {
@@ -471,6 +499,42 @@ impl Shaper {
         if text.is_empty() {
             return Some(0.0);
         }
+        if self.cache.limit == 0 {
+            return self.shape_now(fonts, font, text, out);
+        }
+        let c = &mut self.cache;
+        c.key.clear();
+        c.key.extend_from_slice(&font.to_le_bytes());
+        c.key.extend_from_slice(text);
+        if let Some((glyphs, width)) = c.runs.get(c.key.as_slice()) {
+            c.hits += 1;
+            out.extend_from_slice(glyphs);
+            return Some(*width);
+        }
+        c.misses += 1;
+        let start = out.len();
+        let width = self.shape_now(fonts, font, text, out)?;
+        let c = &mut self.cache;
+        // What a run costs: its key, its glyphs and about as much again.
+        let cost = 2 * (c.key.len() + (out.len() - start) * std::mem::size_of::<Glyph>()) + 64;
+        if c.bytes + cost > c.limit {
+            c.runs.clear();
+            c.bytes = 0;
+        }
+        c.bytes += cost;
+        c.runs
+            .insert(c.key.as_slice().into(), (out[start..].into(), width));
+        Some(width)
+    }
+
+    /// shape, without the cache.
+    fn shape_now(
+        &mut self,
+        fonts: &mut Fonts,
+        font: u32,
+        text: &[u8],
+        out: &mut Vec<Glyph>,
+    ) -> Option<f32> {
         decode(text, &mut self.units, &mut self.unit_byte);
         let string = Cf::take(unsafe {
             CFStringCreateWithCharacters(null(), self.units.as_ptr(), self.units.len() as CFIndex)
@@ -1220,6 +1284,19 @@ pub extern "C" fn tp_font_metrics(font: i32, size: f32, out: *mut GpMetrics) -> 
 /// the advance of the whole text. Goose breaks lines with these: a word's width
 /// is the difference of two positions, so each text is shaped once however
 /// often the window's width changes.
+/// Keeps the runs this thread shapes, about `limit_bytes` of them at most, so
+/// that the same text in the same font is shaped once; 0 keeps none, the
+/// default. Worth it on a thread that lays out the same text again and again,
+/// as the interface's does.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_text_cache(limit_bytes: i64) -> i32 {
+    guarded(|| {
+        let limit = usize::try_from(limit_bytes).map_err(|_| ERR_ARGUMENT)?;
+        with_text(|t| t.shaper.cache.set_limit(limit));
+        Ok(0)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_text_carets(
     font: i32,
@@ -1629,5 +1706,40 @@ mod tests {
         assert!(e.w <= 202 && e.div <= 1, "{e:?}");
         // What shows is another mask than the whole bar's.
         assert_ne!(atlas.path(&bar, 0.0, 0, 0, 0, None), e);
+    }
+
+    #[test]
+    fn a_thread_with_a_shape_cache_shapes_each_run_once() {
+        with_text(|t| {
+            let f = t.fonts.get(0, 16.0).unwrap();
+            let g = t.fonts.get(0, 20.0).unwrap();
+            let shape = |t: &mut Text, font: u32, s: &[u8]| {
+                let mut out = Vec::new();
+                let w = t.shaper.shape(&mut t.fonts, font, s, &mut out).unwrap();
+                (out, w)
+            };
+            let plain = shape(t, f, b"Wild, not farmed.");
+            t.shaper.cache.set_limit(1 << 20);
+            let first = shape(t, f, b"Wild, not farmed.");
+            let again = shape(t, f, b"Wild, not farmed.");
+            assert_eq!(first, plain);
+            assert_eq!(again, plain);
+            assert_eq!((t.shaper.cache.hits, t.shaper.cache.misses), (1, 1));
+            // Another size is another font, and another text another run.
+            assert_ne!(shape(t, g, b"Wild, not farmed.").1, plain.1);
+            shape(t, f, b"Wild, not farmed");
+            assert_eq!((t.shaper.cache.hits, t.shaper.cache.misses), (1, 3));
+            // Past its limit it starts again empty.
+            t.shaper.cache.set_limit(600);
+            shape(t, f, b"Wild, not farmed.");
+            shape(t, f, b"A private browser on its own engine.");
+            shape(t, f, b"Wild, not farmed.");
+            assert_eq!(t.shaper.cache.misses, 6);
+            // Off, it keeps nothing.
+            t.shaper.cache.set_limit(0);
+            shape(t, f, b"Wild, not farmed.");
+            shape(t, f, b"Wild, not farmed.");
+            assert_eq!((t.shaper.cache.hits, t.shaper.cache.misses), (1, 6));
+        });
     }
 }
