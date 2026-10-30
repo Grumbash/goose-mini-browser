@@ -19,18 +19,21 @@ let IMPORT_DEPTH: i32 = 4;
 let WAVE_MS: i64 = 10000;
 
 // A sheet: the one that imports it (-1 for the page's own), how deep, its
-// URL (what its imports resolve against) and text as spans of the pool, and
-// its request while it runs (0 when none does).
-struct SheetFetch { parent: i32, depth: i32, url_at: i64, url_len: i64, text_at: i64, text_len: i64, req: i32 }
+// URL (what its imports resolve against), text and media (what its <link>,
+// <style> or @import says; empty: all) as spans of the pool, and its
+// request while it runs (0 when none does).
+struct SheetFetch { parent: i32, depth: i32, url_at: i64, url_len: i64, text_at: i64, text_len: i64, media_at: i64,
+                    media_len: i64, req: i32 }
 
 // The sheets of document `d`, at `page` (its URL; "file://..." for a file),
 // with relative URLs resolving against `base`: onto `texts`, one after
 // another in the cascade's order (each one's imports before it), each
-// ending where `ends` says, as load_sheets_with reads them. What went wrong goes on `log`, a line each.
-// What the main thread asks meanwhile goes in `later`. False if the tab
-// quits first.
+// ending where `ends` says, and the media each applies under onto `medias`,
+// and `media_ends`, as load_sheets_with reads them. What went wrong goes on
+// `log`, a line each. What the main thread asks meanwhile goes in `later`.
+// False if the tab quits first.
 fn gather_sheets(tab: i32, profile: i32, d: Doc, page: const u8[:], base: const u8[:], texts: u8[>..]&,
-                 ends: i64[>..]&, later: TabMsg[>..]&, log: u8[>..]&) -> bool {
+                 ends: i64[>..]&, medias: u8[>..]&, media_ends: i64[>..]&, later: TabMsg[>..]&, log: u8[>..]&) -> bool {
     var sources: i32[>..] = [];
     sheet_sources(d, sources);
     guard sources.len > 0 else { return true; }
@@ -39,7 +42,14 @@ fn gather_sheets(tab: i32, profile: i32, d: Doc, page: const u8[:], base: const 
     for n in sources {
         guard fetches.len < SHEETS_MAX else { break; }
         let k = fetches.len as i32;
-        fetches.push(SheetFetch { parent: -1, depth: 0, url_at: pool.len, url_len: 0, text_at: 0, text_len: 0, req: 0 });
+        fetches.push(SheetFetch { parent: -1, depth: 0, url_at: pool.len, url_len: 0, text_at: 0, text_len: 0, media_at: 0,
+                                  media_len: 0, req: 0 });
+        let media, has_media = attr_value(d, n, "media");
+        if has_media {
+            fetches[k].media_at = pool.len;
+            pool.append(trim(media));
+            fetches[k].media_len = pool.len - fetches[k].media_at;
+        }
         if node_name(d, n) == "style" {
             pool.append(base);
             fetches[k].url_len = base.len;
@@ -60,13 +70,21 @@ fn gather_sheets(tab: i32, profile: i32, d: Doc, page: const u8[:], base: const 
             guard fetches[k].depth < IMPORT_DEPTH && fetches[k].text_len > 0 else { continue; }
             var hrefs: u8[>..] = [];
             var href_ends: i64[>..] = [];
-            sheet_imports(pool[fetches[k].text_at..fetches[k].text_at + fetches[k].text_len], hrefs, href_ends);
+            var import_medias: u8[>..] = [];
+            var import_media_ends: i64[>..] = [];
+            sheet_imports(pool[fetches[k].text_at..fetches[k].text_at + fetches[k].text_len], hrefs, href_ends,
+                          import_medias, import_media_ends);
             var from: i64 = 0;
-            for e in href_ends {
+            var mfrom: i64 = 0;
+            for e, h in href_ends {
                 guard fetches.len < SHEETS_MAX else { break; }
                 let at = fetches.len as i32;
+                let media_at = pool.len;
+                pool.append(import_medias[mfrom..import_media_ends[h]]);
+                mfrom = import_media_ends[h];
                 fetches.push(SheetFetch { parent: k as i32, depth: fetches[k].depth + 1, url_at: pool.len, url_len: 0,
-                                          text_at: 0, text_len: 0, req: 0 });
+                                          text_at: 0, text_len: 0, media_at: media_at, media_len: pool.len - media_at,
+                                          req: 0 });
                 var url: u8[>..] = [];
                 url.append(pool[fetches[k].url_at..fetches[k].url_at + fetches[k].url_len]);
                 start_sheet(tab, profile, page, url[..], hrefs[from..e], fetches, at, pool, log);
@@ -76,16 +94,57 @@ fn gather_sheets(tab: i32, profile: i32, d: Doc, page: const u8[:], base: const 
         guard fetches.len > wave_to else { break; }
         wave_from = wave_to;
     }
-    for f, k in fetches { if f.parent < 0 { put_sheet(fetches[..], pool[..], k as i32, texts, ends); } }
+    put_sheets(fetches[..], pool[..], texts, ends, medias, media_ends);
     return true;
 }
 
-// Sheet k's imports, then sheet k, onto `out`, each ending where `ends` says.
-recursive fn put_sheet(fetches: const SheetFetch[:], pool: const u8[:], k: i32, out: u8[>..]&, ends: i64[>..]&) {
-    for f, j in fetches { if f.parent == k { put_sheet(fetches, pool, j as i32, out, ends); } }
-    let f = fetches[k];
-    out.append(pool[f.text_at..f.text_at + f.text_len]);
-    ends.push(out.len);
+// The sheets onto `out`, each ending where `ends` says, every one's imports
+// before it; and onto `medias` the media each applies under: those of the
+// sheets that import it, outermost first, then its own, apart by U+0001. A
+// sheet comes after the one importing it in `fetches`, at most IMPORT_DEPTH
+// below a page's own, so its chain is made from its parent's, and a stack
+// that deep walks each page's sheet's imports first.
+fn put_sheets(fetches: const SheetFetch[:], pool: const u8[:], out: u8[>..]&, ends: i64[>..]&, medias: u8[>..]&,
+              media_ends: i64[>..]&) {
+    var chains: u8[>..] = [];
+    var chain_at: i64[>..] = [];
+    var chain_len: i64[>..] = [];
+    for f in fetches {
+        let at = chains.len;
+        if f.parent >= 0 { chains.append(chains[chain_at[f.parent]..chain_at[f.parent] + chain_len[f.parent]]); }
+        if f.media_len > 0 {
+            if chains.len > at { chains.push(0x01); }
+            chains.append(pool[f.media_at..f.media_at + f.media_len]);
+        }
+        chain_at.push(at);
+        chain_len.push(chains.len - at);
+    }
+    var stack: i32[8];
+    var scan: i64[8];
+    for f, root in fetches {
+        guard f.parent < 0 else { continue; }
+        stack[0] = root as i32;
+        scan[0] = root + 1;
+        var top: i64 = 1;
+        while top > 0 {
+            let n = stack[top - 1];
+            var j = scan[top - 1];
+            while j < fetches.len && fetches[j].parent != n { j += 1; }
+            if j < fetches.len && top < 8 {
+                scan[top - 1] = j + 1;
+                stack[top] = j as i32;
+                scan[top] = j + 1;
+                top += 1;
+                continue;
+            }
+            let g = fetches[n];
+            out.append(pool[g.text_at..g.text_at + g.text_len]);
+            ends.push(out.len);
+            medias.append(chains[chain_at[n]..chain_at[n] + chain_len[n]]);
+            media_ends.push(medias.len);
+            top -= 1;
+        }
+    }
 }
 
 // Starts fetching sheet k, `href` against `base`. A page from the web loads

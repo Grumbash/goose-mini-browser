@@ -761,8 +761,9 @@ fn show_doc(html: const u8[:], w: f32, h: f32, scale: f32, layer: i32, slot: Rec
     var sel_attrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sel_attrs, decls: decls, bytes: sheet_bytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);

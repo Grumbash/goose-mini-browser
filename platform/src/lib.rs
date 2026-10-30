@@ -952,6 +952,16 @@ pub(crate) fn post_to_main(kind: i32, code: i32) {
     });
 }
 
+/// 1 when the system is in dark mode, 0 when it is light. Any thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_dark_mode() -> i32 {
+    guarded(|| {
+        let key = NSString::from_str("AppleInterfaceStyle");
+        let style = NSUserDefaults::standardUserDefaults().stringForKey(&key);
+        Ok(style.is_some_and(|s| s.to_string().eq_ignore_ascii_case("dark")) as i32)
+    })
+}
+
 /// Sets the window's title to `title`, UTF-8.
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_set_title(title: GSlice<u8>) -> i32 {

@@ -45,12 +45,18 @@ fn base_of(src: const u8[:]) -> u8[>..] {
 fn imports_of(src: const u8[:]) -> u8[>..] {
     var hrefs: u8[>..] = [];
     var ends: i64[>..] = [];
-    sheet_imports(src, hrefs, ends);
+    var medias: u8[>..] = [];
+    var media_ends: i64[>..] = [];
+    sheet_imports(src, hrefs, ends, medias, media_ends);
     var out: u8[>..] = [];
     var from: i64 = 0;
-    for e in ends {
-        format(out, "[", hrefs[from..e], "]");
+    var mfrom: i64 = 0;
+    for e, k in ends {
+        format(out, "[", hrefs[from..e]);
+        if media_ends[k] > mfrom { format(out, " ", medias[mfrom..media_ends[k]]); }
+        out.append("]");
         from = e;
+        mfrom = media_ends[k];
     }
     return out;
 }
@@ -81,9 +87,86 @@ fn test_sheets() {
     check("a sheet's @imports: before its first rule, after @charset, for the screen",
           imports_of(str("@charset \"utf-8\";\n/* c */ @import url(a.css); @import \"b.css\" screen; @import url('c;.css');",
                          "@import url(p.css) print; @IMPORT 'e.css'; p { color: red } @import url(late.css);")[..]),
-          "[a.css][b.css][c;.css][e.css]");
+          "[a.css][b.css screen][c;.css][e.css]");
     check("a sheet with no imports has none", imports_of("p { color: red }"), "");
     check("an @import after a rule is no import", imports_of("@media screen { p {} } @import url(x.css);"), "");
+}
+
+fn mq(q: const u8[:], w: f32, h: f32, dark: bool) -> u8[>..] {
+    return str(if media_matches(q, MediaEnv { width: w, height: h, scale: 2.0, dark: dark }) { "on" } else { "off" });
+}
+
+// The colour of each <p> of `src`, its sheets styled for a viewport `w` wide,
+// then for one `w2` wide: whether that restyled anything, and the colours.
+fn colours_at(src: const u8[:], w: f32, w2: f32) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes, media: media };
+    // A sheet imported by a linked one, its media from the <link> and the
+    // @import; the linked one; and one with @media and @supports blocks, as
+    // the worker hands them over.
+    let ends: i64[3] = [19, 38, 240];
+    let media_ends: i64[3] = [25, 31, 31];
+    load_sheets_with(d, sh, str("p.i { color: #0f0 }", "p.l { color: #00f }",
+                                "@media (min-width: 900px) { p.w { color: #f00 } } @supports (display: flex) { p.s { color: #0ff } } @supports (display: nonsense) { p.n { color: #f0f } } @supports not (foo: bar) { p.x { color: #ff0 } }")[..],
+                     ends[..], "screen\x01(max-width: 700px)screen", media_ends[..]);
+    var out: u8[>..] = [];
+    var styles: Style[>..] = [];
+    for pass in 2 {
+        let width = if pass == 0 { w } else { w2 };
+        let changed = set_media(sh, MediaEnv { width: width, height: 800.0, scale: 2.0, dark: false });
+        compute_styles(d, sh, styles);
+        if pass == 1 { out.append(if changed { "restyled:" } else { "same:" }); }
+        for n, i in nodes {
+            guard n.kind == NODE_ELEMENT && node_name(d, i as i32) == "p" else { continue; }
+            format_int(out, styles[i].color & 0xFFFFFF, 16, 6, '0');
+            out.push(' ');
+        }
+        out.push('|');
+    }
+    return out;
+}
+
+fn test_media() {
+    check("min-width and max-width at 800", str(mq("(min-width: 768px)", 800.0, 600.0, false), mq("(max-width: 50em)", 800.0, 600.0, false)), "onon");
+    check("past them", str(mq("(min-width: 801px)", 800.0, 600.0, false), mq("(max-width: 49em)", 800.0, 600.0, false)), "offoff");
+    check("a type, and, and a list", str(mq("screen and (min-width: 600px)", 800.0, 600.0, false),
+                                         mq("print and (min-width: 600px)", 800.0, 600.0, false),
+                                         mq("print, (orientation: landscape)", 800.0, 600.0, false)), "onoffon");
+    check("not and only", str(mq("not print", 800.0, 600.0, false), mq("not screen and (min-width: 1px)", 800.0, 600.0, false),
+                              mq("only screen and (max-width: 900px)", 800.0, 600.0, false)), "onoffon");
+    check("ranges", str(mq("(width >= 800px)", 800.0, 600.0, false), mq("(400px < width <= 700px)", 800.0, 600.0, false),
+                        mq("(500px <= width < 900px)", 800.0, 600.0, false), mq("(height > 700px)", 800.0, 600.0, false)),
+          "onoffonoff");
+    check("dark mode, hover and a fine pointer",
+          str(mq("(prefers-color-scheme: dark)", 800.0, 600.0, true), mq("(prefers-color-scheme: dark)", 800.0, 600.0, false),
+              mq("(hover: hover) and (pointer: fine)", 800.0, 600.0, false)), "onoffon");
+    check("no scripts, and the backing scale",
+          str(mq("(scripting: none)", 800.0, 600.0, false), mq("(min-resolution: 2dppx)", 800.0, 600.0, false),
+              mq("(-webkit-min-device-pixel-ratio: 3)", 800.0, 600.0, false)), "ononoff");
+    check("what Tusk can't read is off", str(mq("(min-width: 10furlongs)", 800.0, 600.0, false),
+                                             mq("screen and", 800.0, 600.0, false), mq("(unknown-feature)", 800.0, 600.0, false),
+                                             mq("(min-width: 1px) and (max-width: 2000px) or (color)", 800.0, 600.0, false)),
+          "offoffoffoff");
+    let page = "<p class=i>i<p class=l>l<p class=w>w<p class=s>s<p class=n>n<p class=x>x";
+    check("@media turns on and off with the width, inside the media of the <link> and the @import; @supports by what Tusk reads",
+          colours_at(page, 600.0, 1000.0),
+          "00ff00 0000ff 1c1c1c 00ffff 1c1c1c ffff00 |restyled:1c1c1c 0000ff ff0000 00ffff 1c1c1c ffff00 |");
+    check("a width that flips nothing restyles nothing", colours_at(page, 1000.0, 1100.0),
+          "1c1c1c 0000ff ff0000 00ffff 1c1c1c ffff00 |same:1c1c1c 0000ff ff0000 00ffff 1c1c1c ffff00 |");
 }
 
 fn test_html() {
@@ -147,8 +230,9 @@ fn style_at(src: const u8[:], name: const u8[:], k: i64, font: bool) -> u8[>..] 
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -199,8 +283,9 @@ fn restyled(src: const u8[:], name: const u8[:]) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var first: Style[>..] = [];
     compute_styles(d, sh, first);
@@ -231,8 +316,9 @@ fn var_bytes_of(src: const u8[:]) -> i64 {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -255,8 +341,9 @@ fn styled_tree(src: const u8[:]) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -988,8 +1075,9 @@ fn hits_of(src: const u8[:], xs: const f32[:], ys: const f32[:]) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -1347,8 +1435,9 @@ fn svg_paints(src: const u8[:]) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -1505,8 +1594,9 @@ fn weights_of(src: const u8[:], name: const u8[:]) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -1567,8 +1657,9 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -2019,6 +2110,7 @@ fn test_page() {
 
 fn main() {
     test_sheets();
+    test_media();
     // The bundled fonts, as the app registers them; run from the repository.
     var fonts: u8[>..] = [];
     format(fonts, tp_register_fonts("app/fonts"));

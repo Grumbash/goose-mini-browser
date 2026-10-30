@@ -100,8 +100,9 @@ let LOAD_QUIT: i32 = 2;      // the tab closed meanwhile
 fn ms_since(from: i64) -> f32 { return ((clock_ns() - from) / 1000000.0) as f32; }
 
 // Tab `tab`'s worker, for the page at `loc`: a file's path, or an http or
-// https URL, loaded on profile `profile`'s session.
-thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32) {
+// https URL, loaded on profile `profile`'s session. Its media queries see
+// dark mode when `dark` says so.
+thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32, dark: bool) {
     var src: u8[>..] = [];
     var later: TabMsg[>..] = [];     // what the main thread asked while the page came
     var page: u8[>..] = [];          // the page's URL, after redirects
@@ -134,8 +135,11 @@ thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32) {
     doc_base(d, page[..], base);
     var sheet_texts: u8[>..] = [];
     var sheet_ends: i64[>..] = [];
+    var sheet_medias: u8[>..] = [];
+    var sheet_media_ends: i64[>..] = [];
     var log: u8[>..] = [];
-    guard gather_sheets(tab, profile, d, page[..], base[..], sheet_texts, sheet_ends, later, log) else { return; }
+    guard gather_sheets(tab, profile, d, page[..], base[..], sheet_texts, sheet_ends, sheet_medias, sheet_media_ends,
+                        later, log) else { return; }
     if log.len > 0 { tp_post_reply(tab, REPLY_LOG, 0, log[..]); }
     info.read += ms_since(t);
     t = clock_ns();
@@ -147,9 +151,15 @@ thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32) {
     var sel_attrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sel_attrs, decls: decls, bytes: sheet_bytes,
-                     vars: vars, var_bytes: var_bytes };
-    load_sheets_with(d, sh, sheet_texts[..], sheet_ends[..]);
+                     vars: vars, var_bytes: var_bytes, media: media };
+    load_sheets_with(d, sh, sheet_texts[..], sheet_ends[..], sheet_medias[..], sheet_media_ends[..]);
+    // Styled for the viewport the main thread asked for while the page came,
+    // or else the design's window.
+    var env = MediaEnv { width: 1200.0, height: 760.0, scale: 2.0, dark: dark };
+    for m in later { if m.kind == MSG_SIZE { env = MediaEnv { width: m.a, height: m.b, scale: m.c, dark: dark }; } }
+    set_media(sh, env);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
     info.style = ms_since(t);
@@ -175,7 +185,7 @@ thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32) {
     var elems: u8[>..] = [];
     elements_of(d, elems);
     tp_post_reply(tab, REPLY_ELEMENTS, 0, elems[..]);
-    serve(tab, P, info, later[..]);
+    serve(tab, P, sh, env, info, later[..]);
 }
 
 // Loads the document at `url` on profile `profile`'s session into `src`, as
@@ -314,8 +324,11 @@ fn one_line(out: u8[>..]&, s: const u8[:], max: i64) {
 
 // Answers the main thread for page P until it says quit: a display list for
 // each size, the pointer's shape for each point, a tree for each snapshot.
-// What it asked while the page came, `later`, is answered first.
-fn serve(tab: i32, P: Page, info: FrameInfo&, later: const TabMsg[:]) {
+// What it asked while the page came, `later`, is answered first. A size that
+// turns one of its sheets' @media on or off styles and measures it again
+// first, against sheets `sh`, for viewport `env`.
+fn serve(tab: i32, P: Page, sh: Sheet, env: MediaEnv, info: FrameInfo&, later: const TabMsg[:]) {
+    var viewport = env;
     var items: DItem[>..<] = [];     // the display list as laid out last, for hit tests
     var bounds: f32[>..<] = [];      // where its items are: made at the first hit test after a layout
     var bounded = false;
@@ -334,6 +347,19 @@ fn serve(tab: i32, P: Page, info: FrameInfo&, later: const TabMsg[:]) {
         }
         if m.kind == MSG_QUIT { return; }
         if m.kind == MSG_SIZE {
+            viewport = MediaEnv { width: m.a, height: m.b, scale: m.c, dark: viewport.dark };
+            if set_media(sh, viewport) {
+                let t0 = clock_ns();
+                compute_styles(P.d, sh, P.styles);
+                info.style = ms_since(t0);
+                // Measured again: new runs go after the old, and each node
+                // points at its new one. The old stay until the page goes, a
+                // copy of its text for each flip.
+                let t1 = clock_ns();
+                measure_page(P);
+                info.measure = ms_since(t1);
+                info.background = background_of(P);
+            }
             let t = clock_ns();
             info.height = lay_out(P, items, paths, m.a, m.b);
             info.layout = ms_since(t);

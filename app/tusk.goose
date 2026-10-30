@@ -80,6 +80,7 @@ extern "tusk_platform" {
     fn tp_set_cursor(kind: i32) -> i32;
     fn tp_set_title(title: const u8[:]) -> i32;
     fn tp_text_cache(limit_bytes: i64) -> i32;
+    fn tp_dark_mode() -> i32;
 }
 
 // Event kinds, as numbered in platform/src/lib.rs.
@@ -399,6 +400,8 @@ fn main() {
     tp_register_fonts(str(resource_dir(), "fonts")[..]);
     // The window's pages are ours; what a test or a picture loads keeps nothing.
     let profile = if mode == MODE_WINDOW { PROFILE_DEFAULT } else { PROFILE_SANDBOX };
+    // Pages see the system's dark mode in the window; a picture or a test, light.
+    let dark = mode == MODE_WINDOW && tp_dark_mode() == 1;
 
     // A worker per page, at once: each loads while the window opens. Where
     // each page is, and later its title and the rest, are notes the tabs
@@ -412,7 +415,7 @@ fn main() {
         let info = FrameInfo { height: 0.0, background: 0xFFFFFFFF, nodes: 0, bytes: 0, parse: 0.0, style: 0.0,
                                measure: 0.0, layout: 0.0, scale: 1.0, read: 0.0 };
         let opened = clock_ns();
-        let worker = thread_spawn_contained(tab_worker, k as i32, str(paths[start..end]), profile);
+        let worker = thread_spawn_contained(tab_worker, k as i32, str(paths[start..end]), profile, dark);
         tabs.push(Tab { worker: worker, ready: false, failed: false, info: info, paint: 0.0, waiting: false, scroll: 0.0,
                         opened: opened, load_ms: 0.0, status: 0, loc_at: start, loc_len: end - start, title_at: 0,
                         title_len: 0, why_at: 0, why_len: 0, log_at: 0, log_len: 0, elems_at: 0, elems_len: 0 });
