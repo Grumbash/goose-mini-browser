@@ -196,13 +196,18 @@ vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
 
 // The signed distance from p (from the top left) to the edge of a rectangle
 // `size` big with corner radii r (top left, top right, bottom right, bottom
-// left): negative inside.
+// left): negative inside. Each corner's arc counts wherever p is in its
+// square, which may reach past the middle: CSS lets one radius take most of
+// a side when the corner next to it is square.
 float rounded_rect(float2 p, float2 size, float4 r) {
-    float2 half_size = size * 0.5;
-    float2 c = p - half_size;
-    float rad = c.x < 0.0 ? (c.y < 0.0 ? r.x : r.w) : (c.y < 0.0 ? r.y : r.z);
-    float2 q = abs(c) - half_size + rad;
-    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - rad;
+    float2 q = abs(p - size * 0.5) - size * 0.5;
+    float d = min(max(q.x, q.y), 0.0) + length(max(q, 0.0));
+    float2 far = size - p;
+    if (p.x < r.x && p.y < r.x) { d = max(d, length(p - r.x) - r.x); }
+    if (far.x < r.y && p.y < r.y) { d = max(d, length(float2(far.x, p.y) - r.y) - r.y); }
+    if (far.x < r.z && far.y < r.z) { d = max(d, length(far - r.z) - r.z); }
+    if (p.x < r.w && far.y < r.w) { d = max(d, length(float2(p.x, far.y) - r.w) - r.w); }
+    return d;
 }
 
 fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[texture(0)]]) {
@@ -1152,6 +1157,23 @@ mod tests {
         assert_eq!(at(12, 8), [255, 255, 255, 255]); // past it: the background
         assert_eq!(at(24, 8), [255, 0, 0, 255]); // the circle's middle: blue
         assert_eq!(at(16, 0), [255, 255, 255, 255]); // its corner, rounded away
+    }
+
+    #[test]
+    fn a_corner_rounds_past_the_middle() {
+        // A red box 40 × 20 with only its top left corner rounded, by 16: more
+        // than half its height. Its arc still curves away below the middle,
+        // where the corner below it is square.
+        let mut item = boxed(0.0, 0.0, 40.0, 20.0, 0xFFFF_0000, 0.0, 0.0, 0, BORDER_SOLID);
+        item.rad_tl = 16.0;
+        let Some(p) = drawn(&[item], 40, 20) else {
+            eprintln!("no Metal device here: corners aren't checked");
+            return;
+        };
+        let at = |x: usize, y: usize| &p[(y * 40 + x) * 4..(y * 40 + x) * 4 + 4];
+        assert!(at(0, 10)[0] > 200, "{:?}", at(0, 10)); // outside the arc, below the middle: the background
+        assert_eq!(at(2, 14), [0, 0, 255, 255]); // inside it: red
+        assert_eq!(at(0, 19), [0, 0, 255, 255]); // the square corner below
     }
 
     #[test]
