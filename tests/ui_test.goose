@@ -72,23 +72,16 @@ fn doc_for(title: const u8[:], path: const u8[:], w: f32, out: u8[>..]&) {
     var rest: u8[>..] = [];
     var run: u8[>..] = [];
     let F = UiFiles { css: css, sprite: sprite, rest: rest, run: run };
-    var paths: u8[>..] = [];
-    paths.append(path);
-    var path_ends: i64[>..] = [];
-    path_ends.push(paths.len);
-    var names: i64[>..] = [];
-    var name: i64 = 0;
-    for c, j in paths { if c == '/' { name = j + 1; } }
-    names.push(name);
     var notes: u8[>..] = [];
+    notes.append(path);
     notes.append(title);
-    let T = UiText { paths: paths, path_ends: path_ends, names: names, notes: notes };
+    let T = UiText { notes: notes };
     let info = FrameInfo { height: 100.0, background: 0xFFFFFFFF, nodes: 10, bytes: 2000, parse: 1.0, style: 1.0,
                            measure: 1.0, layout: 1.0, scale: 2.0, read: 1.0 };
     var tabs: Tab[>..] = [];
     tabs.push(Tab { worker: 0, ready: true, failed: false, info: info, paint: 1.0, waiting: false, scroll: 0.0,
-                    opened: 0, load_ms: 4.0, title_at: 0, title_len: title.len, why_at: 0, why_len: 0, elems_at: 0,
-                    elems_len: 0 });
+                    opened: 0, load_ms: 4.0, status: 0, loc_at: 0, loc_len: path.len, title_at: path.len,
+                    title_len: title.len, why_at: 0, why_len: 0, elems_at: 0, elems_len: 0 });
     let U = Ui { w: w, h: 760.0, lights: 0.0, cur: 0, dev: true, dev_tab: DEV_CONSOLE, oil: 50.0, mac_used: 12288.0, mac_total: 24576.0, cpu: 1.0, mac_cpu: 12.0, fps: 0,
                  running: false };
     ui_html(F, U, tabs, T, [], 0, 1.0, out);
@@ -123,6 +116,16 @@ fn test_document() {
     doc_for("", long[..], 700.0, narrow);
     yes("where only its file's name fits, that shows", find(narrow[..], "…/<b>page.html</b>") >= 0);
     yes("an empty title is the file's name", find(narrow[..], "<b>page.html</b><span class=\"host\">") >= 0);
+    yes("the badge says FILE, and the scheme isn't said again", find(narrow[..], "FILE</span><span class=\"u\">…/") >= 0
+        && find(narrow[..], "file://") < 0);
+    var web: u8[>..] = [];
+    doc_for("", "https://en.wikipedia.org/wiki/Focaccia", 1200.0, web);
+    yes("a web page: its scheme in the badge, its host in bold, then its path",
+        find(web[..], "<span class=\"env\">HTTPS</span><span class=\"u\"><b>en.wikipedia.org</b>/wiki/Focaccia</span>") >= 0);
+    var local: u8[>..] = [];
+    doc_for("", "http://localhost:5173/", 1200.0, local);
+    yes("one on this Mac says LOCAL, then its scheme",
+        find(local[..], "LOCAL</span><span class=\"u\"><i>http://</i><b>localhost</b><em>:5173</em>/</span>") >= 0);
 }
 
 fn test_urls() {

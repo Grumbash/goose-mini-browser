@@ -35,10 +35,9 @@ struct Ui {
     oil: f32, mac_used: f32, mac_total: f32, cpu: f32, mac_cpu: f32, fps: i32, running: bool,
 }
 
-// What it reads of the main thread's strings: the pages' paths, one after
-// another, where each ends and where its file name starts; and the notes the
-// tabs' spans point into (Tab).
-struct UiText { paths: u8[>..]&, path_ends: i64[>..]&, names: i64[>..]&, notes: u8[>..]& }
+// What it reads of the main thread's strings: the notes the tabs' spans
+// point into (Tab).
+struct UiText { notes: u8[>..]& }
 
 // The dev panel's tabs.
 let DEV_CONSOLE: i32 = 0;
@@ -98,18 +97,65 @@ fn drop_icon(out: u8[>..]&) {
 }
 
 fn note(T: UiText, at: i64, len: i64) -> const u8[:] { return T.notes[at..at + len]; }
-fn path_of(T: UiText, k: i64) -> const u8[:] { return T.paths[(if k == 0 { 0 } else { T.path_ends[k - 1] })..T.path_ends[k]]; }
-fn name_of(T: UiText, k: i64) -> const u8[:] { return T.paths[T.names[k]..T.path_ends[k]]; }
 
-// What a tab is called: its title, or else its file's name.
-fn title_of(t: Tab, T: UiText, k: i64) -> const u8[:] {
-    return if t.title_len > 0 { note(T, t.title_at, t.title_len) } else { name_of(T, k) };
+// Where tab t is: its file's path, or its page's URL.
+fn loc_of(t: Tab, T: UiText) -> const u8[:] { return note(T, t.loc_at, t.loc_len); }
+
+// Where the host of web address `loc` starts and ends, its port included:
+// past "://", up to the path. For a file's path, 0 and 0.
+fn host_span(loc: const u8[:]) -> i64, i64 {
+    let s = find(loc, "://");
+    guard s > 0 else { return 0, 0; }
+    var a = s + 3;
+    var b = a;
+    while b < loc.len && loc[b] != '/' && loc[b] != '?' && loc[b] != '#' {
+        if loc[b] == '@' { a = b + 1; }      // past a user's name and password
+        b += 1;
+    }
+    return a, b;
 }
 
-// The board the pages are on: the folder the first one is in.
-fn board_of(T: UiText) -> const u8[:] {
-    let p = path_of(T, 0);
-    let end = T.names[0] - 1;
+// Where the last step of `loc`'s path starts: past its last '/' before any
+// query or fragment.
+fn last_step(loc: const u8[:]) -> i64 {
+    var end = loc.len;
+    for c, j in loc { if (c == '?' || c == '#') && j < end { end = j; break; } }
+    var name: i64 = 0;
+    for j in 0..end { if loc[j] == '/' { name = j + 1; } }
+    return name;
+}
+
+// What tab t's page is called without a title: its file's name, or the last
+// step of its URL's path, or its host.
+fn name_of(t: Tab, T: UiText) -> const u8[:] {
+    let loc = loc_of(t, T);
+    let h0, h1 = host_span(loc);
+    let name = last_step(loc);
+    var end = loc.len;
+    for c, j in loc { if (c == '?' || c == '#') && j >= name { end = j; break; } }
+    if h1 > h0 && (name <= h1 || name >= end) { return loc[h0..h1]; }
+    return loc[name..end];
+}
+
+// Where tab t's page comes from, for its header: its host, or its file's name.
+fn site_of(t: Tab, T: UiText) -> const u8[:] {
+    let loc = loc_of(t, T);
+    let h0, h1 = host_span(loc);
+    return if h1 > h0 { loc[h0..h1] } else { name_of(t, T) };
+}
+
+// What a tab is called: its title, or else name_of.
+fn title_of(t: Tab, T: UiText) -> const u8[:] {
+    return if t.title_len > 0 { note(T, t.title_at, t.title_len) } else { name_of(t, T) };
+}
+
+// The board the pages are on: the folder the first one is in, or the host
+// of its page.
+fn board_of(tabs: const Tab[:], T: UiText) -> const u8[:] {
+    let p = loc_of(tabs[0], T);
+    let h0, h1 = host_span(p);
+    guard h1 <= h0 else { return p[h0..h1]; }
+    let end = last_step(p) - 1;
     var start: i64 = 0;
     guard end > 0 else { return "Pages"; }
     for j in 0..end { if p[j] == '/' { start = j + 1; } }
@@ -133,7 +179,7 @@ fn ui_html(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, frames: const f32[:
     let t = tabs[U.cur];
     let cw = if U.dev { max(U.w - DEV_W, 0.0) } else { U.w };
     let ch = max(U.h - BAR_H - PANEL_H, 0.0);
-    bar(out, U, t, T);
+    bar(out, U, tabs, T);
     content(out, U, t, T, cw, ch);
     if U.dev { dev_panel(out, U, tabs, T, cw, ch, frames, dropped, rebuild_ms); }
     panel(out, F, U, tabs, T);
@@ -142,14 +188,15 @@ fn ui_html(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, frames: const f32[:
 
 // The top bar: the board, back, forward, reload, the address; then board
 // view, the command bar and the dev panel's switch.
-fn bar(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
+fn bar(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText) {
+    let t = tabs[U.cur];
     // The design leaves the traffic lights up to 72 points; AppKit's own may
     // need more, and the plate, the arrows and the address make way.
     let shift = max(U.lights + 10.0 - 72.0, 0.0);
     out.append("<div class=\"bar\" data-drag><span class=\"plate\" data-nodrag style=\"left:");
     px(out, 72.0 + shift);
     out.append("\"><span class=\"bn\">");
-    esc(out, board_of(T));
+    esc(out, board_of(tabs, T));
     out.append("</span>");
     icon(out, "i-chev-r");
     out.append("</span><span class=\"nav\" data-nodrag style=\"left:");
@@ -163,12 +210,64 @@ fn bar(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
     px(out, 290.0 + shift);
     out.append("; width:");
     px(out, url_w);
-    out.append("\"><span class=\"env\">FILE</span><span class=\"u\"><i>file://</i>");
-    let p = path_of(T, U.cur);
-    let name = T.names[U.cur] - (if U.cur == 0 { 0 } else { T.path_ends[U.cur - 1] });
-    // A long path loses its start, from a folder on, so that the file's name
-    // shows: about 7.5 points a character, after the badge and the scheme.
-    let room = ((url_w - 120.0) / 7.5) as i64;
+    out.append("\">");
+    address(out, loc_of(t, T), ((url_w - 120.0) / 7.5) as i64);
+    out.append("</span><span class=\"tools\" data-nodrag><span class=\"bv\">");
+    icon(out, "i-grid");
+    out.append("<kbd>⌘B</kbd></span><kbd>⌘K</kbd><span");
+    if U.dev { out.append(" class=\"on\""); }
+    out.append(">");
+    icon(out, "i-code");
+    out.append("</span></span></div>");
+}
+
+// Where a page is, in the bar, as `room` characters at most fit (about 7.5
+// points each, after the badge). The badge says what the address doesn't, so
+// the scheme isn't written again after it. A file: FILE, and its path, which
+// loses its start from a folder on so that its name shows. A web page: HTTPS
+// or HTTP, its host in bold, its port, and its path, which loses its end; on
+// this Mac, LOCAL, and then its scheme, which LOCAL doesn't say.
+fn address(out: u8[>..]&, p: const u8[:], room: i64) {
+    let h0, h1 = host_span(p);
+    if h1 > h0 {
+        var host_end = h1;
+        for j in h0..h1 { if p[j] == ':' { host_end = j; } }
+        if host_end < h1 && p[h1 - 1] == ']' { host_end = h1; }  // an IPv6 address, no port
+        let host = p[h0..host_end];
+        let local = host == "localhost" || host == "127.0.0.1" || host == "[::1]" || ends_with(host, ".localhost");
+        out.append("<span class=\"env\">");
+        if local { out.append("LOCAL"); }
+        else { for c in p[..h0 - 3] { out.push(if c >= 'a' && c <= 'z' { c - 32 } else { c }); } }
+        out.append("</span><span class=\"u\">");
+        if local {
+            out.append("<i>");
+            esc(out, p[..h0]);
+            out.append("</i>");
+        }
+        out.append("<b>");
+        esc(out, host);
+        out.append("</b>");
+        if host_end < h1 {
+            out.append("<em>");
+            esc(out, p[host_end..h1]);
+            out.append("</em>");
+        }
+        let rest = p[h1..];
+        let left = room - (h1 - h0);
+        if rest.len > left && left > 1 {
+            // Cut before a character, not inside one.
+            var cut = left - 1;
+            while cut > 0 && (rest[cut] & 0xC0) == 0x80 { cut -= 1; }
+            esc(out, rest[..cut]);
+            out.append("…");
+        } else {
+            esc(out, rest);
+        }
+        out.append("</span>");
+        return;
+    }
+    out.append("<span class=\"env\">FILE</span><span class=\"u\">");
+    let name = last_step(p);
     var from: i64 = 0;
     if p.len > room {
         from = min(p.len - room, name);
@@ -178,13 +277,7 @@ fn bar(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
     esc(out, p[from..name]);
     out.append("<b>");
     esc(out, p[name..]);
-    out.append("</b></span></span><span class=\"tools\" data-nodrag><span class=\"bv\">");
-    icon(out, "i-grid");
-    out.append("<kbd>⌘B</kbd></span><kbd>⌘K</kbd><span");
-    if U.dev { out.append(" class=\"on\""); }
-    out.append(">");
-    icon(out, "i-code");
-    out.append("</span></span></div>");
+    out.append("</b></span>");
 }
 
 // The content: the page in focus, its header over its slot.
@@ -200,9 +293,9 @@ fn content(out: u8[>..]&, U: Ui, t: Tab, T: UiText, cw: f32, ch: f32) {
     out.append("\"><div class=\"pgh focus\"><span class=\"fv\">");
     icon(out, "i-globe");
     out.append("</span><b>");
-    esc(out, title_of(t, T, U.cur));
+    esc(out, title_of(t, T));
     out.append("</b><span class=\"host\">");
-    esc(out, name_of(T, U.cur));
+    esc(out, site_of(t, T));
     out.append("</span><span class=\"pgr\">");
     if t.failed { out.append("<span class=\"sdot er\" aria-label=\"1 error\">1</span>"); }
     else if t.ready { out.append("<span class=\"sdot ok\" aria-label=\"Loaded\"></span>"); }
@@ -263,7 +356,10 @@ fn page_line(out: u8[>..]&, t: Tab) {
         out.append("</b> ms</span>");
         return;
     } else {
-        out.append("<span class=\"st ok\">OK</span><span><b>1</b> req</span><span><b>");
+        // An HTTP error is a page too: it shows, with its status.
+        if t.status >= 400 { format(out, "<span class=\"st er\">", t.status, "</span>"); }
+        else { out.append("<span class=\"st ok\">OK</span>"); }
+        out.append("<span><b>1</b> req</span><span><b>");
         format_flt(out, t.info.bytes / 1000.0, 1);
         out.append("</b> KB</span><span><b>0</b> err</span>");
     }
@@ -279,7 +375,8 @@ fn console(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
         esc(out, note(T, t.why_at, t.why_len));
         out.append("</span><em>tusk</em></p>");
     } else if t.ready {
-        out.append("<p class=\"cl inf\"><span class=\"x\"></span><span class=\"msg\">Read ");
+        out.append("<p class=\"cl inf\"><span class=\"x\"></span><span class=\"msg\">");
+        out.append(if t.status > 0 { "Loaded " } else { "Read " });
         format_flt(out, t.info.bytes / 1000.0, 1);
         out.append(" KB; ");
         group(out, t.info.nodes);
@@ -316,7 +413,7 @@ fn network(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
         out.append("</s>");
     }
     out.append("</span></div><div class=\"nr\"><span>");
-    esc(out, name_of(T, U.cur));
+    esc(out, name_of(t, T));
     out.append("</span><span>OK</span><span class=\"r\">");
     format(out, load as i64);
     out.append(" ms</span><span class=\"wfc\">");
@@ -325,7 +422,7 @@ fn network(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
     out.append("<b class=\"dom\" style=\"left:");
     format_flt(out, dom / load * 100.0, 2);
     out.append("%\"></b></span></div></div><div class=\"ndet\"><p><b>");
-    esc(out, name_of(T, U.cur));
+    esc(out, name_of(t, T));
     out.append("</b> · the document</p><ul class=\"tim\">");
     let phases: const u8[:][5] = ["Reading", "Parsing", "Styling", "Measuring text", "Layout"];
     let kinds: const u8[:][5] = ["w", "d", "d", "d", "d"];
@@ -427,7 +524,7 @@ fn oil(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText) {
     out.append("</span>");
     gauge(out, U);
     out.append("</div><ul><li class=\"bd\"><b>");
-    esc(out, board_of(T));
+    esc(out, board_of(tabs, T));
     out.append("</b><small>in play</small><span class=\"v\">");
     format_flt(out, U.oil, 1);
     out.append(" MB</span><i style=\"width:");
@@ -436,7 +533,7 @@ fn oil(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText) {
     for t, k in tabs {
         out.append("<li class=\"pgr\"><span>");
         icon(out, "i-globe");
-        esc(out, title_of(t, T, k));
+        esc(out, title_of(t, T));
         out.append("</span><span class=\"v\">");
         format_flt(out, t.info.bytes / 1000.0, 1);
         out.append(" KB of HTML</span></li>");
@@ -514,7 +611,7 @@ fn panel(out: u8[>..]&, F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText) {
     var cards: u8[>..] = [];
     var ends: i64[>..] = [];
     cards.append("<div class=\"cd ghost\"><div class=\"nm\"><span class=\"bn\">");
-    esc(cards, board_of(T));
+    esc(cards, board_of(tabs, T));
     format(cards, "</span></div><small>In play · ", tabs.len, if tabs.len == 1 { " tab" } else { " tabs" }, "</small><kbd>⌘1</kbd></div>");
     ends.push(cards.len);
     cards.append("<div class=\"cd new\"><div class=\"nm\">");

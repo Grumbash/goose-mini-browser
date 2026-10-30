@@ -15,6 +15,7 @@ import engine.css;
 import engine.layout;
 import engine.snapshot;
 import engine.hit;
+import .net;
 
 // A message to a tab, as platform/src/tabs.rs numbers them.
 struct TabMsg { kind: i32, a: f32, b: f32, c: f32 }
@@ -22,6 +23,7 @@ let MSG_SIZE: i32 = 1;       // a: width, b: the view's height, c: backing scale
 let MSG_HIT: i32 = 2;        // a, b: a point on the page
 let MSG_SNAPSHOT: i32 = 3;   // a: the width to lay the page out at, b: the view's height
 let MSG_QUIT: i32 = 4;
+let MSG_NET: i32 = 5;        // a: a request that ended (platform/src/net.rs)
 
 // What a display list comes with: the page's height and canvas colour, its
 // size in nodes and bytes, what each stage took in milliseconds, the backing
@@ -38,7 +40,8 @@ let REPLY_TITLE: i32 = 2;    // text: the page's title
 let REPLY_SNAPSHOT: i32 = 3; // text: the page as a tree for agents
 let REPLY_FAILED: i32 = 4;   // text: why the page didn't load
 let REPLY_ELEMENTS: i32 = 5; // text: its elements under <body>, a line each (elements_of)
-let REPLY_READ: i32 = 6;     // value: the file's size in bytes, once read
+let REPLY_READ: i32 = 6;     // value: the document's size in bytes, once read
+let REPLY_URL: i32 = 7;      // value: the HTTP status; text: the page's URL after redirects
 
 // How much of a page's own text the interface takes: a page's title or an
 // element's id or class could be any length, and the interface is laid out
@@ -77,24 +80,39 @@ struct Page {
 // What the main thread knows of a tab: its worker; what came with its last
 // display list (`ready` once one has) and what taking it cost there; whether
 // it failed; whether a display list waits to be taken when it is shown; how
-// far it is scrolled; when it opened and how long it took to
-// show; and spans of the main thread's notes: its title, why it failed, its
+// far it is scrolled; when it opened and how long it took to show; its
+// page's HTTP status (0 for a file); and spans of the main thread's notes:
+// where it is (a file's path or a URL), its title, why it failed, its
 // elements.
 struct Tab {
     worker: i64, ready: bool, failed: bool, info: FrameInfo, paint: f32, waiting: bool, scroll: f32, opened: i64,
-    load_ms: f32, title_at: i64, title_len: i64, why_at: i64, why_len: i64, elems_at: i64, elems_len: i64,
+    load_ms: f32, status: i32, loc_at: i64, loc_len: i64, title_at: i64, title_len: i64, why_at: i64, why_len: i64,
+    elems_at: i64, elems_len: i64,
 }
+
+// How fetching a document ended.
+let LOAD_OK: i32 = 0;
+let LOAD_FAILED: i32 = 1;    // the main thread was told why
+let LOAD_QUIT: i32 = 2;      // the tab closed meanwhile
 
 fn ms_since(from: i64) -> f32 { return ((clock_ns() - from) / 1000000.0) as f32; }
 
-// Tab `tab`'s worker, for the page at `path`.
-thread_fn tab_worker(tab: i32, path: u8[>..]) {
+// Tab `tab`'s worker, for the page at `loc`: a file's path, or an http or
+// https URL, loaded on profile `profile`'s session.
+thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32) {
     var src: u8[>..] = [];
+    var later: TabMsg[>..] = [];     // what the main thread asked while the page came
     var t = clock_ns();
-    guard read_file(path[..], src) else {
-        tp_post_reply(tab, REPLY_FAILED, 0, str("can't read ", path)[..]);
-        serve_nothing(tab);
-        return;
+    if is_web(loc[..]) {
+        let got = fetch_document(tab, profile, loc[..], src, later);
+        guard got != LOAD_QUIT else { return; }
+        guard got == LOAD_OK else { serve_nothing(tab); return; }
+    } else {
+        guard read_file(loc[..], src) else {
+            tp_post_reply(tab, REPLY_FAILED, 0, str("can't read ", loc)[..]);
+            serve_nothing(tab);
+            return;
+        }
     }
     var info = FrameInfo { height: 0.0, background: 0xFFFFFFFF, nodes: 0, bytes: src.len as i32,
                            parse: 0.0, style: 0.0, measure: 0.0, layout: 0.0, scale: 1.0, read: ms_since(t) };
@@ -143,7 +161,74 @@ thread_fn tab_worker(tab: i32, path: u8[>..]) {
     var elems: u8[>..] = [];
     elements_of(d, elems);
     tp_post_reply(tab, REPLY_ELEMENTS, 0, elems[..]);
-    serve(tab, P, info);
+    serve(tab, P, info, later[..]);
+}
+
+// Loads the document at `url` on profile `profile`'s session into `src`, as
+// HTML: a text response goes in a <pre>. Tells the main thread the page's URL
+// after redirects and its status, or why it failed. What the main thread
+// asks meanwhile goes in `later`, to answer once there is a page.
+fn fetch_document(tab: i32, profile: i32, url: const u8[:], src: u8[>..]&, later: TabMsg[>..]&) -> i32 {
+    let req = tp_net_open(tab, profile, NET_DOCUMENT, url, "", 0);
+    guard req > 0 else {
+        tp_post_reply(tab, REPLY_FAILED, 0, str("can't load ", url)[..]);
+        return LOAD_FAILED;
+    }
+    guard wait_net(tab, req, later) else {
+        tp_net_cancel(req);
+        return LOAD_QUIT;
+    }
+    var head = NetHead { req: 0, status: 0, error: 0, kind: 0, body: 0, url: 0, mime: 0, text: 0, expected: 0 };
+    var body: u8[>..] = [];
+    var final_url: u8[>..] = [];
+    var mime: u8[>..] = [];
+    var why: u8[>..] = [];
+    guard take_net(req, head, body, final_url, mime, why) else {
+        tp_post_reply(tab, REPLY_FAILED, 0, str("can't load ", url)[..]);
+        return LOAD_FAILED;
+    }
+    guard head.error == 0 else {
+        tp_post_reply(tab, REPLY_FAILED, 0, why[..]);
+        return LOAD_FAILED;
+    }
+    tp_post_reply(tab, REPLY_URL, head.status, final_url[..]);
+    let m = mime[..];
+    if m.len == 0 || m == "text/html" || m == "application/xhtml+xml" {
+        src.append(body);
+    } else if starts_with(m, "text/") || m == "application/json" || ends_with(m, "+json") || ends_with(m, "+xml")
+              || m == "application/xml" || m == "application/javascript" {
+        src.append("<!doctype html><meta charset=\"utf-8\"><pre>");
+        for c in body {
+            if c == '&' { src.append("&amp;"); } else if c == '<' { src.append("&lt;"); } else { src.push(c); }
+        }
+        src.append("</pre>");
+    } else {
+        tp_post_reply(tab, REPLY_FAILED, 0, str("Tusk can't show ", m, " yet: ⌘⇧S opens it in Safari")[..]);
+        return LOAD_FAILED;
+    }
+    return LOAD_OK;
+}
+
+// Waits for request `req` of tab `tab` to end. Meanwhile a hit test is
+// answered with an arrow, and what else the main thread asks goes in
+// `later`. False if the tab quits first.
+fn wait_net(tab: i32, req: i32, later: TabMsg[>..]&) -> bool {
+    var m = TabMsg { kind: 0, a: 0.0, b: 0.0, c: 0.0 };
+    loop {
+        // A mailbox that fails (closed under it) ends the worker.
+        let got = tp_tab_next(tab, -1, m);
+        guard got >= 0 else { return false; }
+        guard got == 1 else { continue; }
+        if m.kind == MSG_QUIT { return false; }
+        if m.kind == MSG_NET {
+            if m.a as i32 == req { return true; }
+        } else if m.kind == MSG_HIT {
+            tp_post_reply(tab, REPLY_HIT, CURSOR_ARROW, "");
+        } else {
+            later.push(m);
+        }
+    }
+    return false;
 }
 
 // The elements under <body>, <body> first, in document order, at most 200, onto
@@ -214,17 +299,24 @@ fn one_line(out: u8[>..]&, s: const u8[:], max: i64) {
 
 // Answers the main thread for page P until it says quit: a display list for
 // each size, the pointer's shape for each point, a tree for each snapshot.
-fn serve(tab: i32, P: Page, info: FrameInfo&) {
+// What it asked while the page came, `later`, is answered first.
+fn serve(tab: i32, P: Page, info: FrameInfo&, later: const TabMsg[:]) {
     var items: DItem[>..<] = [];     // the display list as laid out last, for hit tests
     var bounds: f32[>..<] = [];      // where its items are: made at the first hit test after a layout
     var bounded = false;
     var paths: f32[>..<] = [];
     var m = TabMsg { kind: 0, a: 0.0, b: 0.0, c: 0.0 };
+    var next: i64 = 0;
     loop {
-        // A mailbox that fails (closed under it) ends the worker.
-        let got = tp_tab_next(tab, -1, m);
-        guard got >= 0 else { return; }
-        guard got == 1 else { continue; }
+        if next < later.len {
+            m = later[next];
+            next += 1;
+        } else {
+            // A mailbox that fails (closed under it) ends the worker.
+            let got = tp_tab_next(tab, -1, m);
+            guard got >= 0 else { return; }
+            guard got == 1 else { continue; }
+        }
         if m.kind == MSG_QUIT { return; }
         if m.kind == MSG_SIZE {
             let t = clock_ns();

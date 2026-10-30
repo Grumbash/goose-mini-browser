@@ -229,14 +229,12 @@ fn session(profile: usize) -> Result<Retained<NSURLSession>, i32> {
     Ok(s)
 }
 
-/// Makes both profiles' sessions now, so the first page doesn't wait for
-/// them: call once at launch, from any thread.
+/// Makes profile `profile`'s session now, so the first page doesn't wait
+/// for it: call at launch, from any thread.
 #[unsafe(no_mangle)]
-pub extern "C" fn tp_net_start() -> i32 {
+pub extern "C" fn tp_net_start(profile: i32) -> i32 {
     guarded(|| {
-        for p in 0..PROFILES {
-            session(p)?;
-        }
+        session(usize::try_from(profile).map_err(|_| ERR_ARGUMENT)?)?;
         Ok(0)
     })
 }
@@ -592,6 +590,50 @@ pub extern "C" fn tp_net_take(
             }
         }
         n.reqs.remove(&req);
+        Ok(0)
+    })
+}
+
+/// How far tab `tab`'s document has come: the bytes received so far into
+/// `received`, and those expected into `expected` (-1 when the server didn't
+/// say). Returns 1 while a document request of the tab runs, 0 when none
+/// does.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_net_progress(tab: i32, received: *mut i64, expected: *mut i64) -> i32 {
+    guarded(|| {
+        if received.is_null() || expected.is_null() {
+            return Err(ERR_ARGUMENT);
+        }
+        let n = net();
+        let Some(r) = n
+            .reqs
+            .values()
+            .find(|r| r.tab == tab && r.kind == NET_DOCUMENT && !r.done)
+        else {
+            return Ok(0);
+        };
+        unsafe {
+            received.write_unaligned(r.body.len() as i64);
+            expected.write_unaligned(r.expected);
+        }
+        Ok(1)
+    })
+}
+
+/// Opens `url` (UTF-8; http, https or file) in Safari, for a page Tusk can't
+/// show yet (docs/adr/0001).
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_open_in_safari(url: GSlice<u8>) -> i32 {
+    guarded(|| {
+        let url = std::str::from_utf8(unsafe { url.as_slice() }.ok_or(ERR_ARGUMENT)?)
+            .map_err(|_| ERR_ARGUMENT)?;
+        if !matches!(scheme_of(url).as_str(), "http" | "https" | "file") {
+            return Err(ERR_ARGUMENT);
+        }
+        std::process::Command::new("/usr/bin/open")
+            .args(["-b", "com.apple.Safari", url])
+            .spawn()
+            .map_err(|_| ERR_ARGUMENT)?;
         Ok(0)
     })
 }
@@ -1142,6 +1184,13 @@ mod tests {
         assert_eq!(tp_tab_open(tab), 0);
         let base = format!("http://127.0.0.1:{port}");
         let slow = open(tab, NET_DOCUMENT, &format!("{base}/slow"), "");
+        let (mut got, mut of) = (-2i64, -2i64);
+        assert_eq!(
+            tp_net_progress(tab, &mut got, &mut of),
+            1,
+            "a document runs"
+        );
+        assert_eq!(got, 0);
         let sheets: Vec<i32> = (0..4)
             .map(|_| {
                 open(
@@ -1163,6 +1212,7 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(2500));
         assert_eq!(tp_net_cancel(slow), 0);
         assert_eq!(tp_net_cancel(slow), ERR_ARGUMENT);
+        assert_eq!(tp_net_progress(tab, &mut got, &mut of), 0, "none runs");
         let mut m = TabMsg::default();
         assert_eq!(
             tp_tab_next(tab, 3500, &mut m),
