@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>The box model</title>
+<style>
+  body { margin: 0; padding: 28px; max-width: none; background: #f4f2ee; color: #1c1c1c; font: 15px/1.4 -apple-system, sans-serif }
+  .card { width: 360px; height: 52px; margin: 0 0 16px; padding: 12px 16px; border-radius: 12px; background: #fff; box-shadow: 0 0 0 1px #d8d4cc }
+  .card b { font-size: 17px }
+  .plate { width: 190px; padding: 7px 12px; margin: 0 0 16px; border-radius: 4px; background: #f5b700; font: 800 17px/1 -apple-system, sans-serif }
+  .dashed { width: 340px; height: 44px; margin: 0 0 16px; padding: 10px 16px; border: 2px dashed #8a8f96; border-radius: 10px; color: #6b6560 }
+  .sides { width: 340px; margin: 0 0 16px; padding: 10px 14px; background: #fff; border-top: 4px solid #3b82f6; border-left: 8px solid #c4472f; border-bottom: 1px solid #c9c4ba }
+  .ring { width: 150px; height: 20px; margin: 4px 0 20px 4px; padding: 10px 20px; border-radius: 20px; background: #1d1f22; color: #fff; box-shadow: 0 0 0 3px #f5b700 }
+  .pill { width: 160px; min-height: 24px; margin: 0 0 16px; padding: 6px 14px; border-radius: 18px; background: #34507a; color: #fff }
+  .faded { opacity: .45 }
+  .tall { width: 360px; min-height: 70px; margin: 0 0 16px; padding: 12px 16px; border-radius: 0 16px 0 16px; background: #3b5d4a; color: #f2f0ec }
+</style>
+<div class="card"><b>A page card</b><br>rounded 12, a 1 pt ring, a set height</div>
+<div class="plate">TUSK ▾</div>
+<div class="dashed">a dashed border, rounded</div>
+<div class="sides">borders that differ by side</div>
+<div class="ring">a focus ring</div>
+<div class="pill">a pill</div>
+<div class="pill faded">at 45% opacity</div>
+<div class="tall">corners rounded on two sides, a minimum height</div>

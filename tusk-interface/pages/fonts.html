@@ -1,0 +1,41 @@
+<!doctype html>
+<title>Fonts</title>
+<style>
+  body { margin: 0; padding: 24px 32px; max-width: none; background: #1b1916; color: #efe7d8; font-family: -apple-system, sans-serif; font-size: 13px }
+  .row { display: flex; align-items: baseline; gap: 16px; margin: 0 0 6px }
+  .tag { width: 110px; flex: none; font-family: "JetBrains Mono", monospace; font-size: 10px; color: #a89f8f }
+  .cond { font-family: "Barlow Condensed", "Arial Narrow", sans-serif; font-size: 30px; letter-spacing: .02em; text-transform: uppercase }
+  .mono { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 15px }
+  .ui { font-size: 17px }
+  .spaced { font-family: "Barlow Condensed", sans-serif; font-weight: 700; font-size: 13px; text-transform: uppercase; color: #e0a43a }
+  h2 { font-family: "JetBrains Mono", monospace; font-weight: 500; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+       color: #e0a43a; margin: 18px 0 8px }
+  .plate { display: inline-block; padding: 4px 10px; border-radius: 6px; background: #34507a; font-family: "Barlow Condensed", sans-serif;
+           font-weight: 800; font-size: 14px; letter-spacing: .06em; text-transform: uppercase }
+</style>
+<h2>Barlow Condensed, uppercase, .02em</h2>
+<div class=row><span class=tag>500</span><span class=cond style="font-weight: 500">The hand, played · Work 42 KB</span></div>
+<div class=row><span class=tag>600</span><span class=cond style="font-weight: 600">The hand, played · Work 42 KB</span></div>
+<div class=row><span class=tag>700</span><span class=cond style="font-weight: 700">The hand, played · Work 42 KB</span></div>
+<div class=row><span class=tag>800</span><span class=cond style="font-weight: 800">The hand, played · Work 42 KB</span></div>
+<div class=row><span class=tag>900</span><span class=cond style="font-weight: 900">The hand, played · Work 42 KB</span></div>
+<div class=row><span class=tag>bolder of 500</span><span class=cond style="font-weight: 500"><b style="font-weight: bolder">Bolder</b> than its parent</span></div>
+
+<h2>JetBrains Mono</h2>
+<div class=row><span class=tag>400</span><span class=mono>frames 120 · dropped 0 · 8.3 ms</span></div>
+<div class=row><span class=tag>500</span><span class=mono style="font-weight: 500">frames 120 · dropped 0 · 8.3 ms</span></div>
+<div class=row><span class=tag>700</span><span class=mono style="font-weight: 700">frames 120 · dropped 0 · 8.3 ms</span></div>
+<div class=row><span class=tag>italic</span><span class=mono style="font-style: italic">frames 120 · dropped 0 · 8.3 ms</span></div>
+
+<h2>System UI</h2>
+<div class=row><span class=tag>400</span><span class=ui>Focaccia is a flat leavened oven-baked bread</span></div>
+<div class=row><span class=tag>700</span><span class=ui style="font-weight: 700">Focaccia is a flat leavened oven-baked bread</span></div>
+<div class=row><span class=tag>800</span><span class=ui style="font-weight: 800">Focaccia is a flat leavened oven-baked bread</span></div>
+
+<h2>Letter-spacing and case</h2>
+<div class=row><span class=tag>0</span><span class=spaced>Boards · pages · oil</span></div>
+<div class=row><span class=tag>.08em</span><span class=spaced style="letter-spacing: .08em">Boards · pages · oil</span></div>
+<div class=row><span class=tag>.3em</span><span class=spaced style="letter-spacing: .3em">Boards · pages · oil</span></div>
+<div class=row><span class=tag>capitalize</span><span class=ui style="text-transform: capitalize">école de la boulangerie · привет мир</span></div>
+<div class=row><span class=tag>lowercase</span><span class=ui style="text-transform: lowercase">ÉCOLE DE LA BOULANGERIE · ПРИВЕТ МИР</span></div>
+<div class=row><span class=tag>plate</span><span class=plate>Claude is driving</span></div>

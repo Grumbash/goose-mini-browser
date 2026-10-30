@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CSS: variables, generated content, selectors</title>
+<style>
+  :root { --steel: #1d1f22; --steel-2: #2a2d31; --steel-3: #25282c; --ink: #e4e6ea; --muted: #8a8f96; --hazard: #f5b700; --agent: #3b82f6; --err: #ff6b5d; --pad: 10px 14px }
+  body { margin: 0; padding: 28px; max-width: none; background: var(--steel); color: var(--ink); font: 16px/1.5 -apple-system, sans-serif }
+  h1 { font: 800 32px/1.1 -apple-system, sans-serif; margin: 0 0 18px }
+  h1::after { content: " · " "boards"; color: var(--hazard) }
+  .row { padding: var(--pad); margin: 0 0 4px; background: var(--steel-2) }
+  .row:nth-child(odd) { background: var(--steel-3) }
+  .row::before { content: "▸  "; color: var(--accent, var(--hazard)) }
+  .row[data-state="agent"]::before { content: "●  "; color: var(--agent) }
+  .row[data-state="error"] { color: var(--err) }
+  .row[data-kind~="pinned"]::after { content: "   ⌘1"; color: var(--muted) }
+  .note { margin-top: 18px; font: italic 14px/1.5 Georgia, serif; color: var(--muted) }
+</style>
+<h1>Tusk</h1>
+<div class="rows">
+  <div class="row" data-kind="board pinned">Personal</div>
+  <div class="row" data-kind="board">Tusk, in play</div>
+  <div class="row" data-state="agent">Claude's board</div>
+  <div class="row" data-state="error">Work: 1 error</div>
+  <div class="row">Reading</div>
+</div>
+<p class="note">Colours from custom properties and their fallbacks; the bullets and the key from ::before and ::after; the stripes from :nth-child; the states from [data-…] selectors.</p>

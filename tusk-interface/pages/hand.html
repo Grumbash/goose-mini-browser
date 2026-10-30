@@ -1,0 +1,29 @@
+<!doctype html>
+<title>Hand</title>
+<style>
+  body { margin: 0; padding: 0; max-width: none; background: #1b1916; color: #efe7d8; font-family: sans-serif; font-size: 13px }
+  .table { position: relative; height: 640px; overflow: hidden }
+  .card { position: absolute; left: 0; top: 0; width: 120px; height: 168px; border-radius: 12px; border: 2px solid #efe7d8;
+          overflow: hidden; transform-origin: 50% 100%; display: flex; flex-direction: column; justify-content: space-between; padding: 10px }
+  .card .art { position: absolute; left: -30px; top: -30px; width: 110px; height: 110px; border-radius: 55px; background: #c4472f }
+  .card .name { position: relative; font-weight: bold; font-size: 15px }
+  .card .meta { position: relative; display: flex; justify-content: space-between; font-size: 11px; color: #d6cbb8 }
+  .c1 { background: #34507a; transform: translate(260px, 380px) rotate(-12deg) }
+  .c2 { background: #6b4b7a; transform: translate(350px, 360px) rotate(-6deg) }
+  .c3 { background: #3b5d4a; transform: translate(440px, 350px) rotate(0deg) }
+  .c4 { background: #7a5a34; transform: translate(530px, 360px) rotate(6deg) }
+  .c5 { background: #34507a; transform: translate(620px, 380px) rotate(12deg) }
+  .risen { z-index: 5; background: #3b5d4a; transform: translate(440px, 120px) scale(1.5) }
+  .badge { position: absolute; left: 50%; top: 24px; transform: translateX(-50%); padding: 4px 12px; border-radius: 10px; background: #e0a43a; color: #1b1916 }
+  .spin { position: absolute; left: 40px; top: 60px; width: 60px; height: 60px; background: #e0a43a; transform: rotate(30deg); border-radius: 8px }
+</style>
+<div class=table>
+  <div class=badge>The hand, played</div>
+  <div class=spin></div>
+  <div class="card c1"><div class=art></div><div class=name>Work</div><div class=meta><span>3 pages</span><span>42 KB</span></div></div>
+  <div class="card c2"><div class=art></div><div class=name>Reading</div><div class=meta><span>8 pages</span><span>1.2 MB</span></div></div>
+  <div class="card c3"><div class=art></div><div class=name>Claude</div><div class=meta><span>2 pages</span><span>9 KB</span></div></div>
+  <div class="card c4"><div class=art></div><div class=name>Design</div><div class=meta><span>5 pages</span><span>310 KB</span></div></div>
+  <div class="card c5"><div class=art></div><div class=name>Later</div><div class=meta><span>12 pages</span><span>4 MB</span></div></div>
+  <div class="card risen"><div class=art></div><div class=name>Focaccia</div><div class=meta><span>risen</span><span>99 KB</span></div></div>
+</div>
