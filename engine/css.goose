@@ -59,7 +59,16 @@ let P_RAD_BR: i32 = 44;
 let P_RAD_BL: i32 = 45;
 let P_BOX_SHADOW: i32 = 46;
 let P_OPACITY: i32 = 47;
-let NPROPS: i64 = 48;
+let P_POSITION: i32 = 48;
+let P_TOP: i32 = 49;
+let P_RIGHT: i32 = 50;
+let P_BOTTOM: i32 = 51;
+let P_LEFT: i32 = 52;
+let P_Z_INDEX: i32 = 53;
+let P_OVERFLOW_X: i32 = 54;
+let P_OVERFLOW_Y: i32 = 55;
+let P_TEXT_OVERFLOW: i32 = 56;
+let NPROPS: i64 = 57;
 let P_CUSTOM: i32 = -2;   // a custom property, --name, which the cascade keeps apart
 
 // Kinds of value.
@@ -113,6 +122,13 @@ let K_SOLID: i32 = 31;          // border styles: double, groove and the like dr
 let K_DASHED: i32 = 32;         // and dotted draws dashed
 let K_BORDER_BOX: i32 = 33;
 let K_CONTENT_BOX: i32 = 34;
+let K_STATIC: i32 = 35;
+let K_RELATIVE: i32 = 36;       // sticky too, for now
+let K_ABSOLUTE: i32 = 37;
+let K_FIXED: i32 = 38;
+let K_VISIBLE: i32 = 39;
+let K_HIDDEN: i32 = 40;         // overflow: clip, auto and scroll too, since nothing scrolls inside a page yet
+let K_ELLIPSIS: i32 = 41;
 
 // Font families, as the platform layer's text functions number them.
 let FAMILY_SANS: i32 = 0;
@@ -219,6 +235,12 @@ struct Style {
     shadows: Shadow[2], shadow_count: i32,
     opacity: f32,                        // the element's own
     alpha: f32,                          // what its paint is multiplied by: its opacity times its parent's alpha
+    position: i32,                       // K_STATIC, K_RELATIVE, K_ABSOLUTE or K_FIXED
+    top: f32, right: f32, bottom: f32, left: f32,   // insets, in points or percentages (see inset_pct)
+    inset_auto: i32, inset_pct: i32,     // bit k (top, right, bottom, left): that inset is auto, or a percentage
+    z: i32, z_auto: i32,                 // z-index, and whether it is auto
+    clips: i32,                          // bit 0 overflow-x, bit 1 overflow-y isn't visible; either cuts its content at its padding box
+    ellipsis: i32,                       // text-overflow: ellipsis
 }
 
 // One box-shadow. Blurred ones aren't drawn (docs/adr/0010: the interface's
@@ -247,7 +269,9 @@ fn root_style() -> Style {
                    bl: 3.0, br: 3.0, bl_color: CURRENT_COLOR, br_color: CURRENT_COLOR,
                    bt_style: K_NONE, br_style: K_NONE, bb_style: K_NONE, bl_style: K_NONE,
                    rad_tl: 0.0, rad_tr: 0.0, rad_br: 0.0, rad_bl: 0.0, rad_pct: 0,
-                   shadows: [no_shadow(), no_shadow()], shadow_count: 0, opacity: 1.0, alpha: 1.0 };
+                   shadows: [no_shadow(), no_shadow()], shadow_count: 0, opacity: 1.0, alpha: 1.0,
+                   position: K_STATIC, top: 0.0, right: 0.0, bottom: 0.0, left: 0.0, inset_auto: 15, inset_pct: 0,
+                   z: 0, z_auto: 1, clips: 0, ellipsis: 0 };
 }
 
 // ------------------------------------------------------------------ parsing
@@ -741,6 +765,8 @@ fn longhands(name: const u8[:], out: i32[>..]&) {
     else if name == "border-bottom" { out.append([P_BB_WIDTH, P_BB_STYLE, P_BB_COLOR]); }
     else if name == "border-left" { out.append([P_BL_WIDTH, P_BL_STYLE, P_BL_COLOR]); }
     else if name == "border-radius" { out.append([P_RAD_TL, P_RAD_TR, P_RAD_BR, P_RAD_BL]); }
+    else if name == "inset" { out.append([P_TOP, P_RIGHT, P_BOTTOM, P_LEFT]); }
+    else if name == "overflow" { out.append([P_OVERFLOW_X, P_OVERFLOW_Y]); }
     else if name == "background" { out.push(P_BG); }
     else if name == "list-style" { out.push(P_LIST); }
     else if name == "text-decoration" || name == "text-decoration-line" { out.push(P_DECO); }
@@ -919,6 +945,18 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
         }
         return;
     }
+    if name == "inset" || name == "overflow" {
+        // inset: top right bottom left, as for margin; overflow: x then y.
+        let parts = words(value);
+        guard parts.len >= 1 && parts.len <= (if name == "inset" { 4 } else { 2 });
+        if name == "overflow" {
+            add_value(P_OVERFLOW_X, parts[0], important, out);
+            add_value(P_OVERFLOW_Y, parts[parts.len - 1], important, out);
+            return;
+        }
+        for side in 4 { add_value(side_prop(side, P_TOP, P_RIGHT, P_BOTTOM, P_LEFT), parts[side_index(parts.len, side)], important, out); }
+        return;
+    }
     if name == "box-shadow" {
         if value == "none" { push_decl(out, decl(P_BOX_SHADOW, V_KEYWORD, K_NONE, 0, 0, important)); }
         else { push_decl(out, text_decl(P_BOX_SHADOW, V_STRING, important, value, "", bytes)); }
@@ -1032,6 +1070,10 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
         push_decl(out, d);
         return;
     }
+    if prop == P_Z_INDEX {
+        let n, ok = parse_int(value);
+        if ok { d.kind = V_NUMBER; d.num = clamp(n, -1000000000, 1000000000); push_decl(out, d); return; }
+    }
     if prop == P_OPACITY {
         let pct = value.len > 0 && value[value.len - 1] == '%';
         let n, ok = parse_flt(if pct { value[..value.len - 1] } else { value });
@@ -1120,6 +1162,11 @@ fn property_id(n: const u8[:]) -> i32 {
     if n == "border-top-left-radius" { return P_RAD_TL; } if n == "border-top-right-radius" { return P_RAD_TR; }
     if n == "border-bottom-right-radius" { return P_RAD_BR; } if n == "border-bottom-left-radius" { return P_RAD_BL; }
     if n == "box-shadow" { return P_BOX_SHADOW; }
+    if n == "position" { return P_POSITION; } if n == "z-index" { return P_Z_INDEX; }
+    if n == "top" { return P_TOP; } if n == "right" { return P_RIGHT; }
+    if n == "bottom" { return P_BOTTOM; } if n == "left" { return P_LEFT; }
+    if n == "overflow-x" { return P_OVERFLOW_X; } if n == "overflow-y" { return P_OVERFLOW_Y; }
+    if n == "text-overflow" { return P_TEXT_OVERFLOW; }
     return -1;
 }
 
@@ -1138,6 +1185,9 @@ fn keyword(v: const u8[:]) -> i32 {
     if v == "super" { return K_SUPER; } if v == "sub" { return K_SUB; } if v == "baseline" { return K_BASELINE; }
     if v == "auto" { return K_AUTO; } if v == "transparent" { return K_TRANSPARENT; }
     if v == "border-box" { return K_BORDER_BOX; } if v == "content-box" { return K_CONTENT_BOX; }
+    if v == "static" { return K_STATIC; } if v == "relative" || v == "sticky" { return K_RELATIVE; }
+    if v == "absolute" { return K_ABSOLUTE; } if v == "fixed" { return K_FIXED; } if v == "visible" { return K_VISIBLE; }
+    if v == "hidden" || v == "clip" || v == "scroll" { return K_HIDDEN; } if v == "ellipsis" { return K_ELLIPSIS; }
     // Display values we lay out as one of the three we know.
     if v == "inline-block" || v == "inline-flex" || v == "inline-grid" || v == "inline-table" || v == "table-cell" { return K_INLINE; }
     if v == "flex" || v == "grid" || v == "table" || v == "table-row" || v == "table-row-group" || v == "table-header-group"
@@ -1580,6 +1630,8 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
     if s.bb_style == K_NONE { s.bb = 0.0; }
     if s.bl_style == K_NONE { s.bl = 0.0; }
     s.alpha = parent.alpha * s.opacity;
+    // An absolute or fixed box is a block, whatever its display (CSS 2.2 §9.7).
+    if (s.position == K_ABSOLUTE || s.position == K_FIXED) && s.display == K_INLINE { s.display = K_BLOCK; }
     w.customs.resize(mark);
     w.prio.resize(mark);
     return s;
@@ -1990,6 +2042,29 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
     }
     else if p == P_BOX_SHADOW { s.shadow_count = 0; }       // none; the shadows themselves come through apply_decl
     else if p == P_OPACITY { s.opacity = clamp(dc.num, 0.0, 1.0); }
+    else if p == P_POSITION { if k == K_STATIC || k == K_RELATIVE || k == K_ABSOLUTE || k == K_FIXED { s.position = k; } }
+    else if p >= P_TOP && p <= P_LEFT {
+        let bit: i32 = 1 << (p - P_TOP);
+        var v: f32 = 0.0;
+        if dc.kind == V_LENGTH {
+            s.inset_auto = s.inset_auto & ~bit;
+            if dc.unit == U_PCT { v = dc.num; s.inset_pct = s.inset_pct | bit; }
+            else { v = px(dc, s, parent); s.inset_pct = s.inset_pct & ~bit; }
+        } else {
+            s.inset_auto = s.inset_auto | bit;
+        }
+        if p == P_TOP { s.top = v; } else if p == P_RIGHT { s.right = v; } else if p == P_BOTTOM { s.bottom = v; } else { s.left = v; }
+    }
+    else if p == P_Z_INDEX {
+        if dc.kind == V_NUMBER { s.z = dc.num as i32; s.z_auto = 0; } else { s.z = 0; s.z_auto = 1; }
+    }
+    else if p == P_OVERFLOW_X || p == P_OVERFLOW_Y {
+        // Either axis that isn't visible clips both, as CSS's visible turns to
+        // auto beside it (overflow-x: clip alone would cut only sideways).
+        let bit: i32 = if p == P_OVERFLOW_X { 1 } else { 2 };
+        s.clips = if k == K_HIDDEN || k == K_AUTO { s.clips | bit } else { s.clips & ~bit };
+    }
+    else if p == P_TEXT_OVERFLOW { s.ellipsis = if k == K_ELLIPSIS { 1 } else { 0 }; }
 }
 
 // ------------------------------------------------------------------ Tusk's own style sheet
