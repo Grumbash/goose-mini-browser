@@ -7,14 +7,15 @@
 // and nothing else, and an idle window draws nothing.
 //
 //   tusk [page.html ...]                 open pages, one tab each (the Focaccia article by default);
-//                                        ⌘1 to ⌘9 show a tab
+//                                        ⌘1 to ⌘9 show a tab, ⌘⌥I hides the dev panel
 //   tusk snapshot [page.html]            print the page as a tree for agents (docs/adr/0007)
 //   tusk --screenshot out.png [--at Y] [--size WxH] [--dev-tab NAME] [--bare] [page.html]
 //                                        draw the window offscreen into a PNG, W × H points
 //                                        (1200 × 760 unless given); no window opens. --bare
 //                                        draws the page alone, the interface left out, to
 //                                        check the engine; --dev-tab shows the dev panel's
-//                                        console, network, elements, frames or oil
+//                                        console, network, elements, frames or oil, or
+//                                        off, the panel hidden as ⌘⌥I hides it
 //   tusk --scroll-test [page.html]       scroll the page for 10 s and print frame times
 //   tusk --idle-exit MS [page.html ...]  quit after MS of quiet (the idle test)
 //   tusk --wake-test                     a worker wakes the sleeping main thread (the M0 test)
@@ -90,6 +91,7 @@ let EV_REPLY: i32 = 11;          // code: a tab whose reply waits
 // macOS virtual key codes and modifier flags.
 let KEY_Q: i32 = 12;
 let KEY_W: i32 = 13;
+let KEY_I: i32 = 34;
 let KEY_SPACE: i32 = 49;
 let KEY_HOME: i32 = 115;
 let KEY_PAGE_UP: i32 = 116;
@@ -99,6 +101,7 @@ let KEY_DOWN: i32 = 125;
 let KEY_UP: i32 = 126;
 let KEY_DIGITS: i32[9] = [18, 19, 20, 21, 23, 22, 26, 28, 25];   // 1 to 9
 let MOD_SHIFT: i64 = 0x20000;
+let MOD_OPTION: i64 = 0x80000;
 let MOD_COMMAND: i64 = 0x100000;
 
 let MODE_WINDOW: i32 = 0;
@@ -293,6 +296,7 @@ fn main() {
     var shot_h = WINDOW_H;
     var bare = false;
     var dev_tab = DEV_CONSOLE;
+    var dev = true;                  // the dev panel shows
     var shot_only = false;           // an option only a screenshot takes was given
     var idle_exit_ms: i64 = -1;
     var paths: u8[>..] = [];         // the pages' paths, one after another
@@ -329,7 +333,8 @@ fn main() {
             let names: const u8[:][5] = ["console", "network", "elements", "frames", "oil"];
             dev_tab = -1;
             for name, k in names { if argv[i] == name { dev_tab = k as i32; } }
-            guard dev_tab >= 0 else { usage(); return; }
+            if argv[i] == "off" { dev_tab = DEV_CONSOLE; dev = false; }
+            else { guard dev_tab >= 0 else { usage(); return; } }
             shot_only = true;
         } else if a == "--bare" {
             bare = true;
@@ -418,7 +423,7 @@ fn main() {
     let T = UiText { paths: paths, path_ends: path_ends, names: names, notes: notes };
     // Its text is mostly what it was, each time it is laid out.
     tp_text_cache(SHAPE_CACHE);
-    var U = Ui { w: WINDOW_W, h: WINDOW_H, lights: 0.0, cur: 0, dev: true, dev_tab: dev_tab,
+    var U = Ui { w: WINDOW_W, h: WINDOW_H, lights: 0.0, cur: 0, dev: dev, dev_tab: dev_tab,
                  oil: tp_memory_footprint() / 1048576.0, cpu: 0.0, fps: 0, running: false };
     var slot = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
 
@@ -575,6 +580,11 @@ fn main() {
                     let mods = e.x as i64;
                     let page = slot.h - 40.0;
                     if (mods & MOD_COMMAND) != 0 && (e.code == KEY_Q || e.code == KEY_W) { quit = true; }
+                    else if (mods & MOD_COMMAND) != 0 && (mods & MOD_OPTION) != 0 && e.code == KEY_I {
+                        // ⌘⌥I hides the dev panel, and the page takes its room; again, it shows.
+                        U.dev = !U.dev;
+                        redo = true;
+                    }
                     else if (mods & MOD_COMMAND) != 0 {
                         for code, n in KEY_DIGITS { if e.code == code && n < tabs.len { U.cur = n; } }
                     }
