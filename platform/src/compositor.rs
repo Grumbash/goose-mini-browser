@@ -44,7 +44,10 @@ const LAYERS: usize = 2; // 0: the page, scrolled; 1: the overlay, fixed
 /// clockwise) filled with `color`, and borders inside its edge in one colour
 /// and style: `border` points wide at the top, the others as they say. An
 /// item with a clip (`clip_w` above 0) shows only inside that rectangle, its
-/// corners rounded by `clip_tl`, `clip_tr`, `clip_br` and `clip_bl`.
+/// corners rounded by `clip_tl`, `clip_tr`, `clip_br` and `clip_bl`. A
+/// transformed item has a matrix (`m_a` … `m_f`, as CSS's matrix() takes
+/// them, points to points; all 0: none), and its clip one that takes its
+/// points to the clip's (`c_a` … `c_f`; all 0: they are the same).
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct DItem {
@@ -77,6 +80,18 @@ pub struct DItem {
     pub clip_tr: f32,
     pub clip_br: f32,
     pub clip_bl: f32,
+    pub m_a: f32,
+    pub m_b: f32,
+    pub m_c: f32,
+    pub m_d: f32,
+    pub m_e: f32,
+    pub m_f: f32,
+    pub c_a: f32,
+    pub c_b: f32,
+    pub c_c: f32,
+    pub c_d: f32,
+    pub c_e: f32,
+    pub c_f: f32,
 }
 
 /// One quad, in device pixels: solid when `uv[2]` is 0, otherwise the atlas
@@ -85,7 +100,10 @@ pub struct DItem {
 /// the top left, clockwise, and borders `widths` wide (top, right, bottom,
 /// left) in `border_color`, dashed when `border[1]` is 1, over its fill. Any
 /// quad with a `clip` (its width above 0) shows only inside it, its corners
-/// rounded by `clip_radii`.
+/// rounded by `clip_radii`. A transformed quad (`xt[2]` 1) goes where the
+/// matrix `xf` (a, b, c, d) and `xt` (e, f, in device pixels) take it, its
+/// edges smoothed and glyphs sampled between texels; its clip is tested
+/// where `cxf` and `cxt` take its points, when `cxt[2]` is 1.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Instance {
@@ -98,6 +116,10 @@ pub struct Instance {
     pub widths: [f32; 4],
     pub clip: [f32; 4],
     pub clip_radii: [f32; 4],
+    pub xf: [f32; 4],
+    pub xt: [f32; 4],
+    pub cxf: [f32; 4],
+    pub cxt: [f32; 4],
 }
 
 #[repr(C)]
@@ -110,12 +132,14 @@ const SHADERS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-struct Instance { float4 rect; float4 uv; float4 color; float4 radii; float4 border; float4 border_color; float4 widths; float4 clip; float4 clip_radii; };
+struct Instance { float4 rect; float4 uv; float4 color; float4 radii; float4 border; float4 border_color; float4 widths; float4 clip; float4 clip_radii;
+                  float4 xf; float4 xt; float4 cxf; float4 cxt; };
 struct Uniforms { float2 viewport; float2 scroll; };
 struct Out {
     float4 position [[position]];
     float2 uv; float4 color; float textured;
     float2 local; float2 size; float4 radii; float4 border; float4 border_color; float4 widths; float4 clip; float4 clip_radii;
+    float2 clip_pos; float smooth;
 };
 
 vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
@@ -123,9 +147,15 @@ vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
                        constant Uniforms& u [[buffer(1)]]) {
     Instance q = instances[i];
     float2 corner = float2(v & 1, v >> 1);
-    float2 p = q.rect.xy + corner * q.rect.zw - u.scroll;
+    // On the page, then where its transform takes it, then scrolled.
+    float2 p = q.rect.xy + corner * q.rect.zw;
+    float2 t = p;
+    if (q.xt.z > 0.5) {
+        t = float2(q.xf.x * p.x + q.xf.z * p.y + q.xt.x, q.xf.y * p.x + q.xf.w * p.y + q.xt.y);
+    }
+    t -= u.scroll;
     Out o;
-    o.position = float4(p.x / u.viewport.x * 2.0 - 1.0, 1.0 - p.y / u.viewport.y * 2.0, 0.0, 1.0);
+    o.position = float4(t.x / u.viewport.x * 2.0 - 1.0, 1.0 - t.y / u.viewport.y * 2.0, 0.0, 1.0);
     o.uv = q.uv.xy + corner * q.uv.zw;
     o.color = q.color;
     o.textured = q.uv.z > 0.0 ? 1.0 : 0.0;
@@ -135,8 +165,13 @@ vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
     o.border = q.border;
     o.border_color = q.border_color;
     o.widths = q.widths;
-    o.clip = float4(q.clip.xy - u.scroll, q.clip.zw);
+    o.clip = q.clip;
     o.clip_radii = q.clip_radii;
+    o.clip_pos = p;
+    if (q.cxt.z > 0.5) {
+        o.clip_pos = float2(q.cxf.x * p.x + q.cxf.z * p.y + q.cxt.x, q.cxf.y * p.x + q.cxf.w * p.y + q.cxt.y);
+    }
+    o.smooth = q.xt.z;
     return o;
 }
 
@@ -152,14 +187,17 @@ float rounded_rect(float2 p, float2 size, float4 r) {
 }
 
 fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[texture(0)]]) {
-    // Inside the clip, if there is one, blended over its edge's pixel.
-    float cover = 1.0;
-    if (in.clip.z > 0.0) {
-        cover = clamp(0.5 - rounded_rect(in.position.xy - in.clip.xy, in.clip.zw, in.clip_radii), 0.0, 1.0);
-    }
+    // Inside the clip, if there is one, blended over its edge's pixel. A
+    // transformed quad's distances shrink or grow on screen: dividing by how
+    // fast they change per pixel keeps its edges one pixel soft.
+    float dc = rounded_rect(in.clip_pos - in.clip.xy, in.clip.zw, in.clip_radii);
+    float gc = in.smooth > 0.5 ? max(length(float2(dfdx(dc), dfdy(dc))), 0.0001) : 1.0;
+    float cover = in.clip.z > 0.0 ? clamp(0.5 - dc / gc, 0.0, 1.0) : 1.0;
     if (in.textured > 0.5) {
-        constexpr sampler s(coord::pixel, filter::nearest, address::clamp_to_edge);
-        return in.color * (atlas.sample(s, in.uv).r * cover);
+        constexpr sampler nearest(coord::pixel, filter::nearest, address::clamp_to_edge);
+        constexpr sampler between(coord::pixel, filter::linear, address::clamp_to_edge);
+        float a = in.smooth > 0.5 ? atlas.sample(between, in.uv).r : atlas.sample(nearest, in.uv).r;
+        return in.color * (a * cover);
     }
     if (in.border.z < 0.5) {
         return in.color * cover;
@@ -168,7 +206,8 @@ fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[text
     // and the padding edge (each side's width in, corners less the wider
     // border), each blended over a pixel.
     float d = rounded_rect(in.local, in.size, in.radii);
-    float outer = clamp(0.5 - d, 0.0, 1.0);
+    float g = in.smooth > 0.5 ? max(length(float2(dfdx(d), dfdy(d))), 0.0001) : 1.0;
+    float outer = clamp(0.5 - d / g, 0.0, 1.0);
     float4 w = in.widths;
     if (max(max(w.x, w.y), max(w.z, w.w)) <= 0.0) {
         return in.color * (outer * cover);
@@ -177,7 +216,7 @@ fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[text
     float4 inner_radii = max(in.radii - float4(max(w.x, w.w), max(w.x, w.y), max(w.z, w.y), max(w.z, w.w)), 0.0);
     float inner = 0.0;
     if (inner_size.x > 0.0 && inner_size.y > 0.0) {
-        inner = clamp(0.5 - rounded_rect(in.local - float2(w.w, w.x), inner_size, inner_radii), 0.0, 1.0);
+        inner = clamp(0.5 - rounded_rect(in.local - float2(w.w, w.x), inner_size, inner_radii) / g, 0.0, 1.0);
     }
     float ring = max(outer - inner, 0.0);
     float dash = 1.0;
@@ -574,6 +613,44 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
         };
         let k = scale as f32;
         let clip_radii = [clip_tl * k, clip_tr * k, clip_br * k, clip_bl * k];
+        // Matrices map points to points; in device pixels only their
+        // translations scale.
+        let DItem {
+            m_a,
+            m_b,
+            m_c,
+            m_d,
+            m_e,
+            m_f,
+            c_a,
+            c_b,
+            c_c,
+            c_d,
+            c_e,
+            c_f,
+            ..
+        } = item;
+        let transformed = m_a != 0.0 || m_b != 0.0 || m_c != 0.0 || m_d != 0.0;
+        let (xf, xt) = if transformed {
+            ([m_a, m_b, m_c, m_d], [m_e * k, m_f * k, 1.0, 0.0])
+        } else {
+            ([0.0; 4], [0.0; 4])
+        };
+        let (cxf, cxt) = if c_a != 0.0 || c_b != 0.0 || c_c != 0.0 || c_d != 0.0 {
+            ([c_a, c_b, c_c, c_d], [c_e * k, c_f * k, 1.0, 0.0])
+        } else {
+            ([0.0; 4], [0.0; 4])
+        };
+        // What every quad of the item shares.
+        let common = Instance {
+            clip,
+            clip_radii,
+            xf,
+            xt,
+            cxf,
+            cxt,
+            ..Default::default()
+        };
         let DItem {
             kind,
             x,
@@ -595,9 +672,9 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
             out.push(Instance {
                 rect: snapped(x, y, w, h, scale),
                 color,
-                clip,
-                clip_radii,
-                ..Default::default()
+                // A transformed rect is drawn as a box, so that its edges are smoothed.
+                border: [0.0, 0.0, if transformed { 1.0 } else { 0.0 }, 0.0],
+                ..common
             });
         } else if kind == ITEM_BOX {
             if !(w > 0.0 && h > 0.0) {
@@ -637,8 +714,7 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
                     width(border_bottom),
                     width(border_left),
                 ],
-                clip,
-                clip_radii,
+                ..common
             });
         } else if kind == ITEM_TEXT {
             let (Ok(start), Ok(len)) = (usize::try_from(start), usize::try_from(text_len)) else {
@@ -677,9 +753,7 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
                     ],
                     uv: [e.x as f32, e.y as f32, e.w as f32, e.h as f32],
                     color,
-                    clip,
-                    clip_radii,
-                    ..Default::default()
+                    ..common
                 });
             }
         }
@@ -893,11 +967,11 @@ mod tests {
 
     #[test]
     fn items_match_the_goose_layout() {
-        assert_eq!(std::mem::size_of::<DItem>(), 116);
+        assert_eq!(std::mem::size_of::<DItem>(), 164);
         assert_eq!(std::mem::align_of::<DItem>(), 1);
         assert_eq!(std::mem::size_of::<GpFrameStats>(), 28);
-        // The shader reads instances as nine float4s.
-        assert_eq!(std::mem::size_of::<Instance>(), 144);
+        // The shader reads instances as thirteen float4s.
+        assert_eq!(std::mem::size_of::<Instance>(), 208);
     }
 
     /// The BGRA pixels of `items` drawn offscreen on white, `w` × `h` at one
@@ -1036,6 +1110,39 @@ mod tests {
         assert_eq!(at(12, 8), [255, 255, 255, 255]); // past it: the background
         assert_eq!(at(24, 8), [255, 0, 0, 255]); // the circle's middle: blue
         assert_eq!(at(16, 0), [255, 255, 255, 255]); // its corner, rounded away
+    }
+
+    #[test]
+    fn transforms_turn_quads_and_their_clips_follow() {
+        // A red square 10 across at (10, 10), turned 45° about its middle: a
+        // diamond. Then the same diamond in blue, cut to the top 10 rows of
+        // the screen, which aren't turned: its clip matrix is its own, and
+        // only its tip, above where the square was, shows.
+        let (c, s) = (
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        );
+        let turn = |it: &mut DItem| {
+            (it.m_a, it.m_b, it.m_c, it.m_d) = (c, s, -s, c);
+            (it.m_e, it.m_f) = (15.0 - (c * 15.0 - s * 15.0), 15.0 - (s * 15.0 + c * 15.0));
+        };
+        let mut red = rect(10.0, 10.0, 10.0, 10.0, 0xFFFF_0000);
+        turn(&mut red);
+        let mut blue = rect(30.0, 10.0, 10.0, 10.0, 0xFF00_00FF);
+        (blue.m_a, blue.m_b, blue.m_c, blue.m_d) = (c, s, -s, c);
+        (blue.m_e, blue.m_f) = (35.0 - (c * 35.0 - s * 15.0), 15.0 - (s * 35.0 + c * 15.0));
+        (blue.clip_x, blue.clip_y, blue.clip_w, blue.clip_h) = (0.0, 0.0, 50.0, 10.0);
+        (blue.c_a, blue.c_b, blue.c_c, blue.c_d, blue.c_e, blue.c_f) =
+            (blue.m_a, blue.m_b, blue.m_c, blue.m_d, blue.m_e, blue.m_f);
+        let Some(p) = drawn(&[red, blue], 50, 30) else {
+            eprintln!("no Metal device here: transforms aren't checked");
+            return;
+        };
+        let at = |x: usize, y: usize| &p[(y * 50 + x) * 4..(y * 50 + x) * 4 + 4];
+        assert_eq!(at(15, 9), [0, 0, 255, 255]); // above the square's top: the diamond's tip, red
+        assert_eq!(at(10, 10), [255, 255, 255, 255]); // the square's corner, turned away
+        assert_eq!(at(35, 9), [255, 0, 0, 255]); // the blue diamond's tip, inside the cut
+        assert_eq!(at(35, 15), [255, 255, 255, 255]); // its middle, cut away
     }
 
     #[test]

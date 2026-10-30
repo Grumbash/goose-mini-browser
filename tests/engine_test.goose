@@ -688,8 +688,44 @@ fn test_flex() {
     check("text in a flex row, after the gap", layout_probe(chip, 400.0, PROBE_TEXT), "\"Label text\" line 1 x 26\n");
 }
 
+fn test_transforms() {
+    // translateX(-50%) moves a box by half its width, items and all, with no
+    // matrix; rotate(90deg) about the middle of a 20 × 10 box turns it into
+    // 10 × 20, as its box says; scale(2) about its top left doubles it. A
+    // transformed element contains an absolute box and paints after the flow
+    // after it; skew isn't supported, so that transform is none.
+    let boxes = """
+        <style>body { margin: 0; padding: 0; max-width: none } div { background: #888 }
+        #t { position: absolute; left: 50%; top: 0; width: 40px; height: 10px; transform: translateX(-50%) }
+        #r { width: 20px; height: 10px; transform: rotate(90deg) } #s { width: 10px; height: 10px; transform: scale(2); transform-origin: 0 0 }
+        #tc { margin-left: 50px; height: 20px; transform: rotate(0deg) } #tca { position: absolute; left: 0; top: 0; width: 5px; height: 5px }
+        #after { height: 5px } #k { width: 5px; height: 5px; transform: skewX(10deg) }</style>
+        <div id=t></div><div id=r></div><div id=s></div><div id=tc><div id=tca></div></div><div id=after></div><div id=k></div>
+        """;
+    check("transforms move boxes", layout_probe(boxes, 400.0, PROBE_GEOMETRY),
+          str("t x 180.0 y 0.0 w 40.0 h 10.0\nr x 5.0 y -5.0 w 10.0 h 20.0\ns x 0.0 y 10.0 w 20.0 h 20.0\n",
+              "tc x 50.0 y 20.0 w 350.0 h 20.0\ntca x 50.0 y 20.0 w 5.0 h 5.0\nafter x 0.0 y 40.0 w 400.0 h 5.0\nk x 0.0 y 45.0 w 5.0 h 5.0\n")[..]);
+    check("transforms reach the compositor as matrices", layout_probe(boxes, 400.0, PROBE_XF),
+          "after none\nk none\nt none\nr 0.00,1.00,-1.00,0.00,15.00,-5.00\ns 2.00,0.00,0.00,2.00,0.00,-10.00\ntc none\ntca none\n");
+
+    check("matrix() and a transform-origin in keywords", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none } div { width: 10px; height: 10px; background: #000 } #m { transform: matrix(1, 0, 0, 1, 10, 20) } #o { transform: rotate(180deg); transform-origin: right bottom }</style><div id=m></div><div id=o></div>""", 400.0, PROBE_GEOMETRY),
+          "m x 10.0 y 20.0 w 10.0 h 10.0\no x 10.0 y 20.0 w 10.0 h 10.0\n");
+
+    // A turned card that clips: what is in it turns with it, so its clip
+    // needs no matrix of its own; something turned inside a box that doesn't
+    // turn has one.
+    let clips = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        #card { width: 40px; height: 40px; overflow: hidden; transform: rotate(10deg) } #art { width: 60px; height: 60px; background: #f00 }
+        #box { width: 40px; height: 40px; overflow: hidden } #spin { width: 60px; height: 20px; background: #00f; transform: rotate(30deg) }</style>
+        <div id=card><div id=art></div></div><div id=box><div id=spin></div></div>
+        """;
+    check("clips in the space of what they cut", layout_probe(clips, 400.0, PROBE_XF), "art turned, clip plain\nspin turned, clip mapped\n");
+}
+
 // ------------------------------------------------------------------ layout
 
+let PROBE_XF: i32 = 15;     // each item of an element with an id: its matrix, or "none"; with a clip, how it is mapped
 let PROBE_ORDER: i32 = 9;   // the elements with an id, in the order their items paint
 let PROBE_CLIP: i32 = 10;   // each item of an element with an id: its clip, none, or dropped
 let PROBE_ELLIPSIS: i32 = 11; // whether #e's text ends in "…" inside its box
@@ -881,6 +917,27 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             }
             out.push('\n');
         }
+    } else if probe == PROBE_XF {
+        for it in items {
+            guard it.node >= 0 && it.kind != ITEM_NONE else { continue; }
+            let id, has = attr_value(d, it.node, "id");
+            guard has else { continue; }
+            out.append(id);
+            let turned = it.m_a != 0.0 || it.m_b != 0.0 || it.m_c != 0.0 || it.m_d != 0.0;
+            if it.clip_w > 0.0 {
+                let mapped = it.c_a != 0.0 || it.c_b != 0.0 || it.c_c != 0.0 || it.c_d != 0.0;
+                out.append(if turned { " turned" } else { " plain" });
+                out.append(if mapped { ", clip mapped\n" } else { ", clip plain\n" });
+                continue;
+            }
+            if !turned { out.append(" none\n"); continue; }
+            let m: f32[6] = [it.m_a, it.m_b, it.m_c, it.m_d, it.m_e, it.m_f];
+            for v, j in m {
+                out.push(if j == 0 { ' ' } else { ',' });
+                format_flt(out, if v < 0.005 && v > -0.005 { 0.0 } else { v }, 2);
+            }
+            out.push('\n');
+        }
     } else if probe == PROBE_CENTERED {
         for n, i in nodes {
             let id, has = attr_value(d, i as i32, "id");
@@ -1044,6 +1101,7 @@ fn main() {
     test_box();
     test_positioning();
     test_flex();
+    test_transforms();
     test_layout();
     test_snapshot();
     test_page();
