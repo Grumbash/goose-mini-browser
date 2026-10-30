@@ -30,6 +30,12 @@ struct Rusage {
     rest: [i64; 14],
 }
 
+/// How many cores the Mac has, to give CPU time as a share of all of them.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_cores() -> i64 {
+    std::thread::available_parallelism().map_or(1, |n| n.get() as i64)
+}
+
 /// The CPU time the process has used, on every thread, in nanoseconds: the
 /// readout's CPU is its growth over a while. A negative error code on failure.
 #[unsafe(no_mangle)]
@@ -61,6 +67,11 @@ pub extern "C" fn tp_memory_footprint() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mac_has_cores() {
+        assert!((1..=1024).contains(&tp_cores()));
+    }
 
     #[test]
     fn cpu_time_grows_with_work() {

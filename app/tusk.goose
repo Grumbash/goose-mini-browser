@@ -68,6 +68,7 @@ extern "tusk_platform" {
     fn tp_frame_times(out: f32[:]) -> i64;
     fn tp_memory_footprint() -> i64;
     fn tp_cpu_ns() -> i64;
+    fn tp_cores() -> i64;
     fn tp_frames() -> i64;
     fn tp_close() -> i32;
     fn tp_wake(token: i32) -> i32;
@@ -634,7 +635,8 @@ fn main() {
             let secs = ms(tick_from, now) / 1000.0;
             let cpu = tp_cpu_ns();
             let fps = round(content_frames / secs) as i32;
-            let load = ((cpu - cpu_from) / 10000000.0 / secs) as f32;
+            // As a share of the whole Mac: one busy core of 15 is 6.7%.
+            let load = ((cpu - cpu_from) / 10000000.0 / secs / max(tp_cores(), 1)) as f32;
             let oil = tp_memory_footprint() / 1048576.0;
             if fps != U.fps || abs(load - U.cpu) >= 0.1 || abs(oil - U.oil) >= 0.1 {
                 U.fps = fps;
