@@ -22,7 +22,7 @@ networking, image and video decoding, storage and JavaScript.
 | HTML tokenizer and tree builder (the WHATWG algorithm) | Window, input, IME, menus, display link |
 | DOM: compact nodes in one array, linked by index | GPU compositor: layers, tiles, glyph atlas, present on demand |
 | CSS parser, selector matching, cascade, computed style | Text: Core Text for fonts, fallback and shaping |
-| Layout: block and inline, then flex, grid, tables, positioning | Network: HTTP/1.1 and HTTP/2, TLS (rustls), cookies, cache |
+| Layout: block and inline, then flex, grid, tables, positioning | Network: HTTP/1.1, /2 and /3, TLS, cookies, cache, through Apple's URL loading system (ADR 0011) |
 | Paint: a flat display list | Images and video; the JavaScript engine; storage |
 | Tabs, history, the sleep policy, the interface's logic | |
 

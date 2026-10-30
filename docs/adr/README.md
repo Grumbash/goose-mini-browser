@@ -17,6 +17,7 @@ replacement.
 | [0008](0008-boards-carry-profiles.md) | Boards carry profiles | Proposed |
 | [0009](0009-name-tusk.md) | The browser is called Tusk | Proposed |
 | [0010](0010-interface-as-a-document.md) | The interface is a document Goose rebuilds; pages run in tab workers | Proposed |
+| [0011](0011-network-through-apples-url-loading.md) | The network goes through Apple's URL loading system | Proposed |
 
-All ten start as *Proposed*: Vlad made them on 29 and 30 October 2026, and they
+All eleven start as *Proposed*: Vlad made them on 29 and 30 October 2026, and they
 become *Accepted* when Gleb merges them.
