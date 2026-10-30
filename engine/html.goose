@@ -542,9 +542,11 @@ fn is_void(n: const u8[:]) -> bool {
         || n == "area" || n == "base" || n == "col" || n == "embed" || n == "source" || n == "track" || n == "param";
 }
 
+// <noscript> isn't raw text: Tusk runs no scripts, so its parser's scripting
+// flag is off and a <noscript>'s content is markup (HTML §13.2.6.4.4).
 fn is_raw_text(n: const u8[:]) -> bool {
     return n == "script" || n == "style" || n == "title" || n == "textarea" || n == "xmp" || n == "iframe"
-        || n == "noembed" || n == "noframes" || n == "noscript";
+        || n == "noembed" || n == "noframes";
 }
 
 fn is_head_element(n: const u8[:]) -> bool {

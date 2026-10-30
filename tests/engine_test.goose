@@ -140,6 +140,127 @@ fn colours_at(src: const u8[:], w: f32, w2: f32) -> u8[>..] {
     return out;
 }
 
+// The sheet `css`, with media `m` from its <link> or @import (empty: none),
+// on `html` at a viewport `w` wide, styled once at w and, when w2 > 0, again
+// at w2 (as serve does when a breakpoint is crossed): each <p>'s colour,
+// then each generated ::before/::after as name=text, or name=none when its
+// style hides it.
+fn styled_at(css: const u8[:], m: const u8[:], html: const u8[:], w: f32, w2: f32) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(html, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes, media: media };
+    let ends: i64[1] = [css.len];
+    let media_ends: i64[1] = [m.len];
+    load_sheets_with(d, sh, css, ends[..], m, media_ends[..]);
+    var styles: Style[>..] = [];
+    set_media(sh, MediaEnv { width: w, height: 800.0, scale: 2.0, dark: false });
+    compute_styles(d, sh, styles);
+    if w2 > 0.0 {
+        set_media(sh, MediaEnv { width: w2, height: 800.0, scale: 2.0, dark: false });
+        compute_styles(d, sh, styles);
+    }
+    var out: u8[>..] = [];
+    for n, i in nodes {
+        guard n.kind == NODE_ELEMENT else { continue; }
+        let name = node_name(d, i as i32);
+        if name == "p" {
+            format_int(out, styles[i].color & 0xFFFFFF, 16, 6, '0');
+            out.push(' ');
+        } else if is_generated(d, i as i32) {
+            out.append(name);
+            if styles[i].display == K_NONE { out.append("=none "); }
+            else { format(out, "=", if n.first >= 0 { node_text(d, n.first) } else { "" }, " "); }
+        }
+    }
+    return out;
+}
+
+// Sheets as Chrome reads them: calc() in queries, comments and escapes in
+// at-rules, import conditions, layers, a BOM, which sheets count, and a
+// restyle's generated content.
+fn test_media_review() {
+    // Wikipedia's own sheet: 23 blocks such as @media screen and
+    // (max-width:calc(1120px - 1px)) and (min-width:calc(640px - 1px)).
+    check("calc() in a media query, as Wikipedia writes its breakpoints",
+          str(mq("screen and (max-width:calc(1120px - 1px))", 800.0, 600.0, false),
+              mq("screen and (min-width:calc(640px - 1px))", 1200.0, 600.0, false)), "onon");
+    // A comment is whitespace to the tokenizer; Tusk keeps it in the prelude.
+    check("a comment in an @media or @supports prelude",
+          styled_at("@media screen /* wide */ { p.a { color: #f00 } } @supports (color: red) /* ok */ { p.b { color: #0f0 } }",
+                    "", "<p class=a>a<p class=b>b", 1000.0, 0.0),
+          "ff0000 00ff00 ");
+    // A '{' in that comment opens a block skip_block never closes: the rest
+    // of the sheet is swallowed.
+    check("a brace in a comment in an at-rule prelude swallows nothing after it",
+          styled_at("@media screen /* { */ { p.a { color: #f00 } } p.b { color: #00f }", "", "<p class=a>a<p class=b>b",
+                    1000.0, 0.0),
+          "ff0000 0000ff ");
+    // skip_block takes an escaped quote in a selector (Tailwind's
+    // .before\:content-\[\'\'\]) for a string: the @media's end lands at the
+    // sheet's end and swallows every rule after it.
+    check("an escaped quote in a selector inside @media",
+          styled_at("@media (min-width: 640px) { .sm\\:before\\:content-\\[\\'\\'\\]::before { --tw-content: ''; content: var(--tw-content) } } @media (max-width: 600px) { p.b { color: #0f0 } } p.c { color: #00f }",
+                    "", "<p class=b>b<p class=c>c", 400.0, 0.0),
+          "00ff00 0000ff ");
+    // @import url(x) layer(base) / supports(...): Cascade 5 import conditions,
+    // before the media list. Tusk imports a layered sheet unlayered.
+    check("an @import into a layer, or with supports(), still applies, its media after them",
+          imports_of("@import url(a.css) layer(base); @import url(b.css) layer supports(display: block) screen; @import url(c.css) supports(display: nonsense);"),
+          "[a.css][b.css screen]");
+    // Unlayered author rules beat layered ones whatever their order (Cascade 5).
+    check("an unlayered rule beats an @layer rule after it",
+          styled_at("p { color: #00f } @layer base { p { color: #f00 } }", "", "<p>a", 1000.0, 0.0), "0000ff ");
+    // A UTF-8 BOM is stripped when a sheet is decoded; left in, it turns the
+    // first @media into a qualified rule and the block's second rule escapes it.
+    check("a sheet that starts with a BOM keeps its first @media",
+          styled_at("\xEF\xBB\xBF@media (max-width: 600px) { p.a { color: #f00 } p.b { color: #0f0 } }", "",
+                    "<p class=a>a<p class=b>b", 1000.0, 0.0),
+          "1c1c1c 1c1c1c ");
+    check("a sheet that starts with a BOM keeps its @imports", imports_of("\xEF\xBB\xBF@import url(a.css);"), "[a.css]");
+    // `not print` is for the screen; so is a list with any query for it.
+    check("<link media='not print'> and media='print, (min-width: 1px)' are for the screen",
+          sources_of("<link rel=stylesheet href=a.css media='not print'><link rel=stylesheet href=b.css media='print, (min-width: 1px)'>"),
+          "[link a.css][link b.css]");
+    // Tusk runs no scripts and says (scripting: none), so its parser's
+    // scripting flag is off and <noscript> is markup (HTML §13.2.6.4.4):
+    // the fallback of the common async pattern <link media=print
+    // onload="this.media='all'"><noscript><link ...></noscript> applies.
+    check("a <noscript>'s <link> is a sheet when scripts don't run",
+          sources_of("<head><link rel=stylesheet href=x.css media=print onload=\"this.media='all'\"><noscript><link rel=stylesheet href=a.css></noscript></head><p>x"),
+          "[link a.css]");
+    // Template contents are inert: their sheets apply to nothing (a
+    // declarative shadow root's apply only inside it).
+    check("a <template>'s <link> and <style> are not the page's sheets",
+          sources_of("<template><link rel=stylesheet href=t.css><style>p{}</style></template><link rel=stylesheet href=a.css>"),
+          "[link a.css]");
+    // serve restyles in place when a breakpoint is crossed; a ::after made
+    // under an @media that turned off must go, and one whose content changed
+    // must show the new content.
+    check("a ::after from an @media that turns off goes",
+          styled_at("@media (min-width: 900px) { p::after { content: 'wide' } }", "", "<p>x", 1000.0, 600.0),
+          "1c1c1c ::after=none ");
+    check("a ::after whose content an @media changes shows the new content",
+          styled_at("p::after { content: 'narrow' } @media (min-width: 900px) { p::after { content: 'wide' } }", "", "<p>x",
+                    600.0, 1000.0),
+          "1c1c1c ::after=wide ");
+}
+
+// The colour of each <p class=a|b|c> under sheet `css`, at 1000 wide.
+fn colours_at2(css: const u8[:]) -> u8[>..] { return styled_at(css, "", "<p class=a>a<p class=b>b<p class=c>c", 1000.0, 0.0); }
+
 fn test_media() {
     check("min-width and max-width at 800", str(mq("(min-width: 768px)", 800.0, 600.0, false), mq("(max-width: 50em)", 800.0, 600.0, false)), "onon");
     check("past them", str(mq("(min-width: 801px)", 800.0, 600.0, false), mq("(max-width: 49em)", 800.0, 600.0, false)), "offoff");
@@ -161,6 +282,18 @@ fn test_media() {
                                              mq("screen and", 800.0, 600.0, false), mq("(unknown-feature)", 800.0, 600.0, false),
                                              mq("(min-width: 1px) and (max-width: 2000px) or (color)", 800.0, 600.0, false)),
           "offoffoffoff");
+    check("a type Tusk isn't matches nothing, so `not` it matches",
+          str(mq("not tv", 800.0, 600.0, false), mq("not unknowntype", 800.0, 600.0, false), mq("unknowntype", 800.0, 600.0, false)),
+          "ononoff");
+    check("unknown with or: a true gets past it; with not, it stays unknown",
+          str(mq("(min-width: 1px) or (foo: bar)", 800.0, 600.0, false), mq("not (hover: foo)", 800.0, 600.0, false),
+              mq("(foo: bar) or (max-width: 1px)", 800.0, 600.0, false)), "onoffoff");
+    check("(display-mode) is the browser's; `and(` and `not(` are functions, which no query is",
+          str(mq("(display-mode)", 800.0, 600.0, false), mq("screen and(min-width: 1px)", 800.0, 600.0, false),
+              mq("not(print)", 800.0, 600.0, false)), "onoffoff");
+    check("@supports reads NOT in any case, and says no to displays Tusk lays out as blocks",
+          colours_at2("@supports NOT (display: nonsense) { p.a { color: #f00 } } @supports (display: grid) { p.b { color: #f00 } } @supports not (display: contents) { p.c { color: #0f0 } }"),
+          "ff0000 1c1c1c 00ff00 ");
     let page = "<p class=i>i<p class=l>l<p class=w>w<p class=s>s<p class=n>n<p class=x>x";
     check("@media turns on and off with the width, inside the media of the <link> and the @import; @supports by what Tusk reads",
           colours_at(page, 600.0, 1000.0),
@@ -2132,6 +2265,7 @@ fn test_page() {
 fn main() {
     test_sheets();
     test_media();
+    test_media_review();
     // The bundled fonts, as the app registers them; run from the repository.
     var fonts: u8[>..] = [];
     format(fonts, tp_register_fonts("app/fonts"));

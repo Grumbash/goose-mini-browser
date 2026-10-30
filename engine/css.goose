@@ -237,7 +237,11 @@ struct Rule {
     origin: i32,
     pseudo: i32,                       // its last compound's: 1 for ::before, 2 for ::after
     media: i32,                        // the @media it is in (Sheet.media), or -1
+    layer: i32,                        // its cascade layer's rank, from 0 for the first declared; UNLAYERED for none
 }
+
+// The rank of a rule in no @layer, which beats every layer's (Cascade 5 §6.4).
+let UNLAYERED: i32 = 255;
 
 // An @media's query list, as a span of Sheet.bytes, and the one it is in
 // (-1: none). Its rules apply while it is on, and it is on while its query
@@ -422,6 +426,7 @@ fn skip_block(l: Lexer&) {
         else if c == '}' { depth -= 1; if depth == 0 { l.pos += 1; return; } }
         else if c == '"' || c == '\'' { l.pos = skip_string(s, l.pos); continue; }
         else if at_comment(s, l.pos) { l.pos = skip_comment(s, l.pos); continue; }
+        else if c == '\\' { l.pos += 2; continue; }     // an escape: the next character is no brace or quote
         l.pos += 1;
     }
 }
@@ -466,17 +471,27 @@ fn parse_sheet(src: const u8[:], sh: Sheet, origin: i32, order: i32) -> i32 {
 
 // Parses rules from `src` into `sh`, under @media `media` (-1: none). An
 // @media block's rules go under a new Media; an @supports block's go in when
-// its condition holds and are dropped when it doesn't; an @layer block's go in
-// as if unlayered. Other at-rules are skipped, with any block they open. One
-// pass: the blocks it is inside, at most 16 deep, are a stack of where each
-// ends and the Media outside it.
+// its condition holds and are dropped when it doesn't; an @layer block's go
+// in with its layer's rank, layers ranked in the order the sheet first names
+// them. Other at-rules are skipped, with any block they open. One pass: the
+// blocks it is inside, at most 16 deep, are a stack of where each ends, the
+// Media outside it and the layer it is in. Comments in a prelude are
+// spaces; a backslash escapes the character after it.
 fn parse_rules(src: const u8[:], sh: Sheet, origin: i32, order: i32, media: i32) -> i32 {
     var l = Lexer { src: src, pos: 0 };
+    // A sheet that starts with a UTF-8 byte order mark starts after it.
+    if starts_with(src, "\xEF\xBB\xBF") { l.pos = 3; }
     var next = order;
     var cur = media;
+    var layer = UNLAYERED;
     var block_end: i64[16];
     var block_media: i32[16];
+    var block_layer: i32[16];
     var top: i64 = 0;
+    // The layers' names in the order first named, apart by commas, and how
+    // many there are.
+    var layers: u8[>..] = [];
+    var named: i32 = 0;
     loop {
         skip_ws_comments(l);
         // Out of the blocks that end here, past their '}'.
@@ -484,6 +499,7 @@ fn parse_rules(src: const u8[:], sh: Sheet, origin: i32, order: i32, media: i32)
             l.pos = max(l.pos, block_end[top - 1] + 1);
             top -= 1;
             cur = block_media[top];
+            layer = block_layer[top];
             skip_ws_comments(l);
         }
         guard l.pos < src.len else { break; }
@@ -498,26 +514,40 @@ fn parse_rules(src: const u8[:], sh: Sheet, origin: i32, order: i32, media: i32)
             while e < lim && is_ident(src[e]) { e += 1; }
             while l.pos < lim && src[l.pos] != ';' && src[l.pos] != '{' {
                 if src[l.pos] == '"' || src[l.pos] == '\'' { l.pos = skip_string(src, l.pos); continue; }
+                if at_comment(src, l.pos) { l.pos = skip_comment(src, l.pos); continue; }
+                if src[l.pos] == '\\' { l.pos += 2; continue; }
                 l.pos += 1;
             }
-            guard l.pos < lim && src[l.pos] == '{' else { l.pos += 1; continue; }
-            let prelude = trim(src[e..l.pos]);
+            let name = src[at + 1..e];
+            var prelude: u8[>..] = [];
+            without_comments(src[e..min(l.pos, lim)], prelude);
+            let pre = trim(prelude[..]);
+            guard l.pos < lim && src[l.pos] == '{' else {
+                // A statement: `@layer a, b;` names layers in that order.
+                if same_word(name, "layer") {
+                    each_split(pre, ',') { let r = layer_rank(layers, named, trim(it), layer, false); };
+                }
+                l.pos += 1;
+                continue;
+            }
             let open = l.pos;
             skip_block(l);
             // Its '}', or the sheet's end for a block the sheet never closes.
             let close = if l.pos > open + 1 && src[l.pos - 1] == '}' { l.pos - 1 } else { src.len };
-            let name = src[at + 1..e];
             let into = same_word(name, "media") || same_word(name, "layer")
-                       || (same_word(name, "supports") && supports(prelude));
+                       || (same_word(name, "supports") && supports(pre));
             guard into && top < 16 else { continue; }
             block_end[top] = min(close, lim);
             block_media[top] = cur;
+            block_layer[top] = layer;
             top += 1;
             if same_word(name, "media") {
                 let text = sh.bytes.len as i32;
-                sh.bytes.append(prelude);
-                sh.media.push(Media { text: text, text_len: prelude.len as i32, parent: cur, on: false });
+                sh.bytes.append(pre);
+                sh.media.push(Media { text: text, text_len: pre.len as i32, parent: cur, on: false });
                 cur = (sh.media.len - 1) as i32;
+            } else if same_word(name, "layer") {
+                layer = layer_rank(layers, named, pre, layer, true);
             }
             l.pos = open + 1;
             continue;
@@ -526,34 +556,72 @@ fn parse_rules(src: const u8[:], sh: Sheet, origin: i32, order: i32, media: i32)
         let pstart = l.pos;
         while l.pos < lim && src[l.pos] != '{' {
             if at_comment(src, l.pos) { l.pos = skip_comment(src, l.pos); continue; }
+            if src[l.pos] == '\\' { l.pos += 2; continue; }
             l.pos += 1;
         }
         guard l.pos < lim else { l.pos = lim; continue; }
-        let prelude = src[pstart..l.pos];
+        let selectors = src[pstart..l.pos];
         l.pos += 1;
         let bstart = l.pos;
         while l.pos < lim && src[l.pos] != '}' {
             if src[l.pos] == '"' || src[l.pos] == '\'' { l.pos = skip_string(src, l.pos); continue; }
             if at_comment(src, l.pos) { l.pos = skip_comment(src, l.pos); continue; }
+            if src[l.pos] == '\\' { l.pos += 2; continue; }
             l.pos += 1;
         }
+        l.pos = min(l.pos, lim);
         var body_text: u8[>..] = [];
-        without_comments(src[bstart..min(l.pos, lim)], body_text);
+        without_comments(src[bstart..l.pos], body_text);
         // Past the rule's '}', but never past its block's.
         l.pos = if l.pos < lim { l.pos + 1 } else { lim };
         let decl_start = sh.decls.len as i32;
         parse_declarations(body_text[..], sh.decls, sh.bytes);
         let decl_count = sh.decls.len as i32 - decl_start;
         guard decl_count > 0 else { continue; }
-        each_split(prelude, ',') {
-            if parse_selector(trim(it), sh, decl_start, decl_count, origin, next, cur) { next += 1; }
+        each_split(selectors, ',') {
+            if parse_selector(trim(it), sh, decl_start, decl_count, origin, next, cur, layer) { next += 1; }
         };
     }
     return next;
 }
 
+// The rank of layer `name` inside layer `outer` (UNLAYERED: none), named
+// in the sheet's `layers` (`named` of them, apart by commas): its own if
+// named before, else the next. A nested layer is "outer.name". An unnamed
+// block (`fresh`, no name) is a layer of its own. Ranks stop at 254.
+fn layer_rank(layers: u8[>..]&, named: i32&, name: const u8[:], outer: i32, fresh: bool) -> i32 {
+    var full: u8[>..] = [];
+    if outer != UNLAYERED {
+        // The outer layer's name: the outer-th in the list.
+        var k: i32 = 0;
+        var from: i64 = 0;
+        for c, j in layers {
+            guard c == ',' else { continue; }
+            if k == outer { full.append(layers[from..j]); full.push('.'); }
+            k += 1;
+            from = j + 1;
+        }
+    }
+    if name.len == 0 && fresh { format(full, "#", named); }
+    else { full.append(name); }
+    var k: i32 = 0;
+    var from: i64 = 0;
+    for c, j in layers {
+        guard c == ',' else { continue; }
+        if layers[from..j] == full[..] { return k; }
+        k += 1;
+        from = j + 1;
+    }
+    guard named < UNLAYERED - 1 else { return UNLAYERED - 1; }
+    layers.append(full);
+    layers.push(',');
+    named += 1;
+    return named - 1;
+}
+
 // One complex selector; false (and nothing added) when it uses what we don't support.
-fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origin: i32, order: i32, media: i32) -> bool {
+fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origin: i32, order: i32, media: i32,
+                  layer: i32) -> bool {
     guard sel.len > 0 && selector_supported(sel) else { return false; }
     let comp_start = sh.comps.len;
     var ids = 0;
@@ -643,7 +711,7 @@ fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origi
     let spec = (min(ids, 255) << 16) | (min(classes, 255) << 8) | min(types, 255);
     let pseudo = sh.comps[sh.comps.len - 1].pseudo;
     sh.rules.push(Rule { comp: comp_start as i32, comp_count: (sh.comps.len - comp_start) as i32, decl: decl, decl_count: decl_count,
-                         spec: spec as i32, order: order, origin: origin, pseudo: pseudo, media: media });
+                         spec: spec as i32, order: order, origin: origin, pseudo: pseudo, media: media, layer: layer });
     return true;
 }
 
@@ -1842,6 +1910,17 @@ fn viewport_overflow(d: Doc, styles: Style[>..]&) {
     }
 }
 
+// Where a declaration ranks in the cascade, as one number: importance, then
+// origin, then its layer (Cascade 5 §6.4: a later layer beats an earlier
+// one, and no layer beats any, the other way round for !important), then
+// specificity, then order. Bits: importance 62, origin 59–61, layer 51–58,
+// specificity 27–50, order 0–26.
+fn cascade_prio(important: i32, origin: i64, layer: i32, spec: i32, order: i32) -> i64 {
+    let rank: i64 = if important != 0 { UNLAYERED - layer } else { layer };
+    let o: i64 = order;
+    return (important as i64) << 62 | origin << 59 | rank << 51 | (spec as i64) << 27 | (o & 0x7FFFFFF);
+}
+
 // Whether `a` is `lower` in any case, `lower` being in lower case.
 fn same_word(a: const u8[:], lower: const u8[:]) -> bool {
     guard a.len == lower.len else { return false; }
@@ -1915,13 +1994,21 @@ recursive fn compute_subtree(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, par
         s = if is_generated(d, n) { styles[n] } else { cascade(d, sh, n, parent, 0, w) };
     }
     styles[n] = s;
-    if element && pseudo_rules.len > 0 && s.display != K_NONE && !is_generated(d, n) {
-        // Which of its pseudo-elements a rule styles: 1 ::before, 2 ::after.
+    if element && !is_generated(d, n) {
+        // Which of its pseudo-elements a rule styles: 1 ::before, 2 ::after;
+        // and one made before, styled again: by rules that still give it
+        // content, or hidden.
         var styled: i32 = 0;
-        for k in pseudo_rules {
-            let r = sh.rules[k];
-            if (styled & r.pseudo) == 0 && rule_matches(sh, d, r, n) { styled |= r.pseudo; }
+        if s.display != K_NONE {
+            for k in pseudo_rules {
+                let r = sh.rules[k];
+                if (styled & r.pseudo) == 0 && rule_matches(sh, d, r, n) { styled |= r.pseudo; }
+            }
         }
+        let f = d.nodes[n].first;
+        let l = d.nodes[n].last;
+        if f >= 0 && is_generated(d, f) && node_name(d, f) == "::before" { styled |= 1; }
+        if l >= 0 && is_generated(d, l) && node_name(d, l) == "::after" { styled |= 2; }
         if (styled & 1) != 0 { generate(d, sh, styles, n, s, 1, w); }
         if (styled & 2) != 0 { generate(d, sh, styles, n, s, 2, w); }
     }
@@ -1945,6 +2032,21 @@ fn generate(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, s: const Style&, whi
     if edge >= 0 && d.nodes[edge].kind == NODE_ELEMENT && node_name(d, edge) == name {
         if ps.content_len < 0 { ps.display = K_NONE; }
         styles[edge] = ps;
+        // Content the cascade changed: its text says the new content (the
+        // DOM only grows, so the new text goes after the bytes there).
+        guard ps.content_len >= 0 else { return; }
+        let content = span_of(sh, ps.content, ps.content_len);
+        let t = d.nodes[edge].first;
+        if t >= 0 && d.nodes[t].kind == NODE_TEXT {
+            if node_text(d, t) != content {
+                d.nodes[t].text = d.bytes.len as i32;
+                d.nodes[t].text_len = content.len as i32;
+                d.bytes.append(content);
+            }
+        } else if content.len > 0 {
+            add_text(d, content, edge);
+            styles.push(ps);
+        }
         return;
     }
     guard ps.content_len >= 0;
@@ -1993,7 +2095,7 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work
             let origin: i64 = if r.origin == ORIGIN_UA_HTML { ORIGIN_UA } else { r.origin };
             for j in r.decl..r.decl + r.decl_count {
                 let dc = sh.decls[j];
-                let prio = (dc.important as i64) << 62 | origin << 56 | (r.spec as i64) << 32 | r.order;
+                let prio = cascade_prio(dc.important, origin, r.layer, r.spec, r.order);
                 if dc.prop == P_CUSTOM { keep_custom(sh, w, mark, dc, prio); continue; }
                 if prio >= win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
             }
@@ -2017,7 +2119,7 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work
             var hint: Decl[>..] = [];
             add_declaration(an, v[..], 0, hint, sh.bytes);
             for dc in hint {
-                let prio = (ORIGIN_AUTHOR as i64) << 56;
+                let prio = cascade_prio(0, ORIGIN_AUTHOR, UNLAYERED, 0, 0);
                 if prio > win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
             }
         }
@@ -2030,7 +2132,7 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work
         without_comments(style_attr, text);
         parse_declarations(text[..], inline, sh.bytes);
         for dc in inline {
-            let prio = (dc.important as i64) << 62 | (ORIGIN_INLINE as i64) << 56;
+            let prio = cascade_prio(dc.important, ORIGIN_INLINE, UNLAYERED, 0, 0);
             if dc.prop == P_CUSTOM { keep_custom(sh, w, mark, dc, prio); continue; }
             if prio >= win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
         }
@@ -2753,7 +2855,7 @@ let UA_CSS = """
     article, main, header, footer, nav, aside, address, hr, form, fieldset, details, summary, center, menu, dir,
     table, caption, thead, tbody, tfoot, tr, legend, hgroup { display: block }
     li { display: list-item }
-    head, title, style, script, link, meta, base, noscript, template, iframe, object, embed, video, audio, img,
+    head, title, style, script, link, meta, base, template, iframe, object, embed, video, audio, img,
     math, input, button, select, textarea, map, area, canvas, picture, source, track, param { display: none }
     html { color: #1c1c1c; font-family: sans-serif; font-size: 17px; line-height: 1.6 }
     body { max-width: 720px; margin: 0 auto; padding: 40px 32px 120px }
@@ -2804,7 +2906,8 @@ fn load_sheets(d: Doc, sh: Sheet) {
     var order = parse_sheet(UA_SVG_CSS, sh, ORIGIN_UA, 0);
     order = parse_sheet(UA_CSS, sh, ORIGIN_UA_HTML, order);
     for n, i in d.nodes {
-        guard n.kind == NODE_ELEMENT && n.first >= 0 && node_name(d, i as i32) == "style" else { continue; }
+        guard n.kind == NODE_ELEMENT && n.first >= 0 && node_name(d, i as i32) == "style" && !in_template(d, i as i32)
+              else { continue; }
         // A sheet for print or speech only isn't for the screen.
         let media, has = attr_value(d, i as i32, "media");
         if has && !for_screen(media) { continue; }
@@ -2886,10 +2989,12 @@ fn media_matches(q: const u8[:], env: MediaEnv) -> bool {
 
 fn query_matches(q: const u8[:], env: MediaEnv) -> bool {
     guard q.len > 0 else { return false; }
-    guard q[0] != '(' else { let ok, v = condition(q, env); return ok && v; }
+    guard q[0] != '(' else { let ok, v = condition(q, env); return ok && v == MQ_TRUE; }
     var i: i64 = 0;
     var negate = false;
     var word = next_word(q, i);
+    // A word right before '(' is a function, which no query has.
+    guard i >= q.len || q[i] != '(' else { return false; }
     if word == "not" && (i >= q.len || q[skip_spaces(q, i)] != '(') {
         negate = true;
         word = next_word(q, i);
@@ -2898,24 +3003,42 @@ fn query_matches(q: const u8[:], env: MediaEnv) -> bool {
     } else if word == "not" {
         // `not (...)`: a condition.
         let ok, v = condition(q, env);
-        return ok && v;
+        return ok && v == MQ_TRUE;
     }
     guard word.len > 0 else { return false; }
+    // A type Tusk isn't, known or not, matches nothing (Media Queries 4 §2.3).
     let type_ok = word == "all" || word == "screen";
-    let known = type_ok || word == "print" || word == "speech" || word == "tv" || word == "projection"
-        || word == "handheld" || word == "braille" || word == "embossed" || word == "aural" || word == "tty";
-    guard known else { return false; }
     i = skip_spaces(q, i);
-    var v = type_ok;
+    var v = if type_ok { MQ_TRUE } else { MQ_FALSE };
     if i < q.len {
         let and = next_word(q, i);
-        guard and == "and" else { return false; }
+        guard and == "and" && i < q.len && q[i] != '(' else { return false; }
         let ok, c = condition(trim(q[i..]), env);
         guard ok else { return false; }
-        v = v && c;
+        v = mq_and(v, c);
     }
-    return if negate { !v } else { v };
+    if negate { v = mq_not(v); }
+    return v == MQ_TRUE;
 }
+
+// A media condition's value (Media Queries 4 §3.1): true, false, or unknown
+// for a feature Tusk can't read, which only `or` with a true can get past;
+// a query whose value is unknown doesn't match.
+let MQ_FALSE: i32 = 0;
+let MQ_TRUE: i32 = 1;
+let MQ_UNKNOWN: i32 = 2;
+
+fn mq_and(a: i32, b: i32) -> i32 {
+    if a == MQ_FALSE || b == MQ_FALSE { return MQ_FALSE; }
+    return if a == MQ_TRUE && b == MQ_TRUE { MQ_TRUE } else { MQ_UNKNOWN };
+}
+
+fn mq_or(a: i32, b: i32) -> i32 {
+    if a == MQ_TRUE || b == MQ_TRUE { return MQ_TRUE; }
+    return if a == MQ_FALSE && b == MQ_FALSE { MQ_FALSE } else { MQ_UNKNOWN };
+}
+
+fn mq_not(a: i32) -> i32 { return if a == MQ_UNKNOWN { MQ_UNKNOWN } else { MQ_TRUE - a }; }
 
 fn skip_spaces(q: const u8[:], i: i64) -> i64 {
     var j = i;
@@ -2934,19 +3057,19 @@ fn next_word(q: const u8[:], i: i64&) -> const u8[:] {
 
 // A condition: `not (x)`, or `(x)` joined by all `and` or all `or`. Whether it
 // could be read, and its value.
-recursive fn condition(q: const u8[:], env: MediaEnv) -> bool, bool {
+recursive fn condition(q: const u8[:], env: MediaEnv) -> bool, i32 {
     var i = skip_spaces(q, 0);
     var negate = false;
-    if starts_with(q[i..], "not") && i + 3 < q.len && (is_ws(q[i + 3]) || q[i + 3] == '(') {
+    if starts_with(q[i..], "not") && i + 3 < q.len && is_ws(q[i + 3]) {
         negate = true;
         i = skip_spaces(q, i + 3);
     }
     var joiner = 0;                         // 1 and, 2 or
-    var v = false;
+    var v = MQ_FALSE;
     var first = true;
     loop {
         i = skip_spaces(q, i);
-        guard i < q.len && q[i] == '(' else { return false, false; }
+        guard i < q.len && q[i] == '(' else { return false, MQ_FALSE; }
         // The matching ')'.
         var depth = 0;
         var j = i;
@@ -2954,28 +3077,31 @@ recursive fn condition(q: const u8[:], env: MediaEnv) -> bool, bool {
             if q[j] == '(' { depth += 1; } else if q[j] == ')' { depth -= 1; if depth == 0 { break; } }
             j += 1;
         }
-        guard j < q.len else { return false, false; }
+        guard j < q.len else { return false, MQ_FALSE; }
         let inner = trim(q[i + 1..j]);
-        var ok = true;
-        var x = false;
-        if inner.len > 0 && (inner[0] == '(' || starts_with(inner, "not ") || starts_with(inner, "not(")) {
-            ok, x = condition(inner, env);
+        var x = MQ_UNKNOWN;
+        if inner.len > 0 && (inner[0] == '(' || starts_with(inner, "not ")) {
+            let ok, y = condition(inner, env);
+            guard ok else { return false, MQ_FALSE; }
+            x = y;
         } else {
-            ok, x = feature(inner, env);
+            // A feature Tusk can't read, or a value it can't, is unknown.
+            let ok, y = feature(inner, env);
+            if ok { x = if y { MQ_TRUE } else { MQ_FALSE }; }
         }
-        guard ok else { return false, false; }
         if first { v = x; first = false; }
-        else if joiner == 1 { v = v && x; }
-        else { v = v || x; }
+        else if joiner == 1 { v = mq_and(v, x); }
+        else { v = mq_or(v, x); }
         i = skip_spaces(q, j + 1);
         guard i < q.len else { break; }
-        guard !negate else { return false, false; }       // `not` takes one condition
+        guard !negate else { return false, MQ_FALSE; }    // `not` takes one condition
         let word = next_word(q, i);
         let join = if word == "and" { 1 } else if word == "or" { 2 } else { 0 };
-        guard join != 0 && (joiner == 0 || joiner == join) else { return false, false; }  // no mixing without parens
+        guard join != 0 && (joiner == 0 || joiner == join) else { return false, MQ_FALSE; }  // no mixing without parens
+        guard i < q.len && q[i] != '(' else { return false, MQ_FALSE; }   // `and(` is a function
         joiner = join;
     }
-    return true, if negate { !v } else { v };
+    return true, if negate { mq_not(v) } else { v };
 }
 
 // One media feature: `name`, `name: value`, or a range such as `width >= 600px`
@@ -3083,53 +3209,193 @@ fn compare(name: const u8[:], value: const u8[:], op: const u8[:], env: MediaEnv
     return false, false;
 }
 
-// A length in a media query, in CSS pixels: em and rem are 16px there.
+// A length in a media query, in CSS pixels: em and rem are 16px there, and
+// calc(), min(), max() and clamp() of lengths and numbers, with + - * /,
+// are worked out (Wikipedia writes calc(640px - 1px)).
 fn media_length(v: const u8[:], env: MediaEnv) -> bool, f64 {
     var i: i64 = 0;
-    while i < v.len && (v[i] == '-' || v[i] == '+' || v[i] == '.' || (v[i] >= '0' && v[i] <= '9')) { i += 1; }
-    guard i > 0 else { return false, 0.0; }
-    let n, ok = parse_flt(v[..i]);
-    guard ok else { return false, 0.0; }
-    let unit = v[i..];
-    if unit == "px" || (unit.len == 0 && n == 0.0) { return true, n; }
-    if unit == "em" || unit == "rem" { return true, n * 16.0; }
-    if unit == "pt" { return true, n * 4.0 / 3.0; }
-    if unit == "pc" { return true, n * 16.0; }
-    if unit == "in" { return true, n * 96.0; }
-    if unit == "cm" { return true, n * 96.0 / 2.54; }
-    if unit == "mm" { return true, n * 96.0 / 25.4; }
-    if unit == "vw" { return true, n * env.width / 100.0; }
-    if unit == "vh" { return true, n * env.height / 100.0; }
-    return false, 0.0;
+    var ok = true;
+    var len = false;
+    let x = calc_sum(v, i, env, ok, len);
+    guard ok && skip_spaces(v, i) == v.len && (len || x == 0.0) else { return false, 0.0; }
+    return true, x;
 }
 
-// A feature with a keyword, or none (`(hover)`): what Tusk is, on a Mac.
+// A sum in calc(): products joined by + and -, of the same kind. Moves `i`
+// past it; `len` says whether it is a length (else a number).
+recursive fn calc_sum(v: const u8[:], i: i64&, env: MediaEnv, ok: bool&, len: bool&) -> f64 {
+    var l1 = false;
+    var x = calc_product(v, i, env, ok, l1);
+    loop {
+        let j = skip_spaces(v, i);
+        guard ok && j < v.len && (v[j] == '+' || v[j] == '-') else { break; }
+        let minus = v[j] == '-';
+        i = j + 1;
+        var l2 = false;
+        let y = calc_product(v, i, env, ok, l2);
+        if l1 != l2 { ok = false; }
+        x = if minus { x - y } else { x + y };
+    }
+    len = l1;
+    return x;
+}
+
+// A product in calc(): values joined by * and /; a length may be multiplied
+// or divided by a number, not by a length.
+recursive fn calc_product(v: const u8[:], i: i64&, env: MediaEnv, ok: bool&, len: bool&) -> f64 {
+    var l1 = false;
+    var x = calc_value(v, i, env, ok, l1);
+    loop {
+        let j = skip_spaces(v, i);
+        guard ok && j < v.len && (v[j] == '*' || v[j] == '/') else { break; }
+        let divide = v[j] == '/';
+        i = j + 1;
+        var l2 = false;
+        let y = calc_value(v, i, env, ok, l2);
+        if divide {
+            if l2 || y == 0.0 { ok = false; } else { x = x / y; }
+        } else {
+            if l1 && l2 { ok = false; }
+            x = x * y;
+            l1 = l1 || l2;
+        }
+    }
+    len = l1;
+    return x;
+}
+
+// A value in calc(): a number with or without a unit, a sum in brackets, or
+// calc(), min(), max() or clamp() of sums.
+recursive fn calc_value(v: const u8[:], i: i64&, env: MediaEnv, ok: bool&, len: bool&) -> f64 {
+    i = skip_spaces(v, i);
+    guard i < v.len else { ok = false; return 0.0; }
+    if v[i] == '(' {
+        i += 1;
+        let x = calc_sum(v, i, env, ok, len);
+        i = skip_spaces(v, i);
+        if i < v.len && v[i] == ')' { i += 1; } else { ok = false; }
+        return x;
+    }
+    if (v[i] >= 'a' && v[i] <= 'z') || (v[i] >= 'A' && v[i] <= 'Z') {
+        let name_at = i;
+        while i < v.len && is_ident(v[i]) { i += 1; }
+        let name = v[name_at..i];
+        guard i < v.len && v[i] == '(' else { ok = false; return 0.0; }
+        i += 1;
+        var x = calc_sum(v, i, env, ok, len);
+        var args = 1;
+        var lo = x;
+        var hi = x;
+        var mid = x;
+        loop {
+            i = skip_spaces(v, i);
+            guard ok && i < v.len && v[i] == ',' else { break; }
+            i += 1;
+            var l2 = false;
+            let y = calc_sum(v, i, env, ok, l2);
+            if l2 != len { ok = false; }
+            args += 1;
+            if args == 2 { mid = y; }
+            if args == 3 { hi = y; }
+            x = if same_word(name, "max") { max(x, y) } else { min(x, y) };
+        }
+        i = skip_spaces(v, i);
+        if i < v.len && v[i] == ')' { i += 1; } else { ok = false; }
+        if same_word(name, "calc") { if args != 1 { ok = false; } return x; }
+        if same_word(name, "min") || same_word(name, "max") { return x; }
+        if same_word(name, "clamp") {
+            if args != 3 { ok = false; }
+            return max(lo, min(mid, hi));
+        }
+        ok = false;
+        return 0.0;
+    }
+    let start = i;
+    if v[i] == '-' || v[i] == '+' { i += 1; }
+    while i < v.len && (v[i] == '.' || (v[i] >= '0' && v[i] <= '9')) { i += 1; }
+    let n, number = parse_flt(v[start..i]);
+    guard number else { ok = false; return 0.0; }
+    let unit_at = i;
+    while i < v.len && ((v[i] >= 'a' && v[i] <= 'z') || (v[i] >= 'A' && v[i] <= 'Z')) { i += 1; }
+    let unit = v[unit_at..i];
+    guard unit.len > 0 else { len = false; return n; }
+    len = true;
+    let px, known = unit_px(unit, env);
+    guard known else { ok = false; return 0.0; }
+    return n * px;
+}
+
+// How many CSS pixels one `unit` is in a media query: em and rem are 16px.
+fn unit_px(unit: const u8[:], env: MediaEnv) -> f64, bool {
+    if same_word(unit, "px") { return 1.0, true; }
+    if same_word(unit, "em") || same_word(unit, "rem") { return 16.0, true; }
+    if same_word(unit, "pt") { return 4.0 / 3.0, true; }
+    if same_word(unit, "pc") { return 16.0, true; }
+    if same_word(unit, "in") { return 96.0, true; }
+    if same_word(unit, "cm") { return 96.0 / 2.54, true; }
+    if same_word(unit, "mm") { return 96.0 / 25.4, true; }
+    if same_word(unit, "vw") { return env.width / 100.0, true; }
+    if same_word(unit, "vh") { return env.height / 100.0, true; }
+    return 0.0, false;
+}
+
+// A feature with a keyword, or none (`(hover)`): what Tusk is, on a Mac. A
+// keyword the feature doesn't have can't be read: false, false.
 fn discrete(name: const u8[:], value: const u8[:], env: MediaEnv) -> bool, bool {
     let none = value.len == 0;
-    if name == "width" || name == "height" { return true, if name == "width" { env.width > 0.0 } else { env.height > 0.0 }; }
+    if name == "width" || name == "height" { return none, if name == "width" { env.width > 0.0 } else { env.height > 0.0 }; }
     if name == "orientation" {
-        guard value == "portrait" || value == "landscape" || none else { return false, false; }
+        guard none || value == "portrait" || value == "landscape" else { return false, false; }
         return true, none || (value == "portrait") == (env.height >= env.width);
     }
     if name == "prefers-color-scheme" {
-        guard value == "light" || value == "dark" || none else { return false, false; }
+        guard none || value == "light" || value == "dark" else { return false, false; }
         return true, none || (value == "dark") == env.dark;
     }
-    if name == "hover" || name == "any-hover" { return true, none || value == "hover"; }
-    if name == "pointer" || name == "any-pointer" { return true, none || value == "fine"; }
-    if name == "prefers-reduced-motion" || name == "prefers-reduced-transparency" || name == "prefers-contrast"
-       || name == "prefers-reduced-data" {
+    if name == "hover" || name == "any-hover" {
+        guard none || value == "hover" || value == "none" else { return false, false; }
+        return true, none || value == "hover";
+    }
+    if name == "pointer" || name == "any-pointer" {
+        guard none || value == "fine" || value == "coarse" || value == "none" else { return false, false; }
+        return true, none || value == "fine";
+    }
+    if name == "prefers-reduced-motion" || name == "prefers-reduced-transparency" || name == "prefers-reduced-data" {
+        guard none || value == "no-preference" || value == "reduce" else { return false, false; }
         return true, value == "no-preference";
     }
-    if name == "forced-colors" || name == "inverted-colors" { return true, value == "none"; }
-    if name == "scripting" { return true, value == "none"; }       // no JavaScript yet (docs/adr/0004)
-    if name == "display-mode" { return true, value == "browser"; }
-    if name == "update" { return true, none || value == "fast"; }
-    if name == "color-gamut" { return true, value == "srgb" || value == "p3"; }
-    if name == "dynamic-range" || name == "video-dynamic-range" { return true, value == "standard"; }
+    if name == "prefers-contrast" {
+        guard none || value == "no-preference" || value == "more" || value == "less" || value == "custom" else { return false, false; }
+        return true, value == "no-preference";
+    }
+    if name == "forced-colors" || name == "inverted-colors" {
+        guard none || value == "none" || value == "active" || value == "inverted" else { return false, false; }
+        return true, value == "none";
+    }
+    if name == "scripting" {                          // no JavaScript yet (docs/adr/0004)
+        guard none || value == "none" || value == "enabled" || value == "initial-only" else { return false, false; }
+        return true, value == "none";
+    }
+    if name == "display-mode" {
+        guard none || value == "browser" || value == "fullscreen" || value == "standalone" || value == "minimal-ui"
+              || value == "picture-in-picture" || value == "window-controls-overlay" else { return false, false; }
+        return true, none || value == "browser";
+    }
+    if name == "update" {
+        guard none || value == "fast" || value == "slow" || value == "none" else { return false, false; }
+        return true, none || value == "fast";
+    }
+    if name == "color-gamut" {
+        guard value == "srgb" || value == "p3" || value == "rec2020" else { return false, false; }
+        return true, value != "rec2020";
+    }
+    if name == "dynamic-range" || name == "video-dynamic-range" {
+        guard value == "standard" || value == "high" else { return false, false; }
+        return true, value == "standard";
+    }
     if name == "color" { return true, true; }
     if name == "monochrome" || name == "grid" { return true, value == "0"; }
-    if name == "resolution" || name == "aspect-ratio" { return true, true; }
+    if name == "resolution" || name == "aspect-ratio" { return none, true; }
     return false, false;
 }
 
@@ -3142,7 +3408,7 @@ fn discrete(name: const u8[:], value: const u8[:], env: MediaEnv) -> bool, bool 
 recursive fn supports(q: const u8[:]) -> bool {
     var i = skip_spaces(q, 0);
     var negate = false;
-    if starts_with(q[i..], "not") && i + 3 < q.len && (is_ws(q[i + 3]) || q[i + 3] == '(') {
+    if i + 3 < q.len && same_word(q[i..i + 3], "not") && (is_ws(q[i + 3]) || q[i + 3] == '(') {
         negate = true;
         i = skip_spaces(q, i + 3);
     }
@@ -3170,7 +3436,7 @@ recursive fn supports(q: const u8[:]) -> bool {
             x = selector_supported(inner);
         } else if fn_name.len > 0 {
             x = false;                          // font-tech(), font-format() and the rest
-        } else if inner.len > 0 && (inner[0] == '(' || starts_with(inner, "not ") || starts_with(inner, "not(")) {
+        } else if inner.len > 3 && (inner[0] == '(' || (same_word(inner[..3], "not") && (is_ws(inner[3]) || inner[3] == '('))) {
             x = supports(inner);
         } else {
             x = declaration_supported(inner);
@@ -3194,7 +3460,16 @@ recursive fn supports(q: const u8[:]) -> bool {
 // Whether Tusk reads `property: value` as a declaration: it knows the
 // property and takes the value.
 fn declaration_supported(decl: const u8[:]) -> bool {
-    guard find(decl, ":") > 0 else { return false; }
+    let colon = find(decl, ":");
+    guard colon > 0 else { return false; }
+    // Displays Tusk lays out as blocks for now (M3): saying no keeps a
+    // page's fallbacks.
+    if same_word(trim(decl[..colon]), "display") {
+        let v = trim(decl[colon + 1..]);
+        if same_word(v, "grid") || same_word(v, "inline-grid") || same_word(v, "contents") || same_word(v, "subgrid") {
+            return false;
+        }
+    }
     var out: Decl[>..] = [];
     var bytes: u8[>..] = [];
     parse_declarations(decl, out, bytes);
@@ -3226,12 +3501,24 @@ fn is_sheet_link(d: Doc, n: i32) -> bool {
     return sheet && !alternate && (!has_media || for_screen(media));
 }
 
+// Whether node n is inside a <template>, whose content is inert.
+fn in_template(d: Doc, n: i32) -> bool {
+    var p = d.nodes[n].parent;
+    while p >= 0 {
+        if is_element(d, p, "template") { return true; }
+        p = d.nodes[p].parent;
+    }
+    return false;
+}
+
 // The document's sheets in document order onto `out`: each <style> for the
-// screen with text, and each <link> to a sheet (is_sheet_link).
+// screen with text, and each <link> to a sheet (is_sheet_link), but none in
+// a <template>.
 fn sheet_sources(d: Doc, out: i32[>..]&) {
     for n, i in d.nodes {
         guard n.kind == NODE_ELEMENT else { continue; }
         let k = i as i32;
+        guard !in_template(d, k) else { continue; }
         if n.first >= 0 && node_name(d, k) == "style" {
             let media, has = attr_value(d, k, "media");
             if !has || for_screen(media) { out.push(k); }
@@ -3247,6 +3534,7 @@ fn sheet_sources(d: Doc, out: i32[>..]&) {
 // (CSS Cascade 4 §2.1). @charset and @layer statements may come before them.
 fn sheet_imports(src: const u8[:], hrefs: u8[>..]&, ends: i64[>..]&, medias: u8[>..]&, media_ends: i64[>..]&) {
     var l = Lexer { src: src, pos: 0 };
+    if starts_with(src, "\xEF\xBB\xBF") { l.pos = 3; }
     loop {
         skip_ws_comments(l);
         guard l.pos < src.len && src[l.pos] == '@' else { return; }
@@ -3262,8 +3550,9 @@ fn sheet_imports(src: const u8[:], hrefs: u8[>..]&, ends: i64[>..]&, medias: u8[
         }
         guard end < src.len && src[end] == ';' else { return; }     // a block: rules have begun
         if name[..] == "import" {
-            let href, media = import_target(trim(src[e..end]));
-            if href.len > 0 && (media.len == 0 || for_screen(media)) {
+            let href, rest = import_target(trim(src[e..end]));
+            let holds, media = import_conditions(rest);
+            if href.len > 0 && holds && (media.len == 0 || for_screen(media)) {
                 hrefs.append(href);
                 ends.push(hrefs.len);
                 medias.append(media);
@@ -3274,6 +3563,37 @@ fn sheet_imports(src: const u8[:], hrefs: u8[>..]&, ends: i64[>..]&, medias: u8[
         }
         l.pos = end + 1;
     }
+}
+
+// What follows an @import's URL (Cascade 5 §2.1): a layer, `layer` or
+// `layer(name)`, which Tusk imports unlayered; then `supports(...)`, which
+// must hold; then the media list. Whether it holds, and the media list.
+fn import_conditions(rest: const u8[:]) -> bool, const u8[:] {
+    var r = trim(rest);
+    if starts_with(r, "layer") || starts_with(r, "LAYER") {
+        var i: i64 = 5;
+        if i < r.len && r[i] == '(' {
+            while i < r.len && r[i] != ')' { i += 1; }
+            i = min(i + 1, r.len);
+        }
+        guard i == r.len || is_ws(r[i]) || r[i] == 's' || r[i] == 'S' else { return true, r; }
+        r = trim(r[i..]);
+    }
+    if r.len > 9 && same_word(r[..9], "supports(") {
+        var depth = 0;
+        var i: i64 = 8;
+        while i < r.len {
+            if r[i] == '(' { depth += 1; } else if r[i] == ')' { depth -= 1; if depth == 0 { break; } }
+            i += 1;
+        }
+        guard i < r.len else { return false, r[0..0]; }
+        let cond = trim(r[9..i]);
+        let holds = if cond.len > 0 && (cond[0] == '(' || same_word(cond[..min(cond.len, 4)], "not ")
+                                         || same_word(cond[..min(cond.len, 9)], "selector("))
+                    { supports(cond) } else { declaration_supported(cond) };
+        return holds, trim(r[i + 1..]);
+    }
+    return true, r;
 }
 
 // An @import's URL and media: `url(x) m`, `url("x") m` or `"x" m`.
@@ -3302,6 +3622,22 @@ fn for_screen(media: const u8[:]) -> bool {
     var m: u8[>..] = [];
     m.append(media);
     to_lower(m[..]);
-    let t = trim(m[..]);
-    return t.len == 0 || find(t, "screen") >= 0 || find(t, "all") >= 0 || (find(t, "print") < 0 && find(t, "speech") < 0);
+    guard trim(m[..]).len > 0 else { return true; }
+    // A list could be for the screen when one of its queries could: one of
+    // conditions alone, of all or screen, or `not` another type. Whether its
+    // conditions hold is the window's to say (set_media).
+    var could = false;
+    each_split(m[..], ',') {
+        var q = trim(it);
+        if starts_with(q, "only ") { q = trim(q[5..]); }
+        var negate = false;
+        if starts_with(q, "not ") { negate = true; q = trim(q[4..]); }
+        var e: i64 = 0;
+        while e < q.len && is_ident(q[e]) { e += 1; }
+        let kind = q[..e];
+        let screen = kind.len == 0 || kind == "all" || kind == "screen";
+        let more = trim(q[e..]).len > 0;
+        if (negate && (!screen || more)) || (!negate && screen) { could = true; }
+    };
+    return could;
 }
