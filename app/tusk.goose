@@ -421,7 +421,7 @@ fn wait_for_frame(tabs: Tab[>..]&, notes: u8[>..]&) {
 // The interface for what Tusk shows now, into its layer; its slot into
 // `slot`. Returns what laying it out took, in ms.
 fn show_ui(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, last_ms: f32, scale: f32, slot: Rect&,
-           actions: f32[>..<]&) -> f32 {
+           actions: f32[>..<]&, rows: const NetRow[:], urls: const u8[:]) -> f32 {
     var times: f32[>..<] = [];
     for i in 56 { times.push(0.0); }
     var n = tp_frame_times(times[..]);
@@ -430,7 +430,7 @@ fn show_ui(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, last_ms: f32, scale
                              max_cpu_ms: 0.0, max_gpu_ms: 0.0 };
     tp_frame_stats(stats, false);
     var html: u8[>..] = [];
-    ui_html(F, U, tabs, T, times[..n], stats.dropped, last_ms, html);
+    ui_html(F, U, tabs, T, times[..n], stats.dropped, last_ms, rows, urls, html);
     var drag: f32[>..<] = [];
     var holes: f32[>..<] = [];
     actions.resize(0);
@@ -635,6 +635,8 @@ fn main() {
     weigh(U);
     var slot = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
     var actions: f32[>..<] = [];     // what clicks on the interface do: x, y, w, h and an ACT_ each
+    var log_rows: NetRow[>..] = [];  // the shown page's network log, read for each interface
+    var log_urls: u8[>..] = [];
 
     if mode == MODE_SCREENSHOT {
         // Metal is set up before the page is timed, as tp_open does for the
@@ -654,7 +656,7 @@ fn main() {
         U.h = shot_h;
         var first_ms: f32 = 0.0;
         if bare { slot = Rect { x: 0.0, y: 0.0, w: shot_w, h: shot_h }; }
-        else { first_ms = show_ui(F, U, tabs, T, 0.0, scale, slot, actions); }
+        else { first_ms = show_ui(F, U, tabs, T, 0.0, scale, slot, actions, log_rows[..], log_urls[..]); }
         post(tabs[0].page, MSG_SIZE, slot.w, slot.h, scale);
         wait_for_frame(tabs, notes);
         let page_h = tabs[0].info.height;
@@ -663,7 +665,8 @@ fn main() {
         var bg = tabs[0].info.background;
         if !bare {
             weigh(U);
-            show_ui(F, U, tabs, T, first_ms, scale, slot, actions);
+            read_log(tabs[0].page, log_rows, log_urls);
+            show_ui(F, U, tabs, T, first_ms, scale, slot, actions, log_rows[..], log_urls[..]);
             bg = STEEL;
         }
         let rc = tp_screenshot(shot, shot_w, shot_h, scale, bg);
@@ -1011,7 +1014,8 @@ fn main() {
             let place = tabs[U.cur].entry;
             U.back = place >= 0 && entries[place].prev >= 0;
             U.forward = place >= 0 && entries[place].next >= 0;
-            ui_ms = show_ui(F, U, tabs, T, ui_ms, scale, slot, actions);
+            read_log(tabs[U.cur].page, log_rows, log_urls);
+            ui_ms = show_ui(F, U, tabs, T, ui_ms, scale, slot, actions, log_rows[..], log_urls[..]);
             // Every tab lays out again for a new slot at once, each on its own
             // core, so showing another is instant.
             // And for a new backing scale: a display list carries the scale

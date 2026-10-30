@@ -203,6 +203,7 @@ fn board_of(tabs: const Tab[:], T: UiText) -> const u8[:] {
 
 // The interface's document for tabs `tabs`, onto `out`.
 fn ui_html(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, frames: const f32[:], dropped: i32, rebuild_ms: f32,
+           rows: const NetRow[:], urls: const u8[:],
            out: u8[>..]&) {
     out.append("<!doctype html><meta charset=\"utf-8\"><title>Tusk</title><style>");
     out.append(F.css);
@@ -218,7 +219,7 @@ fn ui_html(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, frames: const f32[:
     let ch = max(U.h - BAR_H - PANEL_H, 0.0);
     bar(out, U, tabs, T);
     content(out, U, t, T, cw, ch);
-    if U.dev { dev_panel(out, U, tabs, T, cw, ch, frames, dropped, rebuild_ms); }
+    if U.dev { dev_panel(out, U, tabs, T, cw, ch, rows, urls, frames, dropped, rebuild_ms); }
     panel(out, F, U, tabs, T);
     out.append("</div>");
 }
@@ -379,7 +380,7 @@ fn content(out: u8[>..]&, U: Ui, t: Tab, T: UiText, cw: f32, ch: f32) {
 }
 
 // The dev panel: the page's line, then its tabs.
-fn dev_panel(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText, cw: f32, ch: f32,
+fn dev_panel(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText, cw: f32, ch: f32, rows: const NetRow[:], urls: const u8[:],
              frames: const f32[:], dropped: i32, rebuild_ms: f32) {
     let t = tabs[U.cur];
     out.append("<aside class=\"devp\" style=\"left:");
@@ -387,7 +388,7 @@ fn dev_panel(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText, cw: f32, ch: f
     out.append("; height:");
     px(out, ch);
     out.append("\"><div class=\"dph\"><div class=\"ro\"><div class=\"r1\">");
-    page_line(out, t, errors_of(t, T));
+    page_line(out, t, errors_of(t, T), rows);
     out.append("</div></div></div><div class=\"dpt\"><div class=\"dtabs\">");
     let names: const u8[:][5] = ["Console", "Network", "Elements", "Frames", "Oil"];
     for name, k in names {
@@ -399,7 +400,9 @@ fn dev_panel(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText, cw: f32, ch: f
     }
     out.append("</div>");
     if U.dev_tab == DEV_CONSOLE { console(out, U, t, T); }
-    else if U.dev_tab == DEV_NETWORK { network(out, U, t, T); }
+    else if U.dev_tab == DEV_NETWORK {
+        if rows.len > 0 { network_log(out, t, T, rows, urls); } else { network(out, U, t, T); }
+    }
     else if U.dev_tab == DEV_ELEMENTS { elements(out, t, T); }
     else if U.dev_tab == DEV_FRAMES { frame_graph(out, frames, dropped, rebuild_ms); }
     else { oil(out, U, tabs, T); }
@@ -407,8 +410,9 @@ fn dev_panel(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText, cw: f32, ch: f
 }
 
 // The page's line: its status, requests, size, `errors` and load time. A
-// file is one request; its status is OK once read.
-fn page_line(out: u8[>..]&, t: Tab, errors: i64) {
+// web page's requests and size are its log's (`rows`); a file is one
+// request, and its status is OK once read.
+fn page_line(out: u8[>..]&, t: Tab, errors: i64, rows: const NetRow[:]) {
     if t.failed {
         out.append("<span class=\"st er\">ERR</span><span><b>1</b> req</span><span><b>0.0</b> KB</span>");
         out.append("<span class=\"er\"><b>1</b> err</span>");
@@ -422,8 +426,13 @@ fn page_line(out: u8[>..]&, t: Tab, errors: i64) {
         // An HTTP error is a page too: it shows, with its status.
         if t.status >= 400 { format(out, "<span class=\"st er\">", t.status, "</span>"); }
         else { out.append("<span class=\"st ok\">OK</span>"); }
-        out.append("<span><b>1</b> req</span><span><b>");
-        format_flt(out, t.info.bytes / 1000.0, 1);
+        var bytes: i64 = t.info.bytes;
+        if rows.len > 0 {
+            bytes = 0;
+            for r in rows { bytes += r.bytes; }
+        }
+        format(out, "<span><b>", max(rows.len, 1), "</b> req</span><span><b>");
+        format_flt(out, bytes / 1000.0, 1);
         out.append("</b> KB</span>");
         format(out, if errors > 0 { "<span class=\"er\"><b>" } else { "<span><b>" }, errors, "</b> err</span>");
     }
@@ -501,6 +510,95 @@ fn network(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
     let phases: const u8[:][5] = ["Reading", "Parsing", "Styling", "Measuring text", "Layout"];
     let kinds: const u8[:][5] = ["w", "d", "d", "d", "d"];
     let times: f32[5] = [i.read, i.parse, i.style, i.measure, i.layout];
+    var most: f32 = 0.01;
+    for v in times { most = max(most, v); }
+    for name, k in phases {
+        format(out, "<li><span>", name, "</span><i class=\"", kinds[k], "\" style=\"width:");
+        format_flt(out, times[k] / most * 100.0, 0);
+        out.append("%\"></i><b>");
+        format_flt(out, times[k], 1);
+        out.append(" ms</b></li>");
+    }
+    out.append("</ul></div>");
+}
+
+// What a request is called in the Network tab: the last step of its URL's
+// path, or its host.
+fn row_name(url: const u8[:]) -> const u8[:] {
+    let h0, h1 = host_span(url);
+    let name = last_step(url);
+    var end = url.len;
+    for c, j in url { if (c == '?' || c == '#') && j >= name { end = j; break; } }
+    if name > h1 && name < end { return url[name..end]; }
+    return url[h0..h1];
+}
+
+let NET_ROWS_SHOWN: i64 = 30;
+
+// A web page's requests, as its log has them (platform/src/net.rs), on the
+// scale of the whole load: each with its status, its time and its phases,
+// connecting (look-up, TCP, TLS), waiting for the first byte and the
+// download; then the document's phases in detail, the network's and Tusk's
+// own.
+fn network_log(out: u8[>..]&, t: Tab, T: UiText, rows: const NetRow[:], urls: const u8[:]) {
+    let i = t.info;
+    var bytes: i64 = 0;
+    var end: f32 = 0.01;
+    for r in rows {
+        bytes += r.bytes;
+        end = max(end, r.start + r.total);
+    }
+    let ours = i.parse + i.style + i.measure + i.layout;
+    let load = max(max(t.load_ms, end + ours), 0.01);
+    out.append("<div class=\"nbar\"><span class=\"flt\">Filter</span><span class=\"sum\">");
+    format(out, rows.len, if rows.len == 1 { " req · " } else { " reqs · " });
+    format_flt(out, bytes / 1000.0, 1);
+    out.append(" KB · load ");
+    format(out, load as i64);
+    out.append(" ms</span></div><div class=\"nt\"><div class=\"nr hd\"><span>Name</span><span>Status</span><span class=\"r\">Time</span><span class=\"wfc ax\">");
+    for q in 4 {
+        out.append("<s style=\"left:");
+        format_flt(out, q * 25.0, 1);
+        out.append("%\">");
+        format(out, (load * q / 4.0) as i64);
+        out.append("</s>");
+    }
+    out.append("</span></div>");
+    for r, k in rows {
+        guard k < NET_ROWS_SHOWN else { break; }
+        let failed = r.error != 0 || r.status >= 400;
+        format(out, "<div class=\"nr", if failed { " er" } else { "" }, "\"><span>");
+        esc(out, row_name(urls[r.url_at..r.url_at + r.url_len]));
+        out.append("</span><span>");
+        if r.error != 0 { out.append("ERR"); } else { format(out, r.status); }
+        out.append("</span><span class=\"r\">");
+        if (r.flags & ROW_CACHED) != 0 { out.append("cache"); } else { format(out, r.total as i64, "ms"); }
+        out.append("</span><span class=\"wfc\">");
+        let setup = r.dns + r.connect + r.tls;
+        if setup > 0.0 { bar_at(out, "c", r.start, setup, load); }
+        bar_at(out, "w", r.start + setup, max(r.wait, load / 200.0), load);
+        bar_at(out, "d", r.start + setup + r.wait, max(r.download, load / 200.0), load);
+        out.append("</span></div>");
+    }
+    if rows.len > NET_ROWS_SHOWN { format(out, "<div class=\"nr\"><span>And ", rows.len - NET_ROWS_SHOWN, " more</span></div>"); }
+    // The document: the first request to end, before any of its sheets.
+    let d = rows[0];
+    out.append("</div><div class=\"ndet\"><p><b>");
+    esc(out, row_name(urls[d.url_at..d.url_at + d.url_len]));
+    out.append("</b> · ");
+    out.append(if d.proto == 3 { "HTTP/3" } else if d.proto == 2 { "HTTP/2" } else if d.proto == 1 { "HTTP/1.1" } else { "the document" });
+    if (d.flags & ROW_CACHED) != 0 { out.append(" · from the cache"); }
+    else if (d.flags & ROW_REUSED) != 0 { out.append(" · a connection already open"); }
+    if d.wire > 0 && d.wire != d.bytes {
+        out.append(" · ");
+        format_flt(out, d.wire / 1000.0, 1);
+        out.append(" KB over the wire");
+    }
+    out.append("</p><ul class=\"tim\">");
+    let phases: const u8[:][9] = ["Looking up", "Connecting", "TLS", "Waiting", "Downloading", "Parsing", "Styling",
+                                  "Measuring text", "Layout"];
+    let kinds: const u8[:][9] = ["c", "c", "c", "w", "d", "d", "d", "d", "d"];
+    let times: f32[9] = [d.dns, d.connect, d.tls, d.wait, d.download, i.parse, i.style, i.measure, i.layout];
     var most: f32 = 0.01;
     for v in times { most = max(most, v); }
     for name, k in phases {

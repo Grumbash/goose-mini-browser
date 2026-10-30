@@ -129,6 +129,7 @@ body { background:var(--bg); color:var(--ink); font:400 17px/1.5 var(--f-ui); -w
 .wfc i { position:absolute; top:6px; height:8px; border-radius:1px }
 .wfc .w { background:var(--h-w) }
 .wfc .d { background:var(--h-d) }
+.wfc .c { background:var(--h-c) }
 .er .wfc .w { background:#7A2A22 }
 .er .wfc .d { background:var(--err) }
 .live .wfc i { background:repeating-linear-gradient(-45deg, var(--h-w) 0 3px, rgba(140,106,46,.35) 3px 6px) }

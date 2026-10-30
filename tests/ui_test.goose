@@ -90,7 +90,7 @@ fn doc_for(title: const u8[:], path: const u8[:], w: f32, out: u8[>..]&) {
                     elems_len: 0 });
     let U = Ui { w: w, h: 760.0, lights: 0.0, cur: 0, dev: true, dev_tab: DEV_CONSOLE, oil: 50.0, mac_used: 12288.0, mac_total: 24576.0, cpu: 1.0, mac_cpu: 12.0, fps: 0,
                  running: false, back: false, forward: false, editing: false, caret: 0, all: false };
-    ui_html(F, U, tabs, T, [], 0, 1.0, out);
+    ui_html(F, U, tabs, T, [], 0, 1.0, [], "", out);
 }
 
 fn test_document() {
@@ -349,7 +349,47 @@ fn test_bar_names_and_log() {
     check("and each line at most 300 bytes", str(cut.len), str(300 + 3 + 1));
 }
 
+fn test_network_log() {
+    var html: u8[>..] = [];
+    var css: u8[>..] = [];
+    var sprite: u8[>..] = [];
+    var rest: u8[>..] = [];
+    var run: u8[>..] = [];
+    let F = UiFiles { css: css, sprite: sprite, rest: rest, run: run };
+    var notes: u8[>..] = [];
+    notes.append("https://a.org/wiki/Page");
+    var edit: u8[>..] = [];
+    let T = UiText { notes: notes, edit: edit };
+    let info = FrameInfo { height: 100.0, background: 0xFFFFFFFF, nodes: 10, bytes: 2000, parse: 1.0, style: 2.0,
+                           measure: 3.0, layout: 4.0, scale: 2.0, read: 50.0 };
+    var tabs: Tab[>..] = [];
+    tabs.push(Tab { worker: 0, page: 0, ready: true, failed: false, info: info, paint: 1.0, waiting: false, scroll: 0.0,
+                    restore: -1.0, opened: 0, load_ms: 60.0, status: 200, entry: 0, loc_at: 0, loc_len: notes.len,
+                    title_at: 0, title_len: 0, why_at: 0, why_len: 0, log_at: 0, log_len: 0, elems_at: 0, elems_len: 0 });
+    let U = Ui { w: 1200.0, h: 760.0, lights: 0.0, cur: 0, dev: true, dev_tab: DEV_NETWORK, oil: 50.0, mac_used: 1000.0,
+                 mac_total: 2000.0, cpu: 0.0, mac_cpu: 0.0, fps: 0, running: false, back: false, forward: false,
+                 editing: false, caret: 0, all: false };
+    var urls: u8[>..] = [];
+    urls.append("https://a.org/wiki/Page");
+    urls.append("https://a.org/w/load.php?modules=site");
+    var rows: NetRow[>..] = [];
+    rows.push(NetRow { req: 1, kind: NET_DOCUMENT, status: 200, error: 0, proto: 2, flags: ROW_TIMED, bytes: 300000,
+                       wire: 50000, url_at: 0, url_len: 23, start: 0.0, dns: 10.0, connect: 20.0, tls: 30.0,
+                       wait: 40.0, download: 50.0, total: 150.0 });
+    rows.push(NetRow { req: 2, kind: NET_STYLE, status: 404, error: 0, proto: 2, flags: ROW_TIMED | ROW_REUSED,
+                       bytes: 1000, wire: 1000, url_at: 23, url_len: urls.len - 23, start: 160.0, dns: 0.0,
+                       connect: 0.0, tls: 0.0, wait: 30.0, download: 5.0, total: 35.0 });
+    ui_html(F, U, tabs, T, [], 0, 1.0, rows[..], urls[..], html);
+    yes("the page line counts the log's requests and bytes", find(html[..], "<b>2</b> req</span><span><b>301.0</b> KB") >= 0);
+    yes("each request: its name, status and time", find(html[..], "<span>Page</span><span>200</span><span class=\"r\">150ms") >= 0
+        && find(html[..], "<span>load.php</span><span>404</span>") >= 0);
+    yes("a failed one is marked", find(html[..], "class=\"nr er\"") >= 0);
+    yes("the document's protocol and what came over the wire", find(html[..], "HTTP/2") >= 0 && find(html[..], "50.0 KB over the wire") >= 0);
+    yes("its phases, the network's and Tusk's", find(html[..], "<span>TLS</span>") >= 0 && find(html[..], "<span>Styling</span>") >= 0);
+}
+
 fn main() {
+    test_network_log();
     test_bar_names_and_log();
     test_address();
     test_links();

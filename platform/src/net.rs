@@ -33,7 +33,8 @@ use objc2_foundation::{
     NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSQualityOfService, NSString,
     NSURL, NSURLCache, NSURLRequest, NSURLRequestCachePolicy, NSURLSession,
     NSURLSessionConfiguration, NSURLSessionDataDelegate, NSURLSessionDataTask,
-    NSURLSessionDelegate, NSURLSessionTask, NSURLSessionTaskDelegate,
+    NSURLSessionDelegate, NSURLSessionTask, NSURLSessionTaskDelegate, NSURLSessionTaskMetrics,
+    NSURLSessionTaskMetricsResourceFetchType,
 };
 
 use crate::url::scheme_of;
@@ -90,12 +91,78 @@ pub struct NetHead {
     pub expected: i64,
 }
 
+/// A request in a page's network log, laid out as Goose's `struct NetRow`:
+/// its id, what it was for, its HTTP status and why it failed (0 when it
+/// didn't), its protocol (1 HTTP/1.1, 2 HTTP/2, 3 HTTP/3, 0 none: a file,
+/// or not known), flags (ROW_REUSED, ROW_CACHED, ROW_TIMED), its body's
+/// bytes and those that came over the wire, where its URL is in the log's
+/// text, and its times in ms: when it started after the page's first, then
+/// looking up, connecting, the TLS handshake, waiting for the first byte,
+/// the download, and in all.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NetRow {
+    pub req: i32,
+    pub kind: i32,
+    pub status: i32,
+    pub error: i32,
+    pub proto: i32,
+    pub flags: i32,
+    pub bytes: i64,
+    pub wire: i64,
+    pub url_at: i64,
+    pub url_len: i64,
+    pub start: f32,
+    pub dns: f32,
+    pub connect: f32,
+    pub tls: f32,
+    pub wait: f32,
+    pub download: f32,
+    pub total: f32,
+}
+
+pub const ROW_REUSED: i32 = 1; // on a connection already open
+pub const ROW_CACHED: i32 = 2; // from the cache, not the network
+pub const ROW_TIMED: i32 = 4; // its times have come
+const LOG_ROWS: usize = 500; // per page: a sanity limit
+
+/// A page's requests as they ended, and their URLs; and when its first
+/// started, in seconds since 1970, that the others count from.
+#[derive(Default)]
+struct PageLog {
+    origin: f64,
+    rows: Vec<NetRow>,
+    urls: Vec<u8>,
+}
+
+static LOGS: LazyLock<Mutex<HashMap<i32, PageLog>>> = LazyLock::new(Default::default);
+
+fn logs() -> MutexGuard<'static, HashMap<i32, PageLog>> {
+    LOGS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What a request's metrics say, kept until it ends.
+#[derive(Clone, Copy, Default)]
+struct Timing {
+    fetch: f64, // when it started, in seconds since 1970
+    proto: i32,
+    flags: i32,
+    wire: i64,
+    dns: f32,
+    connect: f32,
+    tls: f32,
+    wait: f32,
+    download: f32,
+    total: f32,
+}
+
 struct Req {
     tab: i32,
     kind: i32,
     profile: usize,
     from: String, // the page it is for; empty for a page we asked for
     got: i64,     // the body's bytes received so far
+    timing: Option<Timing>,
     task: Retained<NSURLSessionDataTask>,
     done: bool,
     status: i32,
@@ -113,6 +180,8 @@ struct Net {
     reqs: HashMap<i32, Req>,
     /// A session's task, by profile and task identifier, to its request.
     tasks: HashMap<(usize, usize), i32>,
+    /// Tasks that ended before their metrics came: their tab and request.
+    ended: HashMap<(usize, usize), (i32, i32)>,
 }
 
 static NET: LazyLock<Mutex<Net>> = LazyLock::new(Default::default);
@@ -161,6 +230,17 @@ define_class!(
             if catch_unwind(AssertUnwindSafe(|| finish(profile, task, error))).is_err() {
                 fail(profile, task);
             }
+        }
+
+        #[unsafe(method(URLSession:task:didFinishCollectingMetrics:))]
+        fn did_collect_metrics(
+            &self,
+            _session: &NSURLSession,
+            task: &NSURLSessionTask,
+            metrics: &NSURLSessionTaskMetrics,
+        ) {
+            let profile = self.ivars().profile;
+            let _ = catch_unwind(AssertUnwindSafe(|| timed(profile, task, metrics)));
         }
 
         #[unsafe(method(URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:))]
@@ -494,6 +574,7 @@ pub extern "C" fn tp_net_open(
                     profile,
                     from: from.to_string(),
                     got: 0,
+                    timing: None,
                     task: task.clone(),
                     done: false,
                     status: 0,
@@ -549,15 +630,23 @@ fn receive(profile: usize, task: &NSURLSessionDataTask, data: &NSData) {
 /// On the delegate's queue: a task ended. Its response is read, its body
 /// decoded to UTF-8 for a document or a sheet, and its tab woken.
 fn finish(profile: usize, task: &NSURLSessionTask, error: Option<&NSError>) {
-    let (id, tab, kind, preset, body) = {
+    let key = (profile, task.taskIdentifier());
+    let (id, tab, kind, preset, body, timing) = {
         let mut n = net();
-        let Some(id) = n.tasks.remove(&(profile, task.taskIdentifier())) else {
+        let Some(id) = n.tasks.remove(&key) else {
             return;
         };
         let Some(r) = n.reqs.get_mut(&id) else {
             return;
         };
-        (id, r.tab, r.kind, r.error, std::mem::take(&mut r.body))
+        (
+            id,
+            r.tab,
+            r.kind,
+            r.error,
+            std::mem::take(&mut r.body),
+            r.timing,
+        )
     };
     let response = task.response();
     let http = response
@@ -615,8 +704,16 @@ fn finish(profile: usize, task: &NSURLSessionTask, error: Option<&NSError>) {
     } else {
         to_utf8(body, charset.as_deref(), kind)
     };
+    log_row(tab, id, kind, status, code, &url, body.len() as i64, timing);
     {
         let mut n = net();
+        if timing.is_none() {
+            // Its metrics are still to come: they find its row this way.
+            if n.ended.len() > 1000 {
+                n.ended.clear();
+            }
+            n.ended.insert(key, (tab, id));
+        }
         // Cancelled in the meantime: no one waits for it.
         let Some(r) = n.reqs.get_mut(&id) else {
             return;
@@ -633,6 +730,162 @@ fn finish(profile: usize, task: &NSURLSessionTask, error: Option<&NSError>) {
     if !tabs::post_net(tab, id) {
         net().reqs.remove(&id);
     }
+}
+
+/// On the delegate's queue: `task`'s metrics, kept with its request, or
+/// put in its row when it has already ended.
+fn timed(profile: usize, task: &NSURLSessionTask, metrics: &NSURLSessionTaskMetrics) {
+    let tx = metrics.transactionMetrics();
+    let (Some(first), Some(last)) = (tx.firstObject(), tx.lastObject()) else {
+        return;
+    };
+    let secs = |d: Option<Retained<NSDate>>| d.map(|d| d.timeIntervalSince1970());
+    let span = |a: Option<Retained<NSDate>>, b: Option<Retained<NSDate>>| match (secs(a), secs(b)) {
+        (Some(a), Some(b)) if b >= a => ((b - a) * 1000.0) as f32,
+        _ => 0.0,
+    };
+    let proto = match last.networkProtocolName().map(|p| p.to_string()).as_deref() {
+        Some("h3") => 3,
+        Some("h2") => 2,
+        Some("http/1.1") | Some("http/1.0") => 1,
+        _ => 0,
+    };
+    let mut flags = ROW_TIMED;
+    if last.isReusedConnection() {
+        flags |= ROW_REUSED;
+    }
+    if last.resourceFetchType() == NSURLSessionTaskMetricsResourceFetchType::LocalCache {
+        flags |= ROW_CACHED;
+    }
+    let tls_start = last.secureConnectionStartDate();
+    let t = Timing {
+        fetch: secs(first.fetchStartDate()).unwrap_or(0.0),
+        proto,
+        flags,
+        wire: tx
+            .iter()
+            .map(|m| m.countOfResponseBodyBytesReceived())
+            .sum(),
+        dns: span(last.domainLookupStartDate(), last.domainLookupEndDate()),
+        connect: span(
+            last.connectStartDate(),
+            tls_start.clone().or_else(|| last.connectEndDate()),
+        ),
+        tls: span(tls_start, last.secureConnectionEndDate()),
+        wait: span(last.requestStartDate(), last.responseStartDate()),
+        download: span(last.responseStartDate(), last.responseEndDate()),
+        total: (metrics.taskInterval().duration() * 1000.0) as f32,
+    };
+    let key = (profile, task.taskIdentifier());
+    let ended = {
+        let mut n = net();
+        match n.tasks.get(&key).copied() {
+            Some(id) => {
+                if let Some(r) = n.reqs.get_mut(&id) {
+                    r.timing = Some(t);
+                }
+                None
+            }
+            None => n.ended.remove(&key),
+        }
+    };
+    if let Some((tab, id)) = ended {
+        let mut logs = logs();
+        if let Some(log) = logs.get_mut(&tab) {
+            if log.origin == 0.0 {
+                log.origin = t.fetch;
+            }
+            let origin = log.origin;
+            if let Some(row) = log.rows.iter_mut().rev().find(|r| r.req == id) {
+                fill_row(row, &t, origin);
+            }
+        }
+    }
+}
+
+/// Request `req` of page `tab` has ended: a row in the page's log.
+#[allow(clippy::too_many_arguments)]
+fn log_row(
+    tab: i32,
+    req: i32,
+    kind: i32,
+    status: i32,
+    error: i32,
+    url: &[u8],
+    bytes: i64,
+    timing: Option<Timing>,
+) {
+    let mut logs = logs();
+    let log = logs.entry(tab).or_default();
+    if log.rows.len() >= LOG_ROWS {
+        return;
+    }
+    let mut row = NetRow {
+        req,
+        kind,
+        status,
+        error,
+        bytes,
+        url_at: log.urls.len() as i64,
+        url_len: url.len() as i64,
+        ..Default::default()
+    };
+    log.urls.extend_from_slice(url);
+    if let Some(t) = timing {
+        if log.origin == 0.0 {
+            log.origin = t.fetch;
+        }
+        fill_row(&mut row, &t, log.origin);
+    }
+    log.rows.push(row);
+}
+
+fn fill_row(row: &mut NetRow, t: &Timing, origin: f64) {
+    row.proto = t.proto;
+    row.flags |= t.flags;
+    row.wire = t.wire;
+    row.start = (((t.fetch - origin) * 1000.0).max(0.0)) as f32;
+    row.dns = t.dns;
+    row.connect = t.connect;
+    row.tls = t.tls;
+    row.wait = t.wait;
+    row.download = t.download;
+    row.total = t.total;
+}
+
+/// How many rows page `tab`'s network log has, into `rows`, and how many
+/// bytes of URLs, into `bytes`.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_net_log_size(tab: i32, rows: *mut i64, bytes: *mut i64) -> i32 {
+    guarded(|| {
+        if rows.is_null() || bytes.is_null() {
+            return Err(ERR_ARGUMENT);
+        }
+        let logs = logs();
+        let (r, b) = logs
+            .get(&tab)
+            .map_or((0, 0), |l| (l.rows.len(), l.urls.len()));
+        unsafe {
+            rows.write_unaligned(r as i64);
+            bytes.write_unaligned(b as i64);
+        }
+        Ok(0)
+    })
+}
+
+/// Page `tab`'s network log: its rows into `rows` and their URLs into
+/// `urls`, each as long as tp_net_log_size said.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_net_log(tab: i32, rows: GSlice<NetRow>, urls: GSlice<u8>) -> i32 {
+    guarded(|| {
+        let logs = logs();
+        let empty = PageLog::default();
+        let log = logs.get(&tab).unwrap_or(&empty);
+        if !unsafe { rows.copy_from(&log.rows) } || !unsafe { urls.copy_from(&log.urls) } {
+            return Err(ERR_ARGUMENT);
+        }
+        Ok(0)
+    })
 }
 
 /// On the delegate's queue: a panic made `task` end where it was. Its
@@ -854,8 +1107,10 @@ pub extern "C" fn tp_net_cancel(req: i32) -> i32 {
     })
 }
 
-/// Stops and forgets every request of tab `tab`, as its mailbox closes.
+/// Stops and forgets every request of tab `tab`, and its log, as its
+/// mailbox closes.
 pub(crate) fn cancel_tab(tab: i32) {
+    logs().remove(&tab);
     let gone: Vec<Req> = {
         let mut n = net();
         let ids: Vec<i32> = n
@@ -1177,6 +1432,52 @@ mod tests {
         assert_eq!(names, ["kept"]);
         assert_eq!(tp_tab_drop(tab), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_page_logs_each_request_with_its_times() {
+        assert_eq!(std::mem::size_of::<NetRow>(), 84);
+        let port = serve(route);
+        let tab = 9106;
+        assert_eq!(tp_tab_open(tab), 0);
+        let base = format!("http://127.0.0.1:{port}");
+        open(tab, NET_DOCUMENT, &format!("{base}/page"), "");
+        take(tab);
+        open(
+            tab,
+            NET_STYLE,
+            &format!("{base}/missing"),
+            &format!("{base}/page"),
+        );
+        take(tab);
+        // The metrics may come just after the end.
+        std::thread::sleep(Duration::from_millis(200));
+        let (mut rows, mut bytes) = (0i64, 0i64);
+        assert_eq!(tp_net_log_size(tab, &mut rows, &mut bytes), 0);
+        assert_eq!(rows, 2);
+        let mut got = vec![NetRow::default(); rows as usize];
+        let mut urls = vec![0u8; bytes as usize];
+        let r = GSlice {
+            data: got.as_mut_ptr(),
+            len: rows,
+        };
+        let u = GSlice {
+            data: urls.as_mut_ptr(),
+            len: bytes,
+        };
+        assert_eq!(tp_net_log(tab, r, u), 0);
+        let (status, proto, flags, size) =
+            (got[0].status, got[0].proto, got[0].flags, got[0].bytes);
+        assert_eq!((status, proto, size), (200, 1, "<p>héllo</p>".len() as i64));
+        assert!(flags & ROW_TIMED != 0);
+        let (at, len) = (got[0].url_at as usize, got[0].url_len as usize);
+        assert_eq!(&urls[at..at + len], format!("{base}/page").as_bytes());
+        let (status, kind, total, start) = (got[1].status, got[1].kind, got[1].total, got[1].start);
+        assert_eq!((status, kind), (404, NET_STYLE));
+        assert!(total > 0.0 && start >= 0.0);
+        assert_eq!(tp_tab_drop(tab), 0);
+        assert_eq!(tp_net_log_size(tab, &mut rows, &mut bytes), 0);
+        assert_eq!(rows, 0, "a closed page's log goes");
     }
 
     #[test]
