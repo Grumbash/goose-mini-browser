@@ -23,8 +23,10 @@ woke the sleeping main thread through `tp_wake`.
 ## Consequences
 
 - AppKit and Metal objects live on the main thread only; every entry point
-  refuses, with an error code, when called from another thread.
+  that touches them refuses, with an error code, when called from another
+  thread. Text measuring touches neither and keeps its state per thread.
 - Workers never touch the window: they finish a display list and call
-  `tp_wake`, which posts an event to the main loop. Nothing polls.
+  `tp_wake`, the entry point meant for them, which posts an event to the main
+  loop. Nothing polls.
 - The demo in `browser/` keeps Goose's gfx and ui packages until Tusk can do
   what it does; the two programs live side by side in this repository.
