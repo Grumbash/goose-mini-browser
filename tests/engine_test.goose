@@ -98,17 +98,18 @@ fn style_at(src: const u8[:], name: const u8[:], k: i64, font: bool) -> u8[>..] 
         guard n.kind == NODE_ELEMENT && node_name(d, i as i32) == name else { continue; }
         if seen < k { seen += 1; continue; }
         let st = styles[i];
+        let bold = if st.weight >= 600 { 1 } else { 0 };
         if font {
-            format(out, "italic=", st.italic, " bold=", st.bold, " size=");
+            format(out, "italic=", st.italic, " bold=", bold, " size=");
             format_flt(out, st.font_size, 1);
             out.append(" lh=");
             format_flt(out, line_height(st), 1);
-            format(out, " family=", st.family);
+            format(out, " family=", st.family, " weight=", st.weight);
             return out;
         }
         format(out, "display=", st.display, " size=");
         format_flt(out, st.font_size, 1);
-        format(out, " bold=", st.bold, " italic=", st.italic, " color=");
+        format(out, " bold=", bold, " italic=", st.italic, " color=");
         format_uint(out, st.color, 16, 8, '0');
         out.append(" mt=");
         format_flt(out, st.mt, 1);
@@ -258,9 +259,9 @@ fn test_css_interface() {
         <style>h1 { font: italic 600 20px/1.5 "Barlow Condensed", Georgia, serif }
         h2 { font: 12px monospace; font-weight: bold } h3 { font: bold }</style><h1>a</h1><h2>b</h2><h3>c</h3>
         """;
-    check("the font shorthand", style_at(fonts, "h1", 0, true), "italic=1 bold=1 size=20.0 lh=30.0 family=1");
-    check("a longhand after the shorthand wins", style_at(fonts, "h2", 0, true), "italic=0 bold=1 size=12.0 lh=14.4 family=2");
-    check("a font with no size is ignored", style_at(fonts, "h3", 0, true), "italic=0 bold=1 size=20.4 lh=26.5 family=0");
+    check("the font shorthand", style_at(fonts, "h1", 0, true), "italic=1 bold=1 size=20.0 lh=30.0 family=1 weight=600");
+    check("a longhand after the shorthand wins", style_at(fonts, "h2", 0, true), "italic=0 bold=1 size=12.0 lh=14.4 family=2 weight=700");
+    check("a font with no size is ignored", style_at(fonts, "h3", 0, true), "italic=0 bold=1 size=20.4 lh=26.5 family=0 weight=700");
 
     // ::before and ::after, made once; :first-child still sees the first real child.
     let gen = """<style>p.q::before { content: "> "; color: #ff0000 } p.q::after { content: "" } p:before { content: none } p.q span:first-child { color: #00ff00 } p.q span::after { content: "\41 B" }</style><p class=q><span>s</span> quote</p><p>plain</p>""";
@@ -837,6 +838,19 @@ fn test_transforms() {
     check("transforms reach down the page", layout_probe(far, 400.0, PROBE_PAGE), "2030.0");
 }
 
+fn test_fonts() {
+    // Weights from 1 to 1000; bolder and lighter step from the parent's.
+    let weights = """
+        <style>h3 { font-weight: 300 } h3 b { font-weight: bolder } h4 { font-weight: 700 } h4 i { font-weight: lighter }
+        h5 { font-weight: 950 } h5 b { font-weight: bolder } h6 { font-weight: 50 } h6 i { font-weight: lighter }</style>
+        <h3>c <b>d</b></h3><h4>e <i>f</i></h4><h5>g <b>h</b></h5><h6>i <i>j</i></h6>
+        """;
+    check("bolder from 300", style_at(weights, "b", 0, true), "italic=0 bold=0 size=20.4 lh=26.5 family=0 weight=400");
+    check("lighter from 700", style_at(weights, "i", 0, true), "italic=1 bold=0 size=17.0 lh=27.2 family=0 weight=400");
+    check("bolder from over 900 stays", style_at(weights, "b", 1, true), "italic=0 bold=1 size=17.0 lh=27.2 family=0 weight=950");
+    check("lighter from under 100 stays", style_at(weights, "i", 1, true), "italic=1 bold=0 size=17.0 lh=27.2 family=0 weight=50");
+}
+
 // ------------------------------------------------------------------ layout
 
 let PROBE_PAGE: i32 = 17;   // the page's height
@@ -1221,6 +1235,7 @@ fn test_page() {
 }
 
 fn main() {
+    // The bundled fonts, as the app registers them; run from the repository.
     test_html();
     test_css();
     test_css_interface();
@@ -1228,6 +1243,7 @@ fn main() {
     test_positioning();
     test_flex();
     test_transforms();
+    test_fonts();
     test_layout();
     test_snapshot();
     test_page();
