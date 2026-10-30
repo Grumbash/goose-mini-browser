@@ -919,12 +919,13 @@ fn add_font(value: const u8[:], important: i32, out: Decl[>..]&) {
 // Whether a word of the font shorthand is its size: a length, or a size keyword.
 // The flex shorthand (CSS Flexbox 1 §7.1): none is 0 0 auto, auto 1 1 auto,
 // initial 0 1 auto; otherwise a grow and a shrink factor and a basis, any of
-// them left out: a number alone means a basis of 0.
+// them left out: a number alone means a basis of 0%, which in a column of
+// auto height is its content's size, as browsers have it.
 fn add_flex(value: const u8[:], important: i32, out: Decl[>..]&) {
     var grow: f64 = 1.0;
     var shrink: f64 = 1.0;
     var basis: u8[>..] = [];
-    basis.append("0");
+    basis.append("0%");
     if value == "none" || value == "auto" || value == "initial" {
         grow = if value == "auto" { 1.0 } else { 0.0 };
         shrink = if value == "none" { 0.0 } else { 1.0 };

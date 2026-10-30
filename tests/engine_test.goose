@@ -624,6 +624,62 @@ fn test_flex() {
           str(style_at(items, "span", 0, false)[..], " / ", style_at(items, "b", 0, false)[..])[..],
           "display=1 size=17.0 bold=0 italic=0 color=ff1c1c1c mt=0.0 ml=0.0 auto_ml=0 / display=42 size=17.0 bold=1 italic=0 color=ff1c1c1c mt=0.0 ml=0.0 auto_ml=0");
 
+    // From a review. A flex item keeps its content's margins; a container's
+    // min-height reaches its line, and a column's its items; a row item's
+    // percentage height counts in its container; reversed, margins stay on
+    // their sides; flex: 1 is a basis of 0%, its content's size in a column
+    // of auto height; an item with a height still shrinks to its content; a
+    // container that wraps is multi-line, even on one line; wrapped in
+    // reverse, flex-start is the line's far side.
+    let review = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        #fi { display: flex; align-items: flex-start } #it { width: 50px } #it p { height: 10px }
+        #tb { display: flex; align-items: center; min-height: 56px } #tb1 { width: 10px; height: 20px }
+        #cm { display: flex; flex-direction: column; min-height: 200px } #cm1 { height: 40px } #cm2 { flex: 1 }
+        #ph { display: flex; height: 80px } #ph1 { width: 10px; height: 50% }
+        #rr { display: flex; flex-direction: row-reverse; width: 200px } #rr1 { width: 20px; height: 5px; margin-left: 10px }
+        #ra { display: flex; flex-direction: row-reverse; width: 200px } #ra1 { width: 20px; height: 5px; margin-left: auto }
+        #cr { display: flex; flex-direction: column-reverse; height: 100px } #cr1 { height: 20px; margin-top: 15px }
+        #ic { display: flex; flex-direction: column } #ic1 { flex: 1; overflow: hidden }
+        #cs { display: flex; flex-direction: column; height: 100px } #cs1, #cs2 { height: 80px }
+        #w1 { display: flex; flex-wrap: wrap; height: 100px; align-content: flex-start } #w1a { width: 10px }
+        #w2 { display: flex; flex-wrap: wrap; height: 100px; align-content: center } #w2a { width: 10px; height: 20px }
+        #wr { display: flex; flex-wrap: wrap-reverse; align-items: flex-start } #wr1 { width: 10px; height: 10px } #wr2 { width: 10px; height: 20px }</style>
+        <div id=fi><div id=it><p id=p1 style="margin: 20px 0"></p><p id=p2 style="margin: 30px 0"></p></div></div>
+        <div id=tb><div id=tb1></div></div><div id=cm><div id=cm1></div><div id=cm2></div></div><div id=ph><div id=ph1></div></div>
+        <div id=rr><div id=rr1></div></div><div id=ra><div id=ra1></div></div><div id=cr><div id=cr1></div></div>
+        <div id=ic><div id=ic1><div style="height: 50px"></div></div></div>
+        <div id=cs><div id=cs1><div style="height: 10px"></div></div><div id=cs2><div style="height: 10px"></div></div></div>
+        <div id=w1><div id=w1a><div style="height: 20px"></div></div></div><div id=w2><div id=w2a></div></div>
+        <div id=wr><div id=wr1></div><div id=wr2></div></div>
+        """;
+    check("flex fixes from review", layout_probe(review, 400.0, PROBE_GEOMETRY),
+          str("fi x 0.0 y 0.0 w 400.0 h 100.0\nit x 0.0 y 0.0 w 50.0 h 100.0\np1 x 0.0 y 20.0 w 50.0 h 10.0\np2 x 0.0 y 60.0 w 50.0 h 10.0\n",
+              "tb x 0.0 y 100.0 w 400.0 h 56.0\ntb1 x 0.0 y 118.0 w 10.0 h 20.0\n",
+              "cm x 0.0 y 156.0 w 400.0 h 200.0\ncm1 x 0.0 y 156.0 w 400.0 h 40.0\ncm2 x 0.0 y 196.0 w 400.0 h 160.0\n",
+              "ph x 0.0 y 356.0 w 400.0 h 80.0\nph1 x 0.0 y 356.0 w 10.0 h 40.0\n",
+              "rr x 0.0 y 436.0 w 200.0 h 5.0\nrr1 x 180.0 y 436.0 w 20.0 h 5.0\nra x 0.0 y 441.0 w 200.0 h 5.0\nra1 x 180.0 y 441.0 w 20.0 h 5.0\n",
+              "cr x 0.0 y 446.0 w 400.0 h 100.0\ncr1 x 0.0 y 526.0 w 400.0 h 20.0\n",
+              "ic x 0.0 y 546.0 w 400.0 h 50.0\nic1 x 0.0 y 546.0 w 400.0 h 50.0\n",
+              "cs x 0.0 y 596.0 w 400.0 h 100.0\ncs1 x 0.0 y 596.0 w 400.0 h 50.0\ncs2 x 0.0 y 646.0 w 400.0 h 50.0\n",
+              "w1 x 0.0 y 696.0 w 400.0 h 100.0\nw1a x 0.0 y 696.0 w 10.0 h 20.0\nw2 x 0.0 y 796.0 w 400.0 h 100.0\nw2a x 0.0 y 836.0 w 10.0 h 20.0\n",
+              "wr x 0.0 y 896.0 w 400.0 h 20.0\nwr1 x 0.0 y 906.0 w 10.0 h 10.0\nwr2 x 10.0 y 896.0 w 10.0 h 20.0\n")[..]);
+
+    // Text straight in a container centres as its items do, down a row and
+    // across a column.
+    check("text in a flex row, centred", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none }</style><div id=c style="display: flex; height: 60px; align-items: center">label</div>""", 400.0, PROBE_CENTERED), "centred");
+    check("text in a flex column, centred", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none }</style><div id=c style="display: flex; flex-direction: column; align-items: center">label</div>""", 400.0, PROBE_CENTERED), "centred");
+
+    // Inline-blocks: a line may break after one; nowrap keeps two on a line
+    // however long; a percentage max-width counts in the line.
+    check("a break after an inline-block", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none }</style><div style="width: 100px"><span style="display: inline-block; width: 80px; height: 5px"></span>abcdefgh</div>""", 400.0, PROBE_TEXT),
+          "\"abcdefgh\" line 1 x 0\n");
+    check("inline-blocks that mustn't wrap, and a percentage max-width", layout_probe("""
+        <style>body { margin: 0; padding: 0; max-width: none } div { font-size: 0; width: 100px } span { display: inline-block; height: 5px }</style>
+        <div style="white-space: nowrap"><span id=n1 style="width: 60px"></span><span id=n2 style="width: 60px"></span></div>
+        <div style="width: 300px"><span id=ia style="width: 500px; max-width: 100%"></span></div>
+        """, 400.0, PROBE_GEOMETRY), "n1 x 0.0 y 0.0 w 60.0 h 5.0\nn2 x 60.0 y 0.0 w 60.0 h 5.0\nia x 0.0 y 5.0 w 300.0 h 5.0\n");
+
     // Text straight inside a flex container is an item of its own.
     let chip = """
         <style>body { margin: 0; padding: 0; max-width: none } #c { display: flex; align-items: center; gap: 6px; padding: 0 8px; position: absolute; left: 0; top: 0 }
@@ -639,6 +695,7 @@ let PROBE_CLIP: i32 = 10;   // each item of an element with an id: its clip, non
 let PROBE_ELLIPSIS: i32 = 11; // whether #e's text ends in "…" inside its box
 let PROBE_SHRINK: i32 = 12; // whether #s holds its text on one line, as wide as it
 let PROBE_ROOM: i32 = 13;   // whether #e is at most 100 wide, its text wrapped to fit
+let PROBE_CENTERED: i32 = 14; // whether #c's text's line box is centred in #c, down a row or across a column
 let PROBE_GLUE: i32 = 5;    // "ok", or the first text that starts a line with , . [ or ]
 let PROBE_RAISE: i32 = 6;   // each text item and its height over the first one's baseline
 let PROBE_TEXT: i32 = 1;    // each text item: its text, its line, and where it starts: the
@@ -678,8 +735,10 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
     var items: DItem[>..<] = [];
     var flex: FlexItem[>..<] = [];
     var atoms: i32[>..<] = [];
+    var measured: Measured[>..] = [];
     let L = Layout { d: d, styles: styles, text: text, carets: carets, runs: runs, run_of: run_of,
-                     fonts: fonts, boxes: boxes, items: items, flex: flex, atoms: atoms };
+                     fonts: fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
+                     measured: measured };
     measure(L);
     layout_page(L, width, 600.0);
 
@@ -821,6 +880,17 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
                 out.push(','); format_flt(out, it.clip_bl, 0);
             }
             out.push('\n');
+        }
+    } else if probe == PROBE_CENTERED {
+        for n, i in nodes {
+            let id, has = attr_value(d, i as i32, "id");
+            guard n.kind == NODE_ELEMENT && has && id == "c" else { continue; }
+            let column = styles[i].flex_dir == K_COLUMN;
+            let t = nodes[i].first;
+            let b = boxes[i];
+            let tb = boxes[t];
+            let off = if column { (tb.x + tb.w / 2.0) - (b.x + b.w / 2.0) } else { (tb.y + tb.h / 2.0) - (b.y + b.h / 2.0) };
+            out.append(if tb.w > 0.0 && off < 0.5 && off > -0.5 { "centred" } else { "not centred" });
         }
     } else if probe == PROBE_ROOM {
         for n, i in nodes {

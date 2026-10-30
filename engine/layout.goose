@@ -6,8 +6,9 @@
 // platform. Blocks stack with their margins collapsed, inline content breaks
 // into lines at spaces, and list items get markers. Positioned boxes are
 // placed once the flow is done, then everything is put in CSS's paint order
-// and cut to the boxes that clip it. Floats, tables as grids, flex and inline
-// backgrounds wait.
+// and cut to the boxes that clip it. Flex containers lay out their items;
+// inline-blocks sit on lines as one piece. Floats, grid, tables as grids and
+// inline backgrounds wait.
 
 import std;
 import .dom;
@@ -79,7 +80,12 @@ struct Layout {
     items: DItem[>..<]&,     // shrinks only when a flex container measures an item, see measure_sized
     flex: FlexItem[>..<]&,   // the items of the flex containers being laid out, one above another
     atoms: i32[>..<]&,       // the inline-blocks on the lines being laid out, see place_atomic
+    measured: Measured[>..]&, // per node, what measure_sized last found
 }
+
+// What measure_sized found for a node: its border-box height and first
+// baseline laid out `w` wide and `h` high (w -1: nothing yet).
+struct Measured { w: f32, h: f32, height: f32, baseline: f32 }
 
 // The line being filled.
 struct Line {
@@ -97,6 +103,7 @@ struct Line {
     ellipsis: i32,               // the run of the "…" that ends a line too long for its box, or -1
     soft: bool,                  // its last text wraps, so a break may follow it
     first_atom: i64,             // its inline-blocks start here in L.atoms
+    atom: bool,                  // an inline-block came last, so a break may follow
 }
 
 // The platform's font id: the family, then bold and italic bits.
@@ -334,10 +341,11 @@ fn is_out(L: Layout, n: i32) -> bool {
 }
 
 // Whether block n keeps its children's margins inside it, so that they don't
-// collapse with its own: the root, a box out of the flow, one that clips, and
-// a flex container.
+// collapse with its own: the root, a box out of the flow, one that clips, a
+// flex container and a flex item, and an inline-block.
 fn keeps_margins(L: Layout, n: i32) -> bool {
-    return L.d.nodes[n].parent == 0 || is_out(L, n) || clips_content(L, n) || is_flex(L, n) || is_atomic(L, n);
+    let p = L.d.nodes[n].parent;
+    return p == 0 || is_out(L, n) || clips_content(L, n) || is_flex(L, n) || is_atomic(L, n) || (p > 0 && is_flex(L, p));
 }
 
 // Whether n draws nothing: white space between blocks, a hidden element, or
@@ -438,7 +446,8 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
         // A height it has makes its items' room definite; percentages wait.
         var fh: f32 = -1.0;
         if s.height >= 0.0 { fh = content_height(s, 0.0, vt); }
-        let ih, ib = layout_flex(L, n, bx + s.bl + s.pl, y + s.bt + s.pt, w, fh);
+        let lo, hi = height_limits(s);
+        let ih, ib = layout_flex(L, n, bx + s.bl + s.pl, y + s.bt + s.pt, w, fh, lo, hi);
         inner = ih;
         first = ib;
     } else {
@@ -831,7 +840,7 @@ fn layout_lines(L: Layout, parent: i32, from: i32, to: i32, x: f32, y: f32, w: f
                       ascent: f.m.ascent + half, descent: f.m.descent + half,
                       strut_ascent: f.m.ascent + half, strut_descent: f.m.descent + half,
                       content: false, space: false, trailing: 0.0, align: s.align, first_baseline: -1.0, ellipsis: -1,
-                      soft: true, first_atom: L.atoms.len };
+                      soft: true, first_atom: L.atoms.len, atom: false };
     // A block that clips with text-overflow: ellipsis has its "…" as its run.
     if s.ellipsis != 0 && s.clips != 0 && s.display != K_LIST_ITEM { line.ellipsis = L.run_of[parent]; }
     if from == L.d.nodes[parent].first { line.x = s.indent; }
@@ -916,7 +925,7 @@ fn flow_text(L: Layout, line: Line&, n: i32) {
         let unit_w = own_w + (if word_end == run.len { glued_after(L, n) } else { 0.0 });
         // No break between this run and the text before it without a space, nor
         // where neither may wrap.
-        let glued = i == 0 && line.content && (!line.space || (!wraps && !line.soft));
+        let glued = i == 0 && line.content && ((!line.space && !line.atom) || (!wraps && !line.soft));
         if line.content && !glued && line.x + unit_w > line.width + 0.01 {
             if piece >= 0 { emit_text(L, line, run, s, piece, i, piece_x, raise); piece = -1; }
             close_line(L, line, false);
@@ -939,6 +948,7 @@ fn flow_text(L: Layout, line: Line&, n: i32) {
         if piece < 0 { piece = i; piece_x = line.x; }
         place(line, L.carets[c + j] - L.carets[c + i], j > word_end, L.carets[c + j] - L.carets[c + word_end], above, below);
         line.soft = wraps;
+        line.atom = false;
         i = j;
     }
     if piece >= 0 { emit_text(L, line, run, s, piece, run.len, piece_x, raise); }
@@ -1063,6 +1073,7 @@ fn close_line(L: Layout, line: Line&, forced: bool) {
         line.y += height;
     }
     L.atoms.resize(line.first_atom);
+    line.atom = false;
     line.x = 0.0;
     line.ascent = line.strut_ascent;
     line.descent = line.strut_descent;
@@ -1124,8 +1135,10 @@ fn ellipsize(L: Layout, line: Line&) -> f32 {
 // Sets inline-block or inline-flex n on the line as one piece: laid out as a
 // block as wide as it says, else as its content needs within the line, with
 // its first baseline on the line's (its bottom margin edge when it has no
-// lines). Its items wait on the line, relative to its baseline like text,
-// and its boxes go on L.atoms until close_line moves them too.
+// lines). It moves to the next line when it doesn't fit and its white-space
+// wraps, and a line may break after it. Its items wait on the line, relative
+// to its baseline like text, and its boxes go on L.atoms until close_line
+// moves them too.
 recursive fn place_atomic(L: Layout, line: Line&, n: i32) {
     let s = L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;
@@ -1138,9 +1151,11 @@ recursive fn place_atomic(L: Layout, line: Line&, n: i32) {
         w = min(max(least, line.width - s.ml - s.mr), most) - hz;
     }
     if s.max_width >= 0.0 { w = min(w, s.max_width - inside); }
-    w = max(max(w, s.min_width - inside), 0.0);
+    else if s.max_width_pct >= 0.0 { w = min(w, line.width * s.max_width_pct / 100.0 - inside); }
+    w = max(max(w, (if s.min_width_pct >= 0.0 { line.width * s.min_width_pct / 100.0 } else { s.min_width }) - inside), 0.0);
     let outer = s.ml + w + hz + s.mr;
-    if line.content && line.x + outer > line.width + 0.01 { close_line(L, line, false); }
+    let wraps = s.ws == K_NORMAL || s.ws == K_PRE_WRAP;
+    if wraps && line.content && line.x + outer > line.width + 0.01 { close_line(L, line, false); }
     let from = L.items.len;
     let lo, hi = height_limits(s);
     let bh, b = layout_sized(L, n, line.left + line.x + s.ml, 0.0, w, -1.0, lo, hi);
@@ -1149,6 +1164,8 @@ recursive fn place_atomic(L: Layout, line: Line&, n: i32) {
     shift_boxes(L, n, 0.0, -base);
     L.atoms.push(n);
     place(line, outer, false, 0.0, base + s.mt, bh - base + s.mb);
+    line.soft = wraps;
+    line.atom = true;
 }
 
 // A list item's marker, outside its content box, on its first line.
@@ -1843,17 +1860,20 @@ fn flex_item(node: i32, last: i32, s: Style) -> FlexItem {
 }
 
 // Lays out flex container n's items in its content box at (x, y), `w` wide
-// and `h` high (-1 when its height is auto): their base and hypothetical
-// sizes, lines when it wraps, flexing, their sizes across, and then each laid
-// out where justify-content, auto margins, align-content and align-self put
-// it. A row item's height is found by laying it out once and dropping what
-// that painted (measure_sized), then laying it out for real. Returns the
-// height the items take and the container's first baseline (-1 if none).
-recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f32, f32 {
+// and `h` high (-1 when its height is auto, `hmin` to `hmax` then: its min-
+// and max-height, content box, hmax -1 for none): their base and
+// hypothetical sizes, lines when it wraps, flexing, their sizes across, and
+// then each laid out where justify-content, auto margins, align-content and
+// align-self put it. A row item's height is found by laying it out once and
+// dropping what that painted (measure_sized, which remembers), then laying it
+// out for real. Returns the height the items take and the container's first
+// baseline (-1 if none).
+recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32, hmin: f32, hmax: f32) -> f32, f32 {
     let s = L.styles[n];
     let row = s.flex_dir == K_ROW || s.flex_dir == K_ROW_REVERSE;
     let reverse = s.flex_dir == K_ROW_REVERSE || s.flex_dir == K_COLUMN_REVERSE;
-    let main_size = if row { w } else { h };
+    let single = s.flex_wrap == K_NOWRAP;
+    var main_size = if row { w } else { h };
     let cross_size = if row { h } else { w };
     let col_gap = if (s.gap_pct & 2) != 0 { s.col_gap / 100.0 * w } else { s.col_gap };
     let row_gap = if (s.gap_pct & 1) == 0 { s.row_gap } else if h >= 0.0 { s.row_gap / 100.0 * h } else { 0.0 };
@@ -1870,7 +1890,7 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
     var count = 0;
     for i in mark..end {
         let outer = L.flex[i].main + L.flex[i].edge + L.flex[i].margin;
-        if s.flex_wrap != K_NOWRAP && main_size >= 0.0 && count > 0 && used + gap + outer > main_size + 0.01 {
+        if !single && main_size >= 0.0 && count > 0 && used + gap + outer > main_size + 0.01 {
             lines += 1;
             used = 0.0;
             count = 0;
@@ -1878,6 +1898,12 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
         used += (if count > 0 { gap } else { 0.0 }) + outer;
         count += 1;
         L.flex[i].line = lines - 1;
+    }
+    // A column whose height is auto gives its items the room they take,
+    // within its min-height and max-height, to flex into.
+    if !row && main_size < 0.0 {
+        let room = clamp_size(used, hmin, hmax);
+        if room != used { main_size = room; }
     }
     if main_size >= 0.0 {
         var a = mark;
@@ -1887,10 +1913,11 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
             a = b;
         }
     }
-    for i in mark..end { cross_of(L, i, n, row); }
+    for i in mark..end { cross_of(L, i, n, row, cross_size); }
 
     // Each line's size across: its biggest item, or its items' baselines lined
-    // up. A single line fills a container whose size across is known.
+    // up. The container's: its own, else its lines' within its min-height
+    // and max-height. A single line (nowrap) fills it.
     var total: f32 = 0.0;
     var a = mark;
     while a < end {
@@ -1907,8 +1934,7 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
                 biggest = max(biggest, it.cross);
             }
         }
-        var lc = max(biggest, above + below);
-        if lines == 1 && cross_size >= 0.0 { lc = cross_size; }
+        let lc = max(biggest, above + below);
         for i in a..b {
             L.flex[i].lcross = lc;
             L.flex[i].lbase = above;
@@ -1916,18 +1942,21 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
         total += lc + (if a > mark { line_gap } else { 0.0 });
         a = b;
     }
-    // align-content: lines in a container with room across to spare.
+    var cross_len = total;
+    if cross_size >= 0.0 { cross_len = cross_size; }
+    else if row { cross_len = clamp_size(total, hmin, hmax); }
+    // align-content: the lines of one that wraps, in its room across.
     var lead: f32 = 0.0;
     var between = line_gap;
     var grow_each: f32 = 0.0;
-    if lines > 1 && cross_size >= 0.0 {
-        let free = cross_size - total;
+    if !single && cross_len != total {
+        let free = cross_len - total;
         let k = lines as f32;
         let ac = s.align_content;
         if ac == K_NORMAL || ac == K_STRETCH { if free > 0.0 { grow_each = free / k; } }
         else if ac == K_FLEX_END { lead = free; }
         else if ac == K_CENTER { lead = free / 2.0; }
-        else if ac == K_SPACE_BETWEEN { if free > 0.0 { between += free / (k - 1.0); } }
+        else if ac == K_SPACE_BETWEEN { if free > 0.0 && k > 1.0 { between += free / (k - 1.0); } }
         else if ac == K_SPACE_AROUND { if free > 0.0 { lead = free / k / 2.0; between += free / k; } else { lead = free / 2.0; } }
         else if ac == K_SPACE_EVENLY { if free > 0.0 { lead = free / (k + 1.0); between += free / (k + 1.0); } else { lead = free / 2.0; } }
     }
@@ -1935,7 +1964,7 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
     a = mark;
     while a < end {
         let b = line_end(L, a, end);
-        let lc = L.flex[a].lcross + grow_each;
+        let lc = if single { cross_len } else { L.flex[a].lcross + grow_each };
         for i in a..b {
             L.flex[i].lcross = lc;
             L.flex[i].lpos = cpos;
@@ -1943,10 +1972,10 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
         cpos += lc + between;
         a = b;
     }
-    let cross_len = if cross_size >= 0.0 { cross_size } else { total };
 
     // Along each line: auto margins take the room to spare, else
-    // justify-content spreads it.
+    // justify-content spreads it. Reversed, an item's margins swap ends, so
+    // that they stay on their own sides.
     var main_used: f32 = 0.0;
     a = mark;
     while a < end {
@@ -1981,8 +2010,10 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
             var after: f32 = 0.0;
             if it.last == -2 {
                 let cs = L.styles[it.node];
-                before = if row { (if cs.auto_ml != 0 { share } else { cs.ml }) } else { (if cs.auto_mt != 0 { share } else { cs.mt }) };
-                after = if row { (if cs.auto_mr != 0 { share } else { cs.mr }) } else { (if cs.auto_mb != 0 { share } else { cs.mb }) };
+                let m0 = if row { (if cs.auto_ml != 0 { share } else { cs.ml }) } else { (if cs.auto_mt != 0 { share } else { cs.mt }) };
+                let m1 = if row { (if cs.auto_mr != 0 { share } else { cs.mr }) } else { (if cs.auto_mb != 0 { share } else { cs.mb }) };
+                before = if reverse { m1 } else { m0 };
+                after = if reverse { m0 } else { m1 };
             }
             L.flex[i].pos = pos + before;
             pos += before + it.main + it.edge + after + spacing;
@@ -1991,15 +2022,25 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
     }
     let main_len = if main_size >= 0.0 { main_size } else { main_used };
 
-    // Each item, where align-self puts it across its line.
+    // Each item, where align-self puts it across its line; a run of text
+    // aligns as the container's items do. Wrapped in reverse, a line's start
+    // across is its far side.
     var baseline: f32 = -1.0;
     for i in mark..end {
         let it = L.flex[i];
         var mpos = it.pos;
         if reverse { mpos = main_len - mpos - it.main - it.edge; }
         var cp = if s.flex_wrap == K_WRAP_REVERSE { cross_len - it.lpos - it.lcross } else { it.lpos };
+        var al = item_align(L, it, s);
+        if s.flex_wrap == K_WRAP_REVERSE {
+            if al == K_FLEX_START { al = K_FLEX_END; } else if al == K_FLEX_END { al = K_FLEX_START; }
+        }
+        let free = it.lcross - it.cross;
         var got: f32 = -1.0;
         if it.last != -2 {
+            if al == K_FLEX_END { cp += free; }
+            else if al == K_CENTER { cp += free / 2.0; }
+            else if al == K_BASELINE && row && it.baseline >= 0.0 { cp += it.lbase - it.baseline; }
             let tw = if row { it.main } else { it.width };
             let lh, lb = layout_lines(L, n, it.node, it.last, x + (if row { mpos } else { cp }), y + (if row { cp } else { mpos }), tw);
             got = lb;
@@ -2009,18 +2050,16 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
             let m1 = if row { cs.mb } else { cs.mr };
             let a0 = if row { cs.auto_mt } else { cs.auto_ml };
             let a1 = if row { cs.auto_mb } else { cs.auto_mr };
-            let al = item_align(L, it, s);
-            let free = it.lcross - it.cross;
-            var stretch_to: f32 = -1.0;
+            var item_h = if row { pct_height(cs, cross_size) } else { it.main };
             if a0 != 0 || a1 != 0 {
                 if a0 != 0 && a1 != 0 { cp += max(free / 2.0, 0.0); } else if a0 != 0 { cp += max(free, 0.0); }
             } else if al == K_STRETCH {
-                if row && cs.height < 0.0 && cs.height_pct < 0.0 {
+                if row && cs.height < 0.0 && item_h < 0.0 {
                     let vt = cs.bt + cs.pt + cs.pb + cs.bb;
                     let inside: f32 = if cs.border_box != 0 { vt } else { 0.0 };
-                    stretch_to = it.lcross - m0 - m1 - vt;
-                    if cs.max_height >= 0.0 { stretch_to = min(stretch_to, cs.max_height - inside); }
-                    stretch_to = max(max(stretch_to, cs.min_height - inside), 0.0);
+                    item_h = it.lcross - m0 - m1 - vt;
+                    if cs.max_height >= 0.0 { item_h = min(item_h, cs.max_height - inside); }
+                    item_h = max(max(item_h, cs.min_height - inside), 0.0);
                 }
             } else if al == K_FLEX_END { cp += free; }
             else if al == K_CENTER { cp += free / 2.0; }
@@ -2028,10 +2067,10 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
             cp += m0;
             let lo, hi = height_limits(cs);
             if row {
-                let bh, bl = layout_sized(L, it.node, x + mpos, y + cp, it.main, stretch_to, lo, hi);
+                let bh, bl = layout_sized(L, it.node, x + mpos, y + cp, it.main, item_h, lo, hi);
                 got = bl;
             } else {
-                let bh, bl = layout_sized(L, it.node, x + cp, y + mpos, it.width, it.main, lo, hi);
+                let bh, bl = layout_sized(L, it.node, x + cp, y + mpos, it.width, item_h, lo, hi);
                 got = bl;
             }
         }
@@ -2039,6 +2078,19 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) -> f
     }
     L.flex.resize(mark);
     return (if row { cross_len } else { main_len }), baseline;
+}
+
+// v within lo and hi (hi -1: none); lo wins when they cross.
+fn clamp_size(v: f32, lo: f32, hi: f32) -> f32 {
+    return max(if hi >= 0.0 { min(v, hi) } else { v }, lo);
+}
+
+// A row item's height when it is a percentage of its container's, known
+// across (content box); else -1.
+fn pct_height(cs: Style, cross_size: f32) -> f32 {
+    guard cs.height < 0.0 && cs.height_pct >= 0.0 && cross_size >= 0.0 else { return -1.0; }
+    let inside: f32 = if cs.border_box != 0 { cs.bt + cs.pt + cs.pb + cs.bb } else { 0.0 };
+    return max(cross_size * cs.height_pct / 100.0 - inside, 0.0);
 }
 
 // The index after the last item on the line item a is on.
@@ -2115,7 +2167,8 @@ recursive fn size_item(L: Layout, i: i64, n: i32, row: bool, main_size: f32, cro
             it.base = p.max;
             it.lo = p.min;
         } else {
-            it.width = max(cross_size, 0.0);
+            let room = max(cross_size, 0.0);
+            it.width = if item_align(L, it, L.styles[n]) == K_STRETCH { room } else { min(max(p.min, room), p.max) };
             let lh, lb = measure_lines(L, n, it.node, it.last, it.width);
             it.base = lh;
             it.lo = lh;
@@ -2167,7 +2220,8 @@ recursive fn size_item(L: Layout, i: i64, n: i32, row: bool, main_size: f32, cro
             least = a - hz;
             most = b - hz;
         } else {
-            let bh, bl = measure_sized(L, c, it.width, -1.0);
+            // Its content's height, whatever height it says.
+            let bh, bl = measure_sized(L, c, it.width, -2.0);
             least = bh - vt;
             most = least;
         }
@@ -2255,7 +2309,7 @@ fn resolve_flex(L: Layout, a: i64, b: i64, main_size: f32, gap: f32) {
 
 // Item i's outer size across, and its first baseline from its outer edge:
 // along a row, laid out at its main size to see; down a column, its width.
-recursive fn cross_of(L: Layout, i: i64, n: i32, row: bool) {
+recursive fn cross_of(L: Layout, i: i64, n: i32, row: bool, cross_size: f32) {
     var it = L.flex[i];
     if it.last != -2 {
         if row {
@@ -2268,7 +2322,7 @@ recursive fn cross_of(L: Layout, i: i64, n: i32, row: bool) {
     } else {
         let s = L.styles[it.node];
         if row {
-            let bh, bl = measure_sized(L, it.node, it.main, -1.0);
+            let bh, bl = measure_sized(L, it.node, it.main, pct_height(s, cross_size));
             it.cross = bh + s.mt + s.mb;
             it.baseline = if bl >= 0.0 { bl + s.mt } else { -1.0 };
         } else {
@@ -2279,15 +2333,22 @@ recursive fn cross_of(L: Layout, i: i64, n: i32, row: bool) {
 }
 
 // The border-box height and first baseline (from its top, -1 if none) of
-// element c laid out with its content `w` wide and `h` high (-1: auto),
-// painting nothing: what layout_sized paints is dropped and the boxes it
-// set are cleared.
+// element c laid out with its content `w` wide and `h` high (as layout_sized
+// takes them), painting nothing: what layout_sized paints is dropped and the
+// boxes it set are cleared. It remembers the last answer for each node, so
+// that a nested flex container's items, measured again when the container is
+// laid out for real, aren't laid out again: without it the work doubled at
+// each level.
 recursive fn measure_sized(L: Layout, c: i32, w: f32, h: f32) -> f32, f32 {
+    while L.measured.len < L.d.nodes.len { L.measured.push(Measured { w: -1.0, h: 0.0, height: 0.0, baseline: -1.0 }); }
+    let known = L.measured[c];
+    if known.w == w && known.h == h { return known.height, known.baseline; }
     let mark = L.items.len;
     let lo, hi = height_limits(L.styles[c]);
     let bh, b = layout_sized(L, c, 0.0, 0.0, w, h, lo, hi);
     L.items.resize(mark);
     clear_boxes(L, c);
+    L.measured[c] = Measured { w: w, h: h, height: bh, baseline: b };
     return bh, b;
 }
 
