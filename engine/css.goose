@@ -2656,8 +2656,10 @@ let UA_CSS = """
     article, main, header, footer, nav, aside, address, hr, form, fieldset, details, summary, center, menu, dir,
     table, caption, thead, tbody, tfoot, tr, legend, hgroup { display: block }
     li { display: list-item }
-    head, title, style, script, link, meta, base, noscript, template, iframe, object, embed, video, audio, img, svg,
+    head, title, style, script, link, meta, base, noscript, template, iframe, object, embed, video, audio, img,
     math, input, button, select, textarea, map, area, canvas, picture, source, track, param { display: none }
+    svg { overflow: hidden }
+    svg * { transform-origin: 0 0 }
     html { color: #1c1c1c; font-family: sans-serif; font-size: 17px; line-height: 1.6 }
     body { max-width: 720px; margin: 0 auto; padding: 40px 32px 120px }
     h1 { font-size: 2em; font-weight: bold; line-height: 1.2; margin: 0.4em 0 0.6em }

@@ -36,7 +36,7 @@ extern "tusk_platform" {
     fn tp_next_event(timeout_ms: i64, out: Event&) -> i32;
     fn tp_render(scroll: f32, background: u32) -> i32;
     fn tp_start_metal() -> i32;
-    fn tp_set_layer(layer: i32, items: const DItem[:], text: const u8[:], scale: f32) -> i32;
+    fn tp_set_layer(layer: i32, items: const DItem[:], text: const u8[:], paths: const f32[:], scale: f32) -> i32;
     fn tp_screenshot(path: const u8[:], width: f32, height: f32, scale: f32, scroll: f32, background: u32) -> i32;
     fn tp_frame_stats(out: FrameStats&, reset: bool) -> i32;
     fn tp_memory_footprint() -> i64;
@@ -100,8 +100,8 @@ fn ms(from: i64, to: i64) -> f64 { return (to - from) / 1000000.0; }
 
 // Hands a layer to the compositor. One it refuses would leave the window or
 // the screenshot without it, so Tusk stops and says why.
-fn set_layer(layer: i32, items: const DItem[:], text: const u8[:], scale: f32) {
-    let rc = tp_set_layer(layer, items, text, scale);
+fn set_layer(layer: i32, items: const DItem[:], text: const u8[:], paths: const f32[:], scale: f32) {
+    let rc = tp_set_layer(layer, items, text, paths, scale);
     guard rc != 0 else { return; }
     write_stderr(str("tusk: the compositor refused layer ", layer, " (error ", rc, ")\n"));
     exit(1);
@@ -113,9 +113,10 @@ fn measure_page(P: Page) {
     var flex: FlexItem[>..<] = [];
     var atoms: i32[>..<] = [];
     var measured: Measured[>..] = [];
+    var paths: f32[>..<] = [];
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
                      fonts: P.fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
-                     measured: measured };
+                     measured: measured, paths: paths };
     measure(L);
 }
 
@@ -127,13 +128,14 @@ fn show_page(P: Page, width: f32, scale: f32, cost: Cost&) -> f32 {
     var flex: FlexItem[>..<] = [];
     var atoms: i32[>..<] = [];
     var measured: Measured[>..] = [];
+    var paths: f32[>..<] = [];
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
                      fonts: P.fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
-                     measured: measured };
+                     measured: measured, paths: paths };
     let t0 = clock_ns();
     let height = layout_page(L, width, WINDOW_H - BAR_H);
     let t1 = clock_ns();
-    set_layer(LAYER_PAGE, items, P.text, scale);
+    set_layer(LAYER_PAGE, items, P.text, paths, scale);
     cost.layout = ms(t0, t1);
     cost.paint = ms(t1, clock_ns());
     return height;
@@ -167,7 +169,7 @@ fn show_bar(P: Page, name: const u8[:], cost: Cost, width: f32, height: f32, sca
     var items: DItem[>..] = [];
     items.push(rect_item(-1, 0.0, height - BAR_H, width, BAR_H, 0xFF1B1C1E));
     items.push(text_item(-1, 12.0, height - 9.5, 0.0, 0xFFC9CBCF, FAMILY_MONO, 11.0, 0, line.len as i32));
-    set_layer(LAYER_BAR, items, line, scale);
+    set_layer(LAYER_BAR, items, line, [], scale);
 }
 
 // n with its thousands separated by commas.
@@ -439,9 +441,10 @@ fn print_snapshot(P: Page, cost: Cost, html_bytes: i64) {
     var flex: FlexItem[>..<] = [];
     var atoms: i32[>..<] = [];
     var measured: Measured[>..] = [];
+    var paths: f32[>..<] = [];
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
                      fonts: P.fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
-                     measured: measured };
+                     measured: measured, paths: paths };
     let t0 = clock_ns();
     let h = layout_page(L, WINDOW_W, WINDOW_H - BAR_H);
     let t1 = clock_ns();

@@ -15,12 +15,14 @@ import std;
 import math;
 import .dom;
 import .css;
+import .vector;
 
 // Display item kinds, as the compositor numbers them (platform/src/compositor.rs).
 let ITEM_NONE: i32 = 0;          // dropped: cut away by a clip or an ellipsis
 let ITEM_RECT: i32 = 1;
 let ITEM_TEXT: i32 = 2;
 let ITEM_BOX: i32 = 3;
+let ITEM_PATH: i32 = 4;          // an SVG shape, filled or stroked (see vector.goose)
 
 // A box item's border style.
 let BORDER_SOLID: i32 = 0;
@@ -36,7 +38,9 @@ let BORDER_DASHED: i32 = 1;
 // (m_a … m_f, as CSS's matrix() takes them, points to points; all 0: none),
 // and its clip one that takes its points to the clip's (c_a … c_f; all 0:
 // they are the same). A second clip (oclip_w above 0) cuts it square on the
-// page, after its transform.
+// page, after its transform. A path item draws a span of the layout's path
+// data, in points from its corner: its text and text_len say where, its font
+// is its PATH_ flags, and its size its stroke's width (0: it is filled).
 struct DItem {
     kind: i32,
     x: f32, y: f32, w: f32, h: f32,
@@ -93,6 +97,7 @@ struct Layout {
     flex: FlexItem[>..<]&,   // the items of the flex containers being laid out, one above another
     atoms: i32[>..<]&,       // the inline-blocks on the lines being laid out, see place_atomic
     measured: Measured[>..]&, // per node, what measure_sized last found
+    paths: f32[>..<]&,       // the path data of SVG's path items, see vector.goose; shrinks as items do
 }
 
 // What measure_sized found for a node: its border-box height and first
@@ -174,7 +179,7 @@ recursive fn measure_children(L: Layout, n: i32) {
         let node = L.d.nodes[c];
         if node.kind == NODE_TEXT {
             add_text_run(L, c);
-        } else if node.kind == NODE_ELEMENT && L.styles[c].display != K_NONE {
+        } else if node.kind == NODE_ELEMENT && L.styles[c].display != K_NONE && L.styles[c].svg != 2 {
             let s = L.styles[c];
             if s.display == K_LIST_ITEM {
                 add_marker_run(L, c, ordinal);
@@ -182,7 +187,7 @@ recursive fn measure_children(L: Layout, n: i32) {
             } else if s.ellipsis != 0 && s.clips != 0 && s.display != K_INLINE {
                 add_ellipsis_run(L, c);
             }
-            measure_children(L, c);
+            if s.svg == 0 { measure_children(L, c); }
         }
         c = node.next;
     }
@@ -480,7 +485,54 @@ fn is_flex(L: Layout, n: i32) -> bool {
 fn is_atomic(L: Layout, n: i32) -> bool {
     guard L.d.nodes[n].kind == NODE_ELEMENT else { return false; }
     let d = L.styles[n].display;
-    return d == K_INLINE_BLOCK || d == K_INLINE_FLEX;
+    return d == K_INLINE_BLOCK || d == K_INLINE_FLEX || (d == K_INLINE && L.styles[n].svg == 1);
+}
+
+// An <svg>'s content box, sized as a replaced element (CSS 2.2 §10.3.2,
+// §10.6.2): its width and height from CSS, its attributes among them; one
+// that is auto from the other through its viewBox's ratio; both auto, as
+// wide as `avail` (less its margins, borders and padding) with a viewBox,
+// else 300 × 150.
+fn svg_size(L: Layout, n: i32, avail: f32) -> f32, f32 {
+    let s = L.styles[n];
+    let hz = s.bl + s.pl + s.pr + s.br;
+    let vt = s.bt + s.pt + s.pb + s.bb;
+    let inside_w: f32 = if s.border_box != 0 { hz } else { 0.0 };
+    let inside_h: f32 = if s.border_box != 0 { vt } else { 0.0 };
+    var w: f32 = -1.0;
+    if s.width >= 0.0 { w = max(s.width - inside_w, 0.0); }
+    else if s.width_pct >= 0.0 && avail >= 0.0 { w = max(avail * s.width_pct / 100.0 - inside_w, 0.0); }
+    var h: f32 = -1.0;
+    if s.height >= 0.0 { h = max(s.height - inside_h, 0.0); }
+    let ratio = view_ratio(L.d, n);
+    if w < 0.0 && h >= 0.0 { w = if ratio > 0.0 { h / ratio } else { 300.0 }; }
+    else if h < 0.0 && w >= 0.0 { h = if ratio > 0.0 { w * ratio } else { 150.0 }; }
+    else if w < 0.0 {
+        if ratio > 0.0 && avail > 0.0 {
+            w = max(avail - s.ml - s.mr - hz, 0.0);
+            h = w * ratio;
+        } else {
+            w = 300.0;
+            h = 150.0;
+        }
+    }
+    return w, h;
+}
+
+// The paths inside <svg> n, whose content box is w × h at (x, y): items that
+// paint them, in order, their data in L.paths.
+fn svg_items(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) {
+    var painted: Painted[>..<] = [];
+    draw_svg(L.d, L.styles[..], n, x, y, w, h, L.paths, painted);
+    for p in painted {
+        var it = rect_item(n, p.x, p.y, p.w, p.h, p.color);
+        it.kind = ITEM_PATH;
+        it.text = p.start;
+        it.text_len = p.len;
+        it.font = p.flags;
+        it.size = p.stroke;
+        L.items.push(it);
+    }
 }
 
 // A block-level element in the flow, which stacks below the one before.
@@ -574,9 +626,18 @@ recursive fn is_empty_block(L: Layout, n: i32) -> bool {
 // its first baseline (-1 if it has no lines) and its bottom margin after
 // collapsing with its last child's.
 recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32, f32, f32 {
-    let s = L.styles[n];
+    var s = L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;        // across, besides the content
     let vt = s.bt + s.pt + s.pb + s.bb;        // down, besides the content
+    // An <svg> is a replaced element: its size is its own, its content paths.
+    let svg = s.svg == 1;
+    var svg_h: f32 = 0.0;
+    if svg {
+        let sw, sh = svg_size(L, n, avail);
+        s.width = sw + (if s.border_box != 0 { hz } else { 0.0 });
+        s.width_pct = -1.0;
+        svg_h = sh;
+    }
     let w = content_width(s, avail, hz);
     var ml = s.ml;
     let room = avail - w - hz;
@@ -597,7 +658,9 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
     var inner: f32 = 0.0;
     var first: f32 = -1.0;
     var trailing: f32 = 0.0;
-    if is_flex(L, n) {
+    if svg {
+        inner = svg_h;
+    } else if is_flex(L, n) {
         // A height it has makes its items' room definite; percentages wait.
         var fh: f32 = -1.0;
         if s.height >= 0.0 { fh = content_height(s, 0.0, vt); }
@@ -618,6 +681,7 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
     let h = vt + ch;
     box_paint(L, n, ps, paint_at, bx, y, bw, h);
     if s.display == K_LIST_ITEM { paint_marker(L, n, bx + s.bl + s.pl, first); }
+    if svg { svg_items(L, n, bx + s.bl + s.pl, y + s.bt + s.pt, w, ch); }
     L.boxes[n] = Rect { x: bx, y: y, w: bw, h: h };
     return h, first, mb;
 }
@@ -1404,7 +1468,7 @@ fn static_position(L: Layout, n: i32, x: f32, y: f32) { L.boxes[n] = Rect { x: x
 recursive fn place_positioned(L: Layout, n: i32, width: f32, height: f32) {
     var c = L.d.nodes[n].first;
     while c >= 0 {
-        if L.d.nodes[c].kind == NODE_ELEMENT && L.styles[c].display != K_NONE {
+        if L.d.nodes[c].kind == NODE_ELEMENT && L.styles[c].display != K_NONE && L.styles[c].svg != 2 {
             if is_out(L, c) { place_box(L, c, width, height); }
             place_positioned(L, c, width, height);
         }
@@ -1662,6 +1726,10 @@ recursive fn content_widths(L: Layout, n: i32) -> f32, f32 {
     let s = L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;
     let inside: f32 = if s.border_box != 0 { 0.0 } else { hz };
+    if s.svg == 1 {
+        let sw, sh = svg_size(L, n, -1.0);
+        return sw + hz, sw + hz;
+    }
     if s.width >= 0.0 {
         let w = s.width + inside;
         return w, w;
@@ -1872,7 +1940,7 @@ recursive fn paint_context(L: Layout, P: Paint, n: i32) {
 recursive fn gather(L: Layout, P: Paint, n: i32) {
     var c = L.d.nodes[n].first;
     while c >= 0 {
-        if L.d.nodes[c].kind == NODE_ELEMENT && L.styles[c].display != K_NONE {
+        if L.d.nodes[c].kind == NODE_ELEMENT && L.styles[c].display != K_NONE && L.styles[c].svg != 2 {
             let s = L.styles[c];
             if s.position != K_STATIC || stacks(s) { P.scratch.push(c); }
             if !stacks(s) { gather(L, P, c); }
@@ -1958,7 +2026,7 @@ fn clip_items(L: Layout, mats: Mat[>..]&) {
         var oy1: f32 = 1000000000.0;
         var outer = false;
         var e = it.node;
-        var own = it.kind == ITEM_TEXT && L.d.nodes[e].kind == NODE_ELEMENT;
+        var own = (it.kind == ITEM_TEXT && L.d.nodes[e].kind == NODE_ELEMENT) || it.kind == ITEM_PATH;
         loop {
             let up = if own { e } else { clip_parent(L, e) };
             own = false;
@@ -2590,9 +2658,11 @@ recursive fn measure_sized(L: Layout, c: i32, w: f32, h: f32) -> f32, f32 {
     let known = L.measured[c];
     if known.w == w && known.h == h { return known.height, known.baseline; }
     let mark = L.items.len;
+    let path_mark = L.paths.len;
     let lo, hi = height_limits(L.styles[c]);
     let bh, b = layout_sized(L, c, 0.0, 0.0, w, h, lo, hi);
     L.items.resize(mark);
+    L.paths.resize(path_mark);
     clear_boxes(L, c);
     L.measured[c] = Measured { w: w, h: h, height: bh, baseline: b };
     return bh, b;
@@ -2602,8 +2672,10 @@ recursive fn measure_sized(L: Layout, c: i32, w: f32, h: f32) -> f32, f32 {
 // text from `from` up to `to` in n laid out `w` wide, painting nothing.
 fn measure_lines(L: Layout, n: i32, from: i32, to: i32, w: f32) -> f32, f32 {
     let mark = L.items.len;
+    let path_mark = L.paths.len;
     let h, b = layout_lines(L, n, from, to, 0.0, 0.0, w);
     L.items.resize(mark);
+    L.paths.resize(path_mark);
     var c = from;
     while c != to {
         clear_boxes(L, c);

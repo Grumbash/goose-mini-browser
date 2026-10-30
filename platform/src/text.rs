@@ -628,6 +628,7 @@ pub struct Atlas {
     /// Rows written since the compositor last uploaded, as [first, end).
     pub dirty: Option<(u32, u32)>,
     entries: HashMap<(u32, u16, u8), AtlasEntry>,
+    paths: HashMap<u64, AtlasEntry>, // by path_key
     shelves: Vec<Shelf>,
     raster_fonts: HashMap<u32, Cf>, // font index -> that font at size × scale
 }
@@ -644,6 +645,7 @@ impl Atlas {
             scale,
             dirty: None,
             entries: HashMap::new(),
+            paths: HashMap::new(),
             shelves: Vec::new(),
             raster_fonts: HashMap::new(),
         }
@@ -740,6 +742,135 @@ impl Atlas {
         })
     }
 
+    /// The atlas entry for an SVG path (see Goose's vector.goose), rasterized
+    /// on first use: its data `data` in points from the item's corner, filled,
+    /// or stroked `stroke` points wide, as `flags` say, from (`phase_x`,
+    /// `phase_y`) in 1/PHASES of a device pixel past a pixel's corner. Its
+    /// `left` and `top` are where its mask's corner is from that pixel, in
+    /// device pixels. A path bigger than the atlas allows has zero size.
+    pub fn path(
+        &mut self,
+        data: &[f32],
+        stroke: f32,
+        flags: i32,
+        phase_x: u8,
+        phase_y: u8,
+    ) -> AtlasEntry {
+        let key = path_key(data, stroke, flags, phase_x, phase_y);
+        if let Some(e) = self.paths.get(&key) {
+            return *e;
+        }
+        let entry = self
+            .rasterize_path(data, stroke, flags, phase_x, phase_y)
+            .unwrap_or_default();
+        self.paths.insert(key, entry);
+        entry
+    }
+
+    fn rasterize_path(
+        &mut self,
+        data: &[f32],
+        stroke: f32,
+        flags: i32,
+        phase_x: u8,
+        phase_y: u8,
+    ) -> Option<AtlasEntry> {
+        let path = device_path(
+            data,
+            self.scale,
+            phase_x as f64 / PHASES as f64,
+            phase_y as f64 / PHASES as f64,
+        )?;
+        let outline = if stroke > 0.0 {
+            let cap = if flags & PATH_CAP_ROUND != 0 {
+                1
+            } else if flags & PATH_CAP_SQUARE != 0 {
+                2
+            } else {
+                0
+            };
+            let join = if flags & PATH_JOIN_ROUND != 0 {
+                1
+            } else if flags & PATH_JOIN_BEVEL != 0 {
+                2
+            } else {
+                0
+            };
+            Cf::take(unsafe {
+                CGPathCreateCopyByStrokingPath(
+                    path.get(),
+                    null(),
+                    stroke as f64 * self.scale,
+                    cap,
+                    join,
+                    4.0,
+                )
+            })?
+        } else {
+            path
+        };
+        let r = unsafe { CGPathGetPathBoundingBox(outline.get()) };
+        if !(r.size.width > 0.0 && r.size.height > 0.0) {
+            return None;
+        }
+        // A pixel of margin all round keeps antialiased edges whole.
+        let x0 = r.origin.x.floor() as i32 - 1;
+        let x1 = (r.origin.x + r.size.width).ceil() as i32 + 1;
+        let y0 = r.origin.y.floor() as i32 - 1;
+        let y1 = (r.origin.y + r.size.height).ceil() as i32 + 1;
+        let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        if w > self.width || h > 2048 || x0 < i16::MIN as i32 || y0 < i16::MIN as i32 {
+            return None;
+        }
+        let (ax, ay) = self.place(w, h)?;
+        let mut mask = vec![0u8; (w * h) as usize];
+        {
+            let context = Cf::take(unsafe {
+                CGBitmapContextCreate(
+                    mask.as_mut_ptr().cast(),
+                    w as usize,
+                    h as usize,
+                    8,
+                    w as usize,
+                    null(),
+                    kCGImageAlphaOnly,
+                )
+            })?;
+            let c = context.get();
+            unsafe {
+                CGContextSetAllowsAntialiasing(c, true);
+                CGContextSetShouldAntialias(c, true);
+                CGContextSetGrayFillColor(c, 1.0, 1.0);
+                // Device pixels have y down; the bitmap's first row is its top.
+                CGContextTranslateCTM(c, -x0 as f64, y1 as f64);
+                CGContextScaleCTM(c, 1.0, -1.0);
+                CGContextAddPath(c, outline.get());
+                if stroke <= 0.0 && flags & PATH_EVENODD != 0 {
+                    CGContextEOFillPath(c);
+                } else {
+                    CGContextFillPath(c);
+                }
+            }
+        }
+        for row in 0..h {
+            let from = (row * w) as usize;
+            let to = ((ay + row) * self.width + ax) as usize;
+            self.pixels[to..to + w as usize].copy_from_slice(&mask[from..from + w as usize]);
+        }
+        self.dirty = Some(match self.dirty {
+            Some((a, b)) => (a.min(ay), b.max(ay + h)),
+            None => (ay, ay + h),
+        });
+        Some(AtlasEntry {
+            x: ax as u16,
+            y: ay as u16,
+            w: w as u16,
+            h: h as u16,
+            left: x0 as i16,
+            top: y0 as i16,
+        })
+    }
+
     /// A free w × h place: on a shelf of about that height, or on a new shelf
     /// below the last one, growing the atlas when it runs out of rows.
     fn place(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
@@ -769,6 +900,65 @@ impl Atlas {
         });
         Some((0, y))
     }
+}
+
+// How an SVG path is painted, as Goose's vector.goose writes Painted.flags.
+pub const PATH_EVENODD: i32 = 1;
+pub const PATH_CAP_ROUND: i32 = 2;
+pub const PATH_CAP_SQUARE: i32 = 4;
+pub const PATH_JOIN_ROUND: i32 = 8;
+pub const PATH_JOIN_BEVEL: i32 = 16;
+
+/// Path data (moves 0 and lines 1 with a point, cubic curves 2 with three,
+/// closes 3) as a Core Graphics path in device pixels, from (dx, dy). Data
+/// that ends early ends the path there.
+fn device_path(data: &[f32], scale: f64, dx: f64, dy: f64) -> Option<Cf> {
+    let path = Cf::take(unsafe { CGPathCreateMutable() })?;
+    let p = path.get();
+    let at = |i: usize| (data[i] as f64 * scale + dx, data[i + 1] as f64 * scale + dy);
+    let mut k = 0;
+    let mut open = false;
+    while k < data.len() {
+        let op = data[k];
+        if op == 3.0 {
+            if open {
+                unsafe { CGPathCloseSubpath(p) };
+            }
+            k += 1;
+        } else if (op == 0.0 || op == 1.0) && k + 2 < data.len() {
+            let (x, y) = at(k + 1);
+            if op == 0.0 || !open {
+                unsafe { CGPathMoveToPoint(p, null(), x, y) };
+                open = true;
+            } else {
+                unsafe { CGPathAddLineToPoint(p, null(), x, y) };
+            }
+            k += 3;
+        } else if op == 2.0 && k + 6 < data.len() && open {
+            let ((ax, ay), (bx, by), (x, y)) = (at(k + 1), at(k + 3), at(k + 5));
+            unsafe { CGPathAddCurveToPoint(p, null(), ax, ay, bx, by, x, y) };
+            k += 7;
+        } else {
+            break;
+        }
+    }
+    if unsafe { CGPathIsEmpty(p) } {
+        return None;
+    }
+    Some(path)
+}
+
+/// What tells two path masks apart: the path's points to a 64th of a point,
+/// its stroke, flags and phases.
+fn path_key(data: &[f32], stroke: f32, flags: i32, phase_x: u8, phase_y: u8) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for &v in data {
+        ((v * 64.0).round() as i32).hash(&mut h);
+    }
+    stroke.to_bits().hash(&mut h);
+    (flags, phase_x, phase_y).hash(&mut h);
+    h.finish()
 }
 
 /// `font` scaled to device pixels. The scale goes through the font's matrix,
