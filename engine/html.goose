@@ -101,8 +101,11 @@ fn start_tag(p: Parser&) {
     }
     let name_len = p.d.bytes.len - name_start;
     let attr_start = p.d.attrs.len;
-    read_attributes(p);
+    let self_closing = read_attributes(p);
     let name = p.d.bytes[name_start..name_start + name_len];
+    // Inside <svg>, foreign content: a tag that ends in /> closes itself,
+    // and HTML's implied closings don't apply.
+    let foreign = name == "svg" || in_svg(p);
 
     if name == "html" || name == "body" {
         let target = if name == "html" { p.d.nodes[p.head].parent } else { p.body };
@@ -118,7 +121,7 @@ fn start_tag(p: Parser&) {
     var parent = p.head;
     if p.in_body || !is_head_element(name) {
         p.in_body = true;
-        close_implied(p, name);
+        if !foreign { close_implied(p, name); }
         parent = current_parent(p);
     }
     let id = append_node(p.d, NODE_ELEMENT, parent);
@@ -127,7 +130,9 @@ fn start_tag(p: Parser&) {
     p.d.nodes[id].attr = attr_start as i32;
     p.d.nodes[id].attr_count = (p.d.attrs.len - attr_start) as i32;
 
-    if is_raw_text(name) {
+    if foreign && self_closing {
+        return;
+    } else if is_raw_text(name) {
         read_raw_text(p, id, name_start, name_len);
     } else if !is_void(name) {
         // Past MAX_OPEN open elements a new one is added but not opened, so
@@ -143,17 +148,28 @@ fn start_tag(p: Parser&) {
     }
 }
 
+// Whether an <svg> is open, so that what starts now is foreign content.
+fn in_svg(p: Parser&) -> bool {
+    for e in p.open { if node_name(p.d, e) == "svg" { return true; } }
+    return false;
+}
+
 // The deepest the open elements go; Blink's parser stops at the same depth.
 let MAX_OPEN: i64 = 512;
 
-// Reads attributes up to and past the closing '>'. A '/' before it is ignored:
-// HTML elements are void or not by name, whatever the tag says.
-fn read_attributes(p: Parser&) {
+// Reads attributes up to and past the closing '>', and says whether a '/'
+// came just before it. HTML elements are void or not by name, whatever the
+// tag says; only foreign ones close themselves so.
+fn read_attributes(p: Parser&) -> bool {
     let s = p.src;
     loop {
-        while p.pos < s.len && (is_ws(s[p.pos]) || s[p.pos] == '/') { p.pos += 1; }
-        guard p.pos < s.len else { return; }
-        if s[p.pos] == '>' { p.pos += 1; return; }
+        var slash = false;
+        while p.pos < s.len && (is_ws(s[p.pos]) || s[p.pos] == '/') {
+            slash = s[p.pos] == '/';
+            p.pos += 1;
+        }
+        guard p.pos < s.len else { return false; }
+        if s[p.pos] == '>' { p.pos += 1; return slash; }
         let an = p.d.bytes.len;
         while p.pos < s.len && !is_ws(s[p.pos]) && s[p.pos] != '=' && s[p.pos] != '>' && s[p.pos] != '/' {
             p.d.bytes.push(lower(s[p.pos]));

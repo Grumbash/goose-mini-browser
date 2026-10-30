@@ -840,6 +840,62 @@ fn test_transforms() {
     check("transforms reach down the page", layout_probe(far, 400.0, PROBE_PAGE), "2030.0");
 }
 
+fn test_svg() {
+    // Inside <svg>, /> closes a tag; outside, an HTML element isn't void for it.
+    check("svg tags that close themselves", tree_of("""<svg><path d="M0 0"/><circle r="1"/><g><rect/></g></svg><div/>x"""),
+          "#document\n  html\n    head\n    body\n      svg\n        path d=\"M0 0\"\n        circle r=\"1\"\n        g\n          rect\n      div\n        \"x\"\n");
+
+    // Paint from CSS and presentation attributes, which any rule beats; a
+    // url() paint takes its fallback, else none.
+    let paints = """
+        <style>.b { fill: #00f } .c { stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: bevel; fill-rule: evenodd }
+        .u { fill: url(#g) #0f0 } .n { fill: url(#g) }</style>
+        <svg><rect fill="#f00" class="b"/><rect fill="#f00" stroke-width="3"/><path class="c"/><path class="u"/><path class="n"/><path style="fill: none"/></svg>
+        """;
+    check("svg paint", svg_paints(paints),
+          str("rect fill=ff0000ff stroke=00000000 width=1.0 cap=63 join=65 rule=67 set=1\n",
+              "rect fill=ffff0000 stroke=00000000 width=3.0 cap=63 join=65 rule=67 set=5\n",
+              "path fill=ff000000 stroke=00000002 width=2.0 cap=64 join=66 rule=68 set=62\n",
+              "path fill=ff00ff00 stroke=00000000 width=1.0 cap=63 join=65 rule=67 set=1\n",
+              "path fill=00000000 stroke=00000000 width=1.0 cap=63 join=65 rule=67 set=1\n",
+              "path fill=00000000 stroke=00000000 width=1.0 cap=63 join=65 rule=67 set=1\n")[..]);
+}
+
+// Each element in the <svg>s of `src`: its name and paint.
+fn svg_paints(src: const u8[:]) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes };
+    load_sheets(d, sh);
+    var styles: Style[>..] = [];
+    compute_styles(d, sh, styles);
+    var out: u8[>..] = [];
+    for n, i in nodes {
+        guard n.kind == NODE_ELEMENT && styles[i].svg == 2 else { continue; }
+        let st = styles[i];
+        format(out, node_name(d, i as i32), " fill=");
+        format_uint(out, st.fill, 16, 8, '0');
+        out.append(" stroke=");
+        format_uint(out, st.stroke, 16, 8, '0');
+        out.append(" width=");
+        format_flt(out, st.stroke_width, 1);
+        format(out, " cap=", st.linecap, " join=", st.linejoin, " rule=", st.fill_rule, " set=", st.svg_set, "\n");
+    }
+    return out;
+}
+
 fn test_fonts() {
     // Weights from 1 to 1000; bolder and lighter step from the parent's.
     let weights = """
@@ -1421,6 +1477,7 @@ fn main() {
     test_flex();
     test_transforms();
     test_fonts();
+    test_svg();
     test_layout();
     test_snapshot();
     test_page();

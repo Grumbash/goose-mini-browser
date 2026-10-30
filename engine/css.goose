@@ -84,7 +84,14 @@ let P_TRANSFORM: i32 = 69;
 let P_TRANSFORM_ORIGIN: i32 = 70;
 let P_LETTER_SPACING: i32 = 71;
 let P_TEXT_TRANSFORM: i32 = 72;
-let NPROPS: i64 = 73;
+let P_FILL: i32 = 73;
+let P_STROKE: i32 = 74;
+let P_STROKE_WIDTH: i32 = 75;
+let P_STROKE_LINECAP: i32 = 76;
+let P_STROKE_LINEJOIN: i32 = 77;
+let P_FILL_RULE: i32 = 78;
+let P_TRANSFORM_BOX: i32 = 79;
+let NPROPS: i64 = 80;
 let P_CUSTOM: i32 = -2;   // a custom property, --name, which the cascade keeps apart
 
 // Kinds of value.
@@ -166,6 +173,14 @@ let K_LOWERCASE: i32 = 59;
 let K_CAPITALIZE: i32 = 60;
 let K_BOLDER: i32 = 61;
 let K_LIGHTER: i32 = 62;
+let K_BUTT: i32 = 63;
+let K_ROUND: i32 = 64;
+let K_MITER: i32 = 65;
+let K_BEVEL: i32 = 66;
+let K_NONZERO: i32 = 67;
+let K_EVENODD: i32 = 68;
+let K_FILL_BOX: i32 = 69;
+let K_VIEW_BOX: i32 = 70;
 
 // Font families, as the platform layer's text functions number them.
 let FAMILY_SANS: i32 = 0;
@@ -292,7 +307,22 @@ struct Style {
     min_w_auto: i32, min_h_auto: i32,    // min-width and min-height are auto, which a flex item turns into its content's
     xf: XForm[6], xf_count: i32,         // transform, its functions in order
     origin_x: f32, origin_y: f32, origin_pct: i32, // transform-origin; origin_pct bit 1 x, 2 y: percentages
+    // SVG: paint (0: none; CURRENT_COLOR: the text's), the stroke's width in
+    // user units, how lines end and join, the fill rule, and transform-box.
+    fill: u32, stroke: u32, stroke_width: f32, linecap: i32, linejoin: i32, fill_rule: i32, transform_box: i32,
+    svg: i32,                            // 1: an <svg> in HTML, 2: inside one
+    svg_set: i32,                        // the SVG_ paint properties the element's own declarations set
 }
+
+// Bits of Style.svg_set: a shape in a <use> takes these from its own
+// declarations, the rest from the <use>.
+let SVG_FILL: i32 = 1;
+let SVG_STROKE: i32 = 2;
+let SVG_STROKE_WIDTH: i32 = 4;
+let SVG_LINECAP: i32 = 8;
+let SVG_LINEJOIN: i32 = 16;
+let SVG_FILL_RULE: i32 = 32;
+let SVG_COLOR: i32 = 64;
 
 // One box-shadow. Blurred ones aren't drawn (docs/adr/0010: the interface's
 // shadows are rings and bars, which have none).
@@ -341,7 +371,9 @@ fn root_style() -> Style {
                    align_self: K_AUTO, grow: 0.0, shrink: 1.0, order: 0, basis: 0.0, basis_kind: K_AUTO,
                    min_w_auto: 1, min_h_auto: 1,
                    xf: [no_xform(), no_xform(), no_xform(), no_xform(), no_xform(), no_xform()], xf_count: 0,
-                   origin_x: 50.0, origin_y: 50.0, origin_pct: 3 };
+                   origin_x: 50.0, origin_y: 50.0, origin_pct: 3,
+                   fill: 0xFF000000, stroke: 0, stroke_width: 1.0, linecap: K_BUTT, linejoin: K_MITER, fill_rule: K_NONZERO,
+                   transform_box: K_VIEW_BOX, svg: 0, svg_set: 0 };
 }
 
 // ------------------------------------------------------------------ parsing
@@ -1264,6 +1296,54 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
         push_decl(out, d);
         return;
     }
+    if prop == P_FILL || prop == P_STROKE {
+        // none, a colour or currentColor; a url() paint (a gradient, a
+        // pattern), which Tusk doesn't draw, its fallback colour or none.
+        var v = value;
+        var none = value == "none";
+        if starts_with(value, "url(") {
+            let close = find(value, ")");
+            guard close > 0 else { return; }
+            v = trim(value[close + 1..]);
+            none = v.len == 0 || v == "none";
+        }
+        if none { d.kind = V_COLOR; d.color = 0; push_decl(out, d); return; }
+        let c, ok = parse_color(v);
+        guard ok else { return; }
+        d.kind = V_COLOR;
+        d.color = c;
+        push_decl(out, d);
+        return;
+    }
+    if prop == P_STROKE_WIDTH {
+        // A length, or a number of user units, which are points.
+        let n, ok = parse_flt(value);
+        if ok && n >= 0.0 { d.kind = V_LENGTH; d.num = n as f32; d.unit = U_PX; push_decl(out, d); return; }
+        let ln, u, lok = parse_length(value);
+        guard lok && ln >= 0.0 && u != U_PCT else { return; }
+        d.kind = V_LENGTH;
+        d.num = ln;
+        d.unit = u;
+        push_decl(out, d);
+        return;
+    }
+    if prop == P_STROKE_LINECAP || prop == P_STROKE_LINEJOIN || prop == P_FILL_RULE || prop == P_TRANSFORM_BOX {
+        var k = keyword(value);
+        // miter-clip and arcs join as miter; content-box, border-box and
+        // stroke-box are taken as view-box and fill-box.
+        if value == "miter-clip" || value == "arcs" { k = K_MITER; }
+        if value == "content-box" || value == "border-box" { k = K_VIEW_BOX; }
+        if value == "stroke-box" { k = K_FILL_BOX; }
+        let ok = if prop == P_STROKE_LINECAP { k == K_BUTT || k == K_ROUND || k == K_SQUARE }
+                 else if prop == P_STROKE_LINEJOIN { k == K_MITER || k == K_ROUND || k == K_BEVEL }
+                 else if prop == P_FILL_RULE { k == K_NONZERO || k == K_EVENODD }
+                 else { k == K_FILL_BOX || k == K_VIEW_BOX };
+        guard ok else { return; }
+        d.kind = V_KEYWORD;
+        d.num = k;
+        push_decl(out, d);
+        return;
+    }
     if prop == P_LETTER_SPACING {
         // normal, or a length, below zero too.
         if value == "normal" { d.kind = V_LENGTH; d.unit = U_PX; push_decl(out, d); return; }
@@ -1356,6 +1436,9 @@ fn property_id(n: const u8[:]) -> i32 {
     if n == "text-overflow" { return P_TEXT_OVERFLOW; }
     if n == "transform" { return P_TRANSFORM; } if n == "transform-origin" { return P_TRANSFORM_ORIGIN; }
     if n == "letter-spacing" { return P_LETTER_SPACING; } if n == "text-transform" { return P_TEXT_TRANSFORM; }
+    if n == "fill" { return P_FILL; } if n == "stroke" { return P_STROKE; } if n == "stroke-width" { return P_STROKE_WIDTH; }
+    if n == "stroke-linecap" { return P_STROKE_LINECAP; } if n == "stroke-linejoin" { return P_STROKE_LINEJOIN; }
+    if n == "fill-rule" { return P_FILL_RULE; } if n == "transform-box" { return P_TRANSFORM_BOX; }
     if n == "flex-direction" { return P_FLEX_DIRECTION; } if n == "flex-wrap" { return P_FLEX_WRAP; }
     if n == "justify-content" { return P_JUSTIFY_CONTENT; } if n == "align-items" { return P_ALIGN_ITEMS; }
     if n == "align-self" { return P_ALIGN_SELF; } if n == "align-content" { return P_ALIGN_CONTENT; }
@@ -1392,6 +1475,9 @@ fn keyword(v: const u8[:]) -> i32 {
     if v == "inline-block" { return K_INLINE_BLOCK; } if v == "inline-flex" { return K_INLINE_FLEX; }
     if v == "uppercase" { return K_UPPERCASE; } if v == "lowercase" { return K_LOWERCASE; }
     if v == "capitalize" { return K_CAPITALIZE; } if v == "bolder" { return K_BOLDER; } if v == "lighter" { return K_LIGHTER; }
+    if v == "butt" { return K_BUTT; } if v == "round" { return K_ROUND; } if v == "miter" { return K_MITER; }
+    if v == "bevel" { return K_BEVEL; } if v == "nonzero" { return K_NONZERO; } if v == "evenodd" { return K_EVENODD; }
+    if v == "fill-box" { return K_FILL_BOX; } if v == "view-box" { return K_VIEW_BOX; }
     // Display values we lay out as one of those we know.
     if v == "inline-grid" || v == "inline-table" || v == "table-cell" { return K_INLINE; }
     if v == "grid" || v == "table" || v == "table-row" || v == "table-row-group" || v == "table-header-group"
@@ -1824,6 +1910,30 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
             }
         }
     }
+    // SVG's presentation attributes, as author declarations that any rule
+    // beats (SVG 2 §6.6): the paint ones on what is in an <svg>, its width and
+    // height on the <svg> itself. A number is in user units, points.
+    let svg: i32 = if parent.svg != 0 { 2 } else if pseudo == 0 && node_name(d, e) == "svg" { 1 } else { 0 };
+    if svg != 0 && pseudo == 0 {
+        let a0 = d.nodes[e].attr;
+        for ai in a0..a0 + d.nodes[e].attr_count {
+            let a = d.attrs[ai];
+            let an = d.bytes[a.name..a.name + a.name_len];
+            let presents = an == "fill" || an == "stroke" || an == "stroke-width" || an == "stroke-linecap" || an == "stroke-linejoin"
+                || an == "fill-rule" || an == "opacity" || an == "color" || an == "display"
+                || (svg == 1 && (an == "width" || an == "height"));
+            guard presents else { continue; }
+            var v: u8[>..] = [];
+            v.append(trim(d.bytes[a.value..a.value + a.value_len]));
+            if (an == "width" || an == "height") && v.len > 0 && v[v.len - 1] >= '0' && v[v.len - 1] <= '9' { v.append("px"); }
+            var hint: Decl[>..] = [];
+            add_declaration(an, v[..], 0, hint, sh.bytes);
+            for dc in hint {
+                let prio = (ORIGIN_AUTHOR as i64) << 56;
+                if prio > win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
+            }
+        }
+    }
     // The style attribute beats every sheet, at its own importance.
     let style_attr, has_style = attr_value(d, e, "style");
     if has_style && pseudo == 0 {
@@ -1839,6 +1949,14 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
     }
 
     var s = inherit(parent);
+    s.svg = svg;
+    if win_prio[P_FILL] >= 0 { s.svg_set = s.svg_set | SVG_FILL; }
+    if win_prio[P_STROKE] >= 0 { s.svg_set = s.svg_set | SVG_STROKE; }
+    if win_prio[P_STROKE_WIDTH] >= 0 { s.svg_set = s.svg_set | SVG_STROKE_WIDTH; }
+    if win_prio[P_STROKE_LINECAP] >= 0 { s.svg_set = s.svg_set | SVG_LINECAP; }
+    if win_prio[P_STROKE_LINEJOIN] >= 0 { s.svg_set = s.svg_set | SVG_LINEJOIN; }
+    if win_prio[P_FILL_RULE] >= 0 { s.svg_set = s.svg_set | SVG_FILL_RULE; }
+    if win_prio[P_COLOR] >= 0 { s.svg_set = s.svg_set | SVG_COLOR; }
     if w.customs.len > mark { s.vars = own_vars(sh, w.customs[mark..], parent.vars, w.text); }
     // Font size first: em lengths everywhere else depend on it.
     if win_prio[P_FONT_SIZE] >= 0 { apply_decl(s, parent, win[P_FONT_SIZE], sh, w.text); }
@@ -2343,6 +2461,7 @@ fn inherit_value(s: Style&, parent: Style, p: i32) {
     }
     else if p == P_TRANSFORM { s.xf = parent.xf; s.xf_count = parent.xf_count; }
     else if p == P_TRANSFORM_ORIGIN { s.origin_x = parent.origin_x; s.origin_y = parent.origin_y; s.origin_pct = parent.origin_pct; }
+    else if p == P_TRANSFORM_BOX { s.transform_box = parent.transform_box; }
 }
 
 // What an element starts from: the inherited properties of its parent, the
@@ -2351,6 +2470,8 @@ fn inherit(p: Style) -> Style {
     var s = root_style();
     s.color = p.color; s.font_size = p.font_size; s.italic = p.italic; s.family = p.family;
     s.weight = p.weight; s.spacing = p.spacing; s.text_case = p.text_case;
+    s.fill = p.fill; s.stroke = p.stroke; s.stroke_width = p.stroke_width; s.linecap = p.linecap; s.linejoin = p.linejoin;
+    s.fill_rule = p.fill_rule;
     s.lh_mult = p.lh_mult; s.lh_px = p.lh_px; s.align = p.align; s.ws = p.ws; s.list = p.list; s.deco = p.deco;
     s.indent = p.indent; s.root_size = p.root_size; s.vars = p.vars;
     s.display = K_INLINE;
@@ -2389,6 +2510,13 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
         s.weight = w;
     }
     else if p == P_LETTER_SPACING { s.spacing = px(dc, s, parent); }
+    else if p == P_FILL { s.fill = dc.color; }
+    else if p == P_STROKE { s.stroke = dc.color; }
+    else if p == P_STROKE_WIDTH { s.stroke_width = px(dc, s, parent); }
+    else if p == P_STROKE_LINECAP { s.linecap = k; }
+    else if p == P_STROKE_LINEJOIN { s.linejoin = k; }
+    else if p == P_FILL_RULE { s.fill_rule = k; }
+    else if p == P_TRANSFORM_BOX { s.transform_box = k; }
     else if p == P_TEXT_TRANSFORM { s.text_case = k; }
     else if p == P_FONT_STYLE { s.italic = if k == K_ITALIC { 1 } else { 0 }; }
     else if p == P_FONT_FAMILY { s.family = k; }
