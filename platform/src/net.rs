@@ -14,20 +14,26 @@
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::Duration;
 
 use block2::DynBlock;
 
 use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252, X_USER_DEFINED};
 use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_foundation::{
-    NSCopying, NSData, NSError, NSHTTPURLResponse, NSMutableCopying, NSMutableURLRequest, NSObject,
-    NSObjectProtocol, NSOperationQueue, NSQualityOfService, NSString, NSURL, NSURLCache,
-    NSURLRequest, NSURLRequestCachePolicy, NSURLSession, NSURLSessionConfiguration,
-    NSURLSessionDataDelegate, NSURLSessionDataTask, NSURLSessionDelegate, NSURLSessionTask,
-    NSURLSessionTaskDelegate,
+    NSArray, NSCopying, NSData, NSDate, NSDictionary, NSError, NSHTTPCookie,
+    NSHTTPCookiePropertyKey, NSHTTPCookieStorage, NSHTTPURLResponse, NSMutableCopying,
+    NSMutableURLRequest, NSObject, NSObjectProtocol, NSOperationQueue, NSPropertyListFormat,
+    NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSQualityOfService, NSString,
+    NSURL, NSURLCache, NSURLRequest, NSURLRequestCachePolicy, NSURLSession,
+    NSURLSessionConfiguration, NSURLSessionDataDelegate, NSURLSessionDataTask,
+    NSURLSessionDelegate, NSURLSessionTask, NSURLSessionTaskDelegate,
 };
 
 use crate::url::scheme_of;
@@ -110,6 +116,14 @@ struct Net {
 }
 
 static NET: LazyLock<Mutex<Net>> = LazyLock::new(Default::default);
+/// Where the Default profile keeps its cache and cookies (tp_net_storage);
+/// none: in memory, as Sandbox.
+static STORAGE: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// A save of the Default profile's cookies is on its way.
+static SAVING: AtomicBool = AtomicBool::new(false);
+
+const CACHE_MEMORY: usize = 16 << 20;
+const CACHE_DISK: usize = 256 << 20; // the Default profile's, on disk
 static SESSIONS: Mutex<[Option<Retained<NSURLSession>>; PROFILES]> =
     Mutex::new([const { None }; PROFILES]);
 
@@ -199,17 +213,40 @@ fn session(profile: usize) -> Result<Retained<NSURLSession>, i32> {
     if let Some(s) = slot {
         return Ok(s.clone());
     }
-    let config = NSURLSessionConfiguration::ephemeralSessionConfiguration();
+    // Default keeps its cache in its folder and its cookies in a cookie
+    // storage of its own, saved there (save_cookies); Sandbox, and Default
+    // with no folder, keep both in memory only (docs/adr/0008).
+    let folder = if profile == PROFILE_DEFAULT as usize {
+        profile_folder()
+    } else {
+        None
+    };
+    let config = match &folder {
+        Some(dir) => {
+            let config = NSURLSessionConfiguration::defaultSessionConfiguration();
+            let own =
+                NSURLSessionConfiguration::ephemeralSessionConfiguration().HTTPCookieStorage();
+            if let Some(cookies) = &own {
+                restore_cookies(cookies, &dir.join("cookies.plist"));
+            }
+            config.setHTTPCookieStorage(own.as_deref());
+            config
+        }
+        None => NSURLSessionConfiguration::ephemeralSessionConfiguration(),
+    };
     // 30 s with no bytes ends a request, and 5 minutes in all: a server that
     // drips can't hold a page past that.
     config.setTimeoutIntervalForRequest(30.0);
     config.setTimeoutIntervalForResource(300.0);
+    let cache_dir = folder
+        .as_ref()
+        .map(|d| NSURL::fileURLWithPath(&NSString::from_str(&d.join("Cache").to_string_lossy())));
     let cache = unsafe {
         NSURLCache::initWithMemoryCapacity_diskCapacity_directoryURL(
             NSURLCache::alloc(),
-            16 << 20,
-            0,
-            None,
+            CACHE_MEMORY,
+            if cache_dir.is_some() { CACHE_DISK } else { 0 },
+            cache_dir.as_deref(),
         )
     };
     config.setURLCache(Some(&cache));
@@ -227,6 +264,139 @@ fn session(profile: usize) -> Result<Retained<NSURLSession>, i32> {
     };
     *slot = Some(s.clone());
     Ok(s)
+}
+
+/// Keeps the Default profile on disk in `dir` (UTF-8), in its folder
+/// "Default": its cache and its cookies. Call before Default's session is
+/// made; tests and the modes without a window never do, and keep it in
+/// memory.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_net_storage(dir: GSlice<u8>) -> i32 {
+    guarded(|| {
+        let dir = std::str::from_utf8(unsafe { dir.as_slice() }.ok_or(ERR_ARGUMENT)?)
+            .map_err(|_| ERR_ARGUMENT)?;
+        set_storage(&Path::new(dir).join("Default")).map_err(|_| ERR_ARGUMENT)?;
+        Ok(0)
+    })
+}
+
+/// Makes `folder` the Default profile's, only its owner's to read.
+fn set_storage(folder: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(folder)?;
+    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))?;
+    *STORAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(folder.to_path_buf());
+    Ok(())
+}
+
+fn profile_folder() -> Option<PathBuf> {
+    STORAGE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The cookies in `file`, a property list save_cookies wrote, into `into`;
+/// those that have expired since stay out.
+fn restore_cookies(into: &NSHTTPCookieStorage, file: &Path) {
+    let Some(data) = NSData::dataWithContentsOfFile(&NSString::from_str(&file.to_string_lossy()))
+    else {
+        return;
+    };
+    let Ok(list) = (unsafe {
+        NSPropertyListSerialization::propertyListWithData_options_format_error(
+            &data,
+            NSPropertyListMutabilityOptions::Immutable,
+            std::ptr::null_mut(),
+        )
+    }) else {
+        return;
+    };
+    let Some(list) = list.downcast_ref::<NSArray>() else {
+        return;
+    };
+    let now = NSDate::now();
+    for item in list.iter() {
+        let Some(dict) = item.downcast_ref::<NSDictionary>() else {
+            continue;
+        };
+        // A cookie's properties: its keys are NSHTTPCookiePropertyKey strings.
+        let props: &NSDictionary<NSHTTPCookiePropertyKey, AnyObject> =
+            unsafe { &*(dict as *const NSDictionary).cast() };
+        let Some(cookie) = (unsafe { NSHTTPCookie::cookieWithProperties(props) }) else {
+            continue;
+        };
+        if cookie
+            .expiresDate()
+            .is_some_and(|d| d.timeIntervalSinceDate(&now) > 0.0)
+        {
+            into.setCookie(&cookie);
+        }
+    }
+}
+
+/// Writes the Default profile's cookies to its folder, as a property list
+/// only its owner can read: those that outlive the session, not yet
+/// expired. Session cookies end with the session, as in browsers.
+fn save_cookies() {
+    let Some(dir) = profile_folder() else {
+        return;
+    };
+    let Ok(s) = session(PROFILE_DEFAULT as usize) else {
+        return;
+    };
+    let Some(cookies) = s
+        .configuration()
+        .HTTPCookieStorage()
+        .and_then(|c| c.cookies())
+    else {
+        return;
+    };
+    let now = NSDate::now();
+    let kept: Vec<Retained<NSDictionary<NSHTTPCookiePropertyKey, AnyObject>>> = cookies
+        .iter()
+        .filter(|c| {
+            !c.isSessionOnly()
+                && c.expiresDate()
+                    .is_some_and(|d| d.timeIntervalSinceDate(&now) > 0.0)
+        })
+        .filter_map(|c| c.properties())
+        .collect();
+    let list = NSArray::from_retained_slice(&kept);
+    let Ok(data) = (unsafe {
+        NSPropertyListSerialization::dataWithPropertyList_format_options_error(
+            &list,
+            NSPropertyListFormat::BinaryFormat_v1_0,
+            0,
+        )
+    }) else {
+        return;
+    };
+    let file = dir.join("cookies.plist");
+    if data.writeToFile_atomically(&NSString::from_str(&file.to_string_lossy()), true) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// After a response sets a cookie on the Default profile: its cookies are
+/// saved a second later, once for however many come meanwhile, so a Dock
+/// Quit loses at most that second.
+fn cookies_changed() {
+    if profile_folder().is_none() || SAVING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(1));
+        SAVING.store(false, Ordering::Release);
+        let _ = catch_unwind(save_cookies);
+    });
+}
+
+/// Saves the Default profile's cookies now: as Tusk quits.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_net_save() -> i32 {
+    guarded(|| {
+        save_cookies();
+        Ok(0)
+    })
 }
 
 /// Makes profile `profile`'s session now, so the first page doesn't wait
@@ -394,6 +564,14 @@ fn finish(profile: usize, task: &NSURLSessionTask, error: Option<&NSError>) {
         .as_ref()
         .and_then(|r| r.downcast_ref::<NSHTTPURLResponse>());
     let status = http.map_or(0, |h| h.statusCode() as i32);
+    if profile == PROFILE_DEFAULT as usize
+        && http.is_some_and(|h| {
+            h.valueForHTTPHeaderField(&NSString::from_str("Set-Cookie"))
+                .is_some()
+        })
+    {
+        cookies_changed();
+    }
     let url = response
         .as_ref()
         .and_then(|r| r.URL())
@@ -919,6 +1097,87 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::time::Duration;
+
+    /// The Default profile on disk, in a folder of the test's own: a sheet
+    /// the server says keeps 10 minutes comes from the cache the second time,
+    /// and a cookie that outlives the session is saved, and restored, while
+    /// a session cookie isn't. The only test that uses Default.
+    #[test]
+    fn the_default_profile_keeps_its_cache_and_cookies() {
+        use std::sync::atomic::AtomicUsize;
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        fn route3(path: &str) -> (Vec<u8>, u64) {
+            HITS.fetch_add(1, Ordering::SeqCst);
+            match path {
+                "/kept.css" => (
+                    reply(
+                        "200 OK",
+                        "Content-Type: text/css\r\nCache-Control: max-age=600\r\n",
+                        b"p { color: red }",
+                    ),
+                    0,
+                ),
+                "/login" => (
+                    reply(
+                        "200 OK",
+                        "Content-Type: text/html\r\nSet-Cookie: kept=1; Max-Age=3600; Path=/\r\nSet-Cookie: gone=1; Path=/\r\n",
+                        b"ok",
+                    ),
+                    0,
+                ),
+                _ => route(path),
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("tusk-profile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_storage(&dir.join("Default")).unwrap();
+        let port = serve(route3);
+        let tab = 9105;
+        assert_eq!(tp_tab_open(tab), 0);
+        let open_default = |url: &str| {
+            let mut url = url.as_bytes().to_vec();
+            let none = GSlice::<u8> {
+                data: std::ptr::null_mut(),
+                len: 0,
+            };
+            let s = GSlice {
+                data: url.as_mut_ptr(),
+                len: url.len() as i64,
+            };
+            tp_net_open(tab, PROFILE_DEFAULT, NET_STYLE, s, none, 0)
+        };
+        for _ in 0..2 {
+            assert!(open_default(&format!("http://127.0.0.1:{port}/kept.css")) > 0);
+            assert_eq!(take(tab).1, b"p { color: red }");
+        }
+        assert_eq!(
+            HITS.load(Ordering::SeqCst),
+            1,
+            "the second came from the server"
+        );
+        assert!(open_default(&format!("http://127.0.0.1:{port}/login")) > 0);
+        take(tab);
+        assert_eq!(tp_net_save(), 0);
+        let file = dir.join("Default/cookies.plist");
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode, 0o600);
+        let fresh = NSURLSessionConfiguration::ephemeralSessionConfiguration()
+            .HTTPCookieStorage()
+            .unwrap();
+        restore_cookies(&fresh, &file);
+        let names: Vec<String> = fresh
+            .cookies()
+            .unwrap()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        assert_eq!(names, ["kept"]);
+        assert_eq!(tp_tab_drop(tab), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn only_a_regular_file_has_a_size() {

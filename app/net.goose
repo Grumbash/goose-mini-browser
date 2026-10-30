@@ -31,6 +31,8 @@ extern "tusk_platform" {
     fn tp_net_progress(tab: i32, received: i64&, expected: i64&) -> i32;
     fn tp_open_in_safari(url: const u8[:]) -> i32;
     fn tp_file_size(path: const u8[:]) -> i64;
+    fn tp_net_storage(dir: const u8[:]) -> i32;
+    fn tp_net_save() -> i32;
 }
 
 // Whether `loc` is a web address, http or https, rather than a file's path.

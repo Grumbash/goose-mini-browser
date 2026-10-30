@@ -557,8 +557,16 @@ fn main() {
     }
     // The fonts Tusk brings (Barlow Condensed, JetBrains Mono), before any text is measured.
     tp_register_fonts(str(resource_dir(), "fonts")[..]);
-    // The window's pages are ours; what a test or a picture loads keeps nothing.
+    // The window's pages are ours, their cache and cookies kept in
+    // ~/Library/Application Support/Tusk (docs/adr/0008); what a test or a
+    // picture loads keeps nothing.
     let profile = if mode == MODE_WINDOW { PROFILE_DEFAULT } else { PROFILE_SANDBOX };
+    if mode == MODE_WINDOW {
+        var home: u8[>..] = [];
+        if env("HOME", home) && home.len > 0 && home[0] == '/' {
+            tp_net_storage(str(home, "/Library/Application Support/Tusk")[..]);
+        }
+    }
     // Pages see the system's dark mode in the window; a picture or a test, light.
     let dark = mode == MODE_WINDOW && tp_dark_mode() == 1;
 
@@ -1068,6 +1076,7 @@ fn main() {
     print("frames presented: ", tp_frames());
     tp_close();
     end_tabs(tabs, pages);
+    tp_net_save();
     if mode == MODE_WAKE_TEST && !(woken && worker_ok) {
         write_stderr("tusk: the worker's wake never arrived\n");
         exit(1);
