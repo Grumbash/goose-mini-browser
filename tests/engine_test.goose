@@ -1277,6 +1277,13 @@ fn test_heights() {
     // only as far as the clip.
     check("a page scrolls to the end of its overflow", layout_probe("""<style>html, body { height: 100%; margin: 0; padding: 0; max-width: none }</style><div style="height: 900px; background: #000"></div><div style="height: 300px; overflow: hidden"><div style="height: 5000px; background: #000"></div></div>""", 400.0, PROBE_PAGE),
           "1200.0");
+    // An <img> is replaced as an <svg> is: its width and height attributes
+    // are its dimensions, and CSS beats each (so width: 100px alone leaves
+    // the height attribute's 333, as browsers draw it); with height: auto
+    // their ratio gives the height; with no size it takes no room until it
+    // is decoded.
+    check("an img's size", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none } img { display: block }</style><img id=a src=x.png width=250 height=333><img id=b src=x.png width=250 height=333 style="width: 100px"><img id=c src=x.png><img id=d src=x.png width=400 height=200 style="max-width: 50%; height: auto">""", 400.0, PROBE_GEOMETRY),
+          "a x 0.0 y 0.0 w 250.0 h 333.0\nb x 0.0 y 333.0 w 100.0 h 333.0\nc x 0.0 y 666.0 w 0.0 h 0.0\nd x 0.0 y 666.0 w 200.0 h 100.0\n");
     check("an svg's percentage height", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none }</style><div style="height: 100px"><svg id=s viewBox="0 0 2 1" style="display: block; height: 50%"></svg></div>""", 400.0, PROBE_GEOMETRY),
           "s x 0.0 y 0.0 w 100.0 h 50.0\n");
     // What a clip cuts away entirely (clip_items makes it ITEM_NONE and sets
@@ -2224,7 +2231,7 @@ fn test_snapshot() {
                    "  - paragraph [ref=n8]: Some link text.\n    - link \"link\" [ref=n10] [href=/x]\n",
                    "  - list [ref=n13]\n    - listitem [ref=n14]: one\n    - listitem [ref=n16]: two\n",
                    "  - table [ref=n18]\n    - row [ref=n19]: a | b\n",
-                   "  - link \"cat\" [ref=n25] [href=/y]\n    - img \"cat\" [ref=n26]\n");
+                   "  - paragraph [ref=n24]\n    - link \"cat\" [ref=n25] [href=/y]\n      - img \"cat\" [ref=n26]\n");
     check("the page as a tree for agents", layout_probe(page[..], 400.0, PROBE_SNAPSHOT), want[..]);
     // Page text can't start lines of its own; links laid out as blocks, or
     // wrapping blocks, are still named links.

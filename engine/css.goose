@@ -331,7 +331,7 @@ struct Style {
     fill: u32, stroke: u32, stroke_width: f32, linecap: i32, linejoin: i32, fill_rule: i32, transform_box: i32,
     stroke_pct: i32,                     // 1: stroke_width is a percentage of the viewport's diagonal
     fill_opacity: f32, stroke_opacity: f32,
-    svg: i32,                            // 1: an <svg> in HTML, 2: inside one
+    svg: i32,                            // 1: an <svg> in HTML, 2: inside one, 3: an <img> (replaced, as an <svg> is)
     svg_set: i32,                        // the SVG_ paint properties the element's own declarations set
 }
 
@@ -2068,7 +2068,8 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work
     fill(win_prio[..], -1);
     let mark = w.customs.len;
     // Whether it is SVG: 1 for an <svg> in HTML, 2 for what is inside one.
-    let svg: i32 = if parent.svg != 0 { 2 } else if pseudo == 0 && node_name(d, e) == "svg" { 1 } else { 0 };
+    let svg: i32 = if parent.svg != 0 && parent.svg != 3 { 2 } else if pseudo == 0 && node_name(d, e) == "svg" { 1 }
+                   else if pseudo == 0 && node_name(d, e) == "img" { 3 } else { 0 };
     // The buckets this element's rules can be in, each once however many
     // classes it has: the universal one, its tag's, its id's and its classes',
     // split as has_class splits them.
@@ -2091,7 +2092,7 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work
         let b = buckets[bi];
         for k in w.offsets[b]..w.offsets[b + 1] {
             let r = sh.rules[w.order[k]];
-            guard r.pseudo == pseudo && (r.origin != ORIGIN_UA_HTML || svg == 0) && rule_matches(sh, d, r, e) else { continue; }
+            guard r.pseudo == pseudo && (r.origin != ORIGIN_UA_HTML || svg == 0 || svg == 3) && rule_matches(sh, d, r, e) else { continue; }
             let origin: i64 = if r.origin == ORIGIN_UA_HTML { ORIGIN_UA } else { r.origin };
             for j in r.decl..r.decl + r.decl_count {
                 let dc = sh.decls[j];
@@ -2109,9 +2110,11 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work
         for ai in a0..a0 + d.nodes[e].attr_count {
             let a = d.attrs[ai];
             let an = d.bytes[a.name..a.name + a.name_len];
-            let presents = an == "fill" || an == "stroke" || an == "stroke-width" || an == "stroke-linecap" || an == "stroke-linejoin"
-                || an == "fill-rule" || an == "fill-opacity" || an == "stroke-opacity" || an == "opacity" || an == "color" || an == "display"
-                || (svg == 1 && (an == "width" || an == "height"));
+            // An <img>'s width and height are its dimensions too (HTML §15.4.3).
+            let presents = (svg != 3 && (an == "fill" || an == "stroke" || an == "stroke-width" || an == "stroke-linecap"
+                || an == "stroke-linejoin" || an == "fill-rule" || an == "fill-opacity" || an == "stroke-opacity"
+                || an == "opacity" || an == "color" || an == "display"))
+                || ((svg == 1 || svg == 3) && (an == "width" || an == "height"));
             guard presents else { continue; }
             var v: u8[>..] = [];
             v.append(trim(d.bytes[a.value..a.value + a.value_len]));
@@ -2855,8 +2858,9 @@ let UA_CSS = """
     article, main, header, footer, nav, aside, address, hr, form, fieldset, details, summary, center, menu, dir,
     table, caption, thead, tbody, tfoot, tr, legend, hgroup { display: block }
     li { display: list-item }
-    head, title, style, script, link, meta, base, template, iframe, object, embed, video, audio, img,
+    head, title, style, script, link, meta, base, template, iframe, object, embed, video, audio,
     math, input, button, select, textarea, map, area, canvas, picture, source, track, param { display: none }
+    img { background-color: #e9ecef }
     html { color: #1c1c1c; font-family: sans-serif; font-size: 17px; line-height: 1.6 }
     body { max-width: 720px; margin: 0 auto; padding: 40px 32px 120px }
     h1 { font-size: 2em; font-weight: bold; line-height: 1.2; margin: 0.4em 0 0.6em }
