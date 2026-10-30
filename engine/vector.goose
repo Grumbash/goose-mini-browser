@@ -7,7 +7,11 @@
 // element, whose paint then comes from the <use>.
 //
 // Not yet: gradients and patterns (a url() paint takes its fallback), clip
-// paths, masks, markers, text, images and dashed strokes.
+// paths, masks, markers, text, images and dashed strokes. A group's opacity
+// goes on each shape in it, so where they overlap it is darker; a stroke
+// under a scale that differs across and down is as wide as the average
+// scale makes it, all round; and a mask is drawn at the layout's scale, so
+// a CSS scale up blurs it.
 
 import std;
 import math;
