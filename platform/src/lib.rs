@@ -22,10 +22,12 @@ use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use objc2::rc::{Retained, autoreleasepool};
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::runtime::AnyObject;
+use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSEventMask,
-    NSEventModifierFlags, NSEventType, NSWindow, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEvent,
+    NSEventMask, NSEventModifierFlags, NSEventType, NSTrackingArea, NSTrackingAreaOptions,
+    NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
@@ -43,14 +45,18 @@ pub(crate) const ERR_ARGUMENT: i32 = -4;
 pub(crate) const ERR_NO_DEVICE: i32 = -5;
 pub(crate) const ERR_PANIC: i32 = -100;
 
-// Event kinds; the Goose side mirrors these numbers.
+// Event kinds; the Goose side mirrors these numbers. Pointer positions are in
+// points from the content's top left; modifier flags are AppKit's.
 const EV_NONE: i32 = 0; // the wait timed out
 const EV_CLOSE: i32 = 1;
 const EV_RESIZE: i32 = 2; // w, h: content size in points; x: backing scale
 const EV_KEY: i32 = 3; // code: macOS virtual key code; x: the modifier flags
-const EV_MOUSE: i32 = 4; // x, y: points from the top-left; code: button
-const EV_SCROLL: i32 = 5; // x, y: scroll deltas; code: 1 for points (trackpads), 0 for lines (wheels)
+const EV_MOUSE: i32 = 4; // a button went down: x, y; code: button (0 left, 1 right); w: modifiers; h: clicks
+const EV_SCROLL: i32 = 5; // x, y: deltas; code: 1 for points (trackpads), 0 for lines (wheels); w, h: the pointer
 const EV_WAKE: i32 = 6; // code: the token passed to tp_wake
+const EV_MOUSE_UP: i32 = 7; // a button went up: as EV_MOUSE
+const EV_MOUSE_MOVE: i32 = 8; // the pointer moved: x, y; code: buttons held (bit 0 left, bit 1 right); w: modifiers
+const EV_MOUSE_LEAVE: i32 = 9; // the pointer left the content
 
 /// One input event, laid out as Goose's `struct Event { kind: i32, code: i32,
 /// x: f64, y: f64, w: f64, h: f64 }`.
@@ -126,6 +132,7 @@ struct Platform {
     open: bool,
     pending: VecDeque<GpEvent>,
     frames: i64,
+    cursor: i32, // the CURSOR_ shape set last, or -1 when AppKit may have changed it
 }
 
 thread_local! {
@@ -215,6 +222,21 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
         // Layer-hosting view: the layer is set before wantsLayer.
         view.setLayer(Some(&**layer));
         view.setWantsLayer(true);
+        // The pointer's moves and its leaving, whichever app is active: hover
+        // follows the pointer as it does in other browsers.
+        let tracking = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                NSRect::ZERO,
+                NSTrackingAreaOptions::MouseEnteredAndExited
+                    | NSTrackingAreaOptions::MouseMoved
+                    | NSTrackingAreaOptions::ActiveAlways
+                    | NSTrackingAreaOptions::InVisibleRect,
+                Some(AsRef::<AnyObject>::as_ref(&*view)),
+                None,
+            )
+        };
+        view.addTrackingArea(&tracking);
 
         window.makeKeyAndOrderFront(None);
         app.activate();
@@ -243,6 +265,7 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
                 open: true,
                 pending,
                 frames: 0,
+                cursor: -1,
             })
         });
         Ok(0)
@@ -290,7 +313,10 @@ pub extern "C" fn tp_next_event(timeout_ms: i64, out: *mut GpEvent) -> i32 {
                     }
                     check_window(p);
                     if let Some(e) = translated {
-                        p.pending.push_back(e);
+                        if e.kind == EV_MOUSE_LEAVE {
+                            p.cursor = -1;
+                        }
+                        queue(&mut p.pending, e);
                     }
                     true
                 });
@@ -318,40 +344,85 @@ fn translate(p: &Platform, ev: &NSEvent) -> Option<GpEvent> {
         });
     }
     if kind == NSEventType::KeyDown {
-        let modifiers = ev.modifierFlags().0 as f64;
         return Some(GpEvent {
             kind: EV_KEY,
             code: ev.keyCode() as i32,
-            x: modifiers,
+            x: ev.modifierFlags().0 as f64,
             ..Default::default()
         });
     }
-    if kind == NSEventType::LeftMouseDown || kind == NSEventType::RightMouseDown {
-        let at = ev.locationInWindow();
-        let button = if kind == NSEventType::LeftMouseDown {
-            0
-        } else {
-            1
-        };
+    let modifiers = ev.modifierFlags().0 as f64;
+    let at = ev.locationInWindow();
+    let (x, y) = (at.x, p.size.1 - at.y);
+    if kind == NSEventType::MouseExited {
         return Some(GpEvent {
-            kind: EV_MOUSE,
-            code: button,
-            x: at.x,
-            y: p.size.1 - at.y,
+            kind: EV_MOUSE_LEAVE,
             ..Default::default()
         });
     }
     if kind == NSEventType::ScrollWheel {
-        let precise = ev.hasPreciseScrollingDeltas() as i32;
         return Some(GpEvent {
             kind: EV_SCROLL,
-            code: precise,
+            code: ev.hasPreciseScrollingDeltas() as i32,
             x: ev.scrollingDeltaX(),
             y: ev.scrollingDeltaY(),
-            ..Default::default()
+            w: x,
+            h: y,
         });
     }
-    None
+    let (event, code) = pointer(kind)?;
+    // A press in the title bar, above the content, is AppKit's alone.
+    if event == EV_MOUSE && y < 0.0 {
+        return None;
+    }
+    let clicks = if event == EV_MOUSE_MOVE {
+        0.0
+    } else {
+        ev.clickCount() as f64
+    };
+    Some(GpEvent {
+        kind: event,
+        code,
+        x,
+        y,
+        w: modifiers,
+        h: clicks,
+    })
+}
+
+/// The pointer event an AppKit mouse event is, and its code: the button, or
+/// for a move the buttons held.
+fn pointer(kind: NSEventType) -> Option<(i32, i32)> {
+    Some(match kind {
+        NSEventType::LeftMouseDown => (EV_MOUSE, 0),
+        NSEventType::RightMouseDown => (EV_MOUSE, 1),
+        NSEventType::LeftMouseUp => (EV_MOUSE_UP, 0),
+        NSEventType::RightMouseUp => (EV_MOUSE_UP, 1),
+        NSEventType::MouseMoved => (EV_MOUSE_MOVE, 0),
+        NSEventType::LeftMouseDragged => (EV_MOUSE_MOVE, 1),
+        NSEventType::RightMouseDragged => (EV_MOUSE_MOVE, 2),
+        _ => return None,
+    })
+}
+
+/// Adds event `e` to the ones waiting for Goose. A move replaces a move just
+/// before it, and a scroll is added to a scroll of the same kind just before
+/// it, so a burst of either costs Goose one hit test or one place a frame.
+fn queue(pending: &mut VecDeque<GpEvent>, e: GpEvent) {
+    if let Some(last) = pending.back_mut() {
+        if e.kind == EV_MOUSE_MOVE && last.kind == EV_MOUSE_MOVE {
+            *last = e;
+            return;
+        }
+        if e.kind == EV_SCROLL && last.kind == EV_SCROLL && e.code == last.code {
+            last.x += e.x;
+            last.y += e.y;
+            last.w = e.w;
+            last.h = e.h;
+            return;
+        }
+    }
+    pending.push_back(e);
 }
 
 /// After AppKit has handled an event: notice a closed window or a new size.
@@ -459,6 +530,45 @@ pub extern "C" fn tp_frames() -> i64 {
     }
 }
 
+// Pointer shapes for tp_set_cursor; the Goose side mirrors these numbers.
+const CURSOR_ARROW: i32 = 0;
+const CURSOR_POINTER: i32 = 1; // a pointing hand, over a link
+const CURSOR_TEXT: i32 = 2;
+const CURSOR_GRAB: i32 = 3;
+const CURSOR_GRABBING: i32 = 4;
+const CURSOR_RESIZE_ACROSS: i32 = 5;
+const CURSOR_RESIZE_DOWN: i32 = 6;
+const CURSOR_CROSSHAIR: i32 = 7;
+const CURSOR_NOT_ALLOWED: i32 = 8;
+
+/// Shows pointer shape `kind` (CURSOR_) over the window. Setting the shape
+/// already shown does nothing, so Goose may call it on every move.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_set_cursor(kind: i32) -> i32 {
+    guarded(|| {
+        with_platform(|p| {
+            if kind == p.cursor {
+                return Ok(0);
+            }
+            let cursor = match kind {
+                CURSOR_ARROW => NSCursor::arrowCursor(),
+                CURSOR_POINTER => NSCursor::pointingHandCursor(),
+                CURSOR_TEXT => NSCursor::IBeamCursor(),
+                CURSOR_GRAB => NSCursor::openHandCursor(),
+                CURSOR_GRABBING => NSCursor::closedHandCursor(),
+                CURSOR_RESIZE_ACROSS => NSCursor::columnResizeCursor(),
+                CURSOR_RESIZE_DOWN => NSCursor::rowResizeCursor(),
+                CURSOR_CROSSHAIR => NSCursor::crosshairCursor(),
+                CURSOR_NOT_ALLOWED => NSCursor::operationNotAllowedCursor(),
+                _ => return Err(ERR_ARGUMENT),
+            };
+            cursor.set();
+            p.cursor = kind;
+            Ok(0)
+        })
+    })
+}
+
 /// Closes the window and releases everything the platform layer holds.
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_close() -> i32 {
@@ -496,6 +606,59 @@ mod tests {
         assert_eq!(tp_next_event(0, &mut e), ERR_NOT_MAIN_THREAD);
         assert_eq!(tp_render(0xFFFF_FFFF), ERR_NOT_MAIN_THREAD);
         assert_eq!(tp_frames(), ERR_NOT_MAIN_THREAD as i64);
+        assert_eq!(tp_set_cursor(CURSOR_POINTER), ERR_NOT_MAIN_THREAD);
+    }
+
+    #[test]
+    fn moves_and_scrolls_coalesce_but_nothing_else_does() {
+        let mv = |x| GpEvent {
+            kind: EV_MOUSE_MOVE,
+            x,
+            ..Default::default()
+        };
+        let mut q = VecDeque::new();
+        queue(&mut q, mv(1.0));
+        queue(&mut q, mv(2.0));
+        assert_eq!((q.len(), q[0].x), (1, 2.0));
+        queue(
+            &mut q,
+            GpEvent {
+                kind: EV_MOUSE,
+                ..Default::default()
+            },
+        );
+        queue(&mut q, mv(3.0));
+        assert_eq!(q.len(), 3);
+        let scroll = |dy, code, h| GpEvent {
+            kind: EV_SCROLL,
+            code,
+            y: dy,
+            h,
+            ..Default::default()
+        };
+        let mut q = VecDeque::new();
+        queue(&mut q, scroll(-2.0, 1, 10.0));
+        queue(&mut q, scroll(-3.0, 1, 12.0));
+        assert_eq!((q.len(), q[0].y, q[0].h), (1, -5.0, 12.0));
+        // A wheel's lines don't add to a trackpad's points.
+        queue(&mut q, scroll(1.0, 0, 12.0));
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn mouse_events_map_to_pointer_events() {
+        assert_eq!(pointer(NSEventType::LeftMouseDown), Some((EV_MOUSE, 0)));
+        assert_eq!(pointer(NSEventType::RightMouseUp), Some((EV_MOUSE_UP, 1)));
+        assert_eq!(pointer(NSEventType::MouseMoved), Some((EV_MOUSE_MOVE, 0)));
+        assert_eq!(
+            pointer(NSEventType::LeftMouseDragged),
+            Some((EV_MOUSE_MOVE, 1))
+        );
+        assert_eq!(
+            pointer(NSEventType::RightMouseDragged),
+            Some((EV_MOUSE_MOVE, 2))
+        );
+        assert_eq!(pointer(NSEventType::KeyDown), None);
     }
 
     #[test]

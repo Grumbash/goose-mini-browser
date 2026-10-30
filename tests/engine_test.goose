@@ -9,6 +9,7 @@ import engine.html;
 import engine.css;
 import engine.layout;
 import engine.snapshot;
+import engine.hit;
 
 var failures = 0;
 
@@ -838,6 +839,89 @@ fn test_transforms() {
         <div style="height: 20px; transform: translateY(2000px)"></div>
         """;
     check("transforms reach down the page", layout_probe(far, 400.0, PROBE_PAGE), "2030.0");
+}
+
+fn test_hit() {
+    // The topmost item under each point: text in its line, a link around it,
+    // a box where its transform turned it (and not where it was), nothing
+    // where a clip cut it, and what paints last where two overlap.
+    let page = """
+        <style>body { margin: 0; padding: 0; max-width: none; font: 10px/1 sans-serif } div { height: 20px }</style>
+        <div id=a style="background: #eee">x <a href="/one">one</a></div>
+        <div id=t style="transform: translateX(100px) rotate(90deg); background: #ccc; width: 50px"></div>
+        <div style="overflow: hidden; height: 10px; width: 50px"><div id=c style="height: 40px; background: #999"></div></div>
+        <div style="height: 30px"></div>
+        <div style="position: relative"><div id=under style="background: #f00"></div>
+        <div id=over style="position: absolute; top: 0; left: 0; width: 30px; background: #00f"></div></div>
+        """;
+    let xs: f32[8] = [1.0, 15.0, 125.0, 10.0, 5.0, 5.0, 5.0, 40.0];
+    let ys: f32[8] = [15.0, 5.0, 50.0, 25.0, 45.0, 55.0, 85.0, 85.0];
+    check("what is under the pointer", hits_of(page, xs[..], ys[..]),
+          "a\n\"one\" in a href=/one\nt\nnone\nc\nnone\nover\nunder\n");
+}
+
+// What node_at finds at each point (xs[k], ys[k]) of `src` laid out 400 wide:
+// the element's id, or a text's quoted text and the element it is in; with
+// the link around it, if any.
+fn hits_of(src: const u8[:], xs: const f32[:], ys: const f32[:]) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes };
+    load_sheets(d, sh);
+    var styles: Style[>..] = [];
+    compute_styles(d, sh, styles);
+    var text: u8[>..] = [];
+    var carets: f32[>..] = [];
+    var runs: Run[>..] = [];
+    var run_of: i32[>..] = [];
+    var fonts: FontInfo[>..] = [];
+    var boxes: Rect[>..] = [];
+    var items: DItem[>..<] = [];
+    var flex: FlexItem[>..<] = [];
+    var atoms: i32[>..<] = [];
+    var measured: Measured[>..] = [];
+    var paths: f32[>..<] = [];
+    var ids: i32[>..] = [];
+    var definite: f32[>..] = [];
+    let L = Layout { d: d, styles: styles, text: text, carets: carets, runs: runs, run_of: run_of,
+                     fonts: fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
+                     measured: measured, paths: paths, ids: ids, definite: definite };
+    measure(L);
+    layout_page(L, 400.0, 600.0);
+    var out: u8[>..] = [];
+    for x, k in xs {
+        let n = node_at(items[..], fonts[..], x, ys[k]);
+        if n < 0 {
+            out.append("none\n");
+            continue;
+        }
+        var e = n;
+        if nodes[n].kind == NODE_TEXT {
+            format(out, "\"", trim(node_text(d, n)), "\" in ");
+            e = nodes[n].parent;
+        }
+        let id, has = attr_value(d, e, "id");
+        out.append(if has { id } else { node_name(d, e) });
+        let link = link_at(d, n);
+        if link >= 0 {
+            let href, h = attr_value(d, link, "href");
+            format(out, " href=", href);
+        }
+        out.push('\n');
+    }
+    return out;
 }
 
 fn test_heights() {
@@ -1834,6 +1918,7 @@ fn main() {
     test_fonts();
     test_svg();
     test_heights();
+    test_hit();
     test_layout();
     test_snapshot();
     test_page();
