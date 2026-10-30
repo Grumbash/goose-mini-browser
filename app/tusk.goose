@@ -115,9 +115,10 @@ fn measure_page(P: Page) {
     var measured: Measured[>..] = [];
     var paths: f32[>..<] = [];
     var ids: i32[>..] = [];
+    var definite: f32[>..] = [];
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
                      fonts: P.fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
-                     measured: measured, paths: paths, ids: ids };
+                     measured: measured, paths: paths, ids: ids, definite: definite };
     measure(L);
 }
 
@@ -131,9 +132,10 @@ fn show_page(P: Page, width: f32, scale: f32, cost: Cost&) -> f32 {
     var measured: Measured[>..] = [];
     var paths: f32[>..<] = [];
     var ids: i32[>..] = [];
+    var definite: f32[>..] = [];
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
                      fonts: P.fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
-                     measured: measured, paths: paths, ids: ids };
+                     measured: measured, paths: paths, ids: ids, definite: definite };
     let t0 = clock_ns();
     let height = layout_page(L, width, WINDOW_H - BAR_H);
     let t1 = clock_ns();
@@ -445,9 +447,10 @@ fn print_snapshot(P: Page, cost: Cost, html_bytes: i64) {
     var measured: Measured[>..] = [];
     var paths: f32[>..<] = [];
     var ids: i32[>..] = [];
+    var definite: f32[>..] = [];
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
                      fonts: P.fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
-                     measured: measured, paths: paths, ids: ids };
+                     measured: measured, paths: paths, ids: ids, definite: definite };
     let t0 = clock_ns();
     let h = layout_page(L, WINDOW_W, WINDOW_H - BAR_H);
     let t1 = clock_ns();
