@@ -153,17 +153,58 @@ struct Bar {
     height: f64, // 0: none, and the system's title bar shows
     lights_x: f64,
     full_screen: bool, // the window is, and its title bar is AppKit's
+    lights: [f64; 4],  // where the traffic lights are, always AppKit's
     drag: Vec<[f64; 4]>,
     holes: Vec<[f64; 4]>, // controls inside the drag regions
 }
 
+/// Who a press goes to, when Goose draws the window's bar.
+#[derive(Debug, PartialEq)]
+enum Press {
+    /// Below the bar: Goose's, and AppKit sees it as usual.
+    Goose,
+    /// A control in the bar: Goose's alone, so AppKit's title bar under it
+    /// doesn't drag the window from there.
+    Control,
+    /// AppKit's alone: off the content (the edges a window is resized by),
+    /// a traffic light, or a drag region, where it moves the window.
+    AppKit,
+    /// A double click on a drag region: Tusk zooms or minimizes the window.
+    TitleClick,
+}
+
+fn inside(r: &[f64; 4], x: f64, y: f64) -> bool {
+    x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3]
+}
+
 impl Bar {
-    /// Whether a press at (x, y) is AppKit's, to drag the window (or zoom
-    /// it, on a double click, or press a traffic light): in a drag region,
-    /// on none of its controls.
+    /// Whether (x, y) is in a drag region, on none of its controls.
     fn drags(&self, x: f64, y: f64) -> bool {
-        let inside = |r: &[f64; 4]| x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3];
-        self.height > 0.0 && self.drag.iter().any(inside) && !self.holes.iter().any(inside)
+        self.height > 0.0
+            && self.drag.iter().any(|r| inside(r, x, y))
+            && !self.holes.iter().any(|r| inside(r, x, y))
+    }
+
+    /// Who a press at (x, y), its `clicks`th, goes to, in a content `size`
+    /// big; `left` for the left button.
+    fn press(&self, size: (f64, f64), x: f64, y: f64, left: bool, clicks: isize) -> Press {
+        if self.height <= 0.0 {
+            return Press::Goose;
+        }
+        if !(x >= 0.0 && y >= 0.0 && x < size.0 && y < size.1) || inside(&self.lights, x, y) {
+            return Press::AppKit;
+        }
+        if y >= self.height {
+            return Press::Goose;
+        }
+        if left && self.drags(x, y) {
+            return if clicks == 2 && !self.full_screen {
+                Press::TitleClick
+            } else {
+                Press::AppKit
+            };
+        }
+        Press::Control
     }
 }
 
@@ -208,7 +249,10 @@ pub extern "C" fn tp_open(
 ) -> i32 {
     guarded(|| {
         let mtm = MainThreadMarker::new().ok_or(ERR_NOT_MAIN_THREAD)?;
-        let sizes = width > 0.0 && height > 0.0 && (0.0..height).contains(&bar) && lights_x >= 0.0;
+        let sizes = width > 0.0
+            && height > 0.0
+            && (0.0..height).contains(&bar)
+            && (0.0..width).contains(&lights_x);
         if !sizes || title_len < 0 || (title.is_null() && title_len > 0) {
             return Err(ERR_ARGUMENT);
         }
@@ -249,6 +293,8 @@ pub extern "C" fn tp_open(
             let mut frame = window.frame();
             frame.size = NSSize::new(width, height);
             window.setFrame_display(frame, false);
+            // The interface needs room for its bar, its panels and some page.
+            window.setContentMinSize(NSSize::new(MIN_WIDTH, MIN_HEIGHT));
         }
         window.center();
 
@@ -338,12 +384,17 @@ pub extern "C" fn tp_open(
     })
 }
 
+/// The smallest window with Goose's bar: its bar's controls, the dev panel
+/// and room for a page.
+const MIN_WIDTH: f64 = 640.0;
+const MIN_HEIGHT: f64 = 400.0;
+
 /// Puts the traffic lights in Goose's bar: AppKit's title bar made as tall
 /// as it, and the three buttons centred down it from `lights_x`, as far
 /// apart as AppKit puts them. AppKit lays its title bar out again now and
 /// then (a resize, a new title), so this runs after every event, and moves
 /// nothing when they are where they should be.
-fn place_lights(p: &Platform) {
+fn place_lights(p: &mut Platform) {
     // In full screen the title bar is AppKit's, in a strip of its own that
     // slides down when the pointer goes to the top: it is left as it is.
     if p.bar.height <= 0.0 || p.window.styleMask().contains(NSWindowStyleMask::FullScreen) {
@@ -363,14 +414,22 @@ fn place_lights(p: &Platform) {
     };
     let (c, n) = (close.frame(), next.frame());
     let y = ((p.bar.height - c.size.height) / 2.0).round();
-    if c.origin.x == p.bar.lights_x && c.origin.y == y {
-        return;
-    }
     let step = n.origin.x - c.origin.x;
+    // Where they are in the content, from its top left: AppKit's to press.
+    p.bar.lights = [
+        p.bar.lights_x,
+        y,
+        step * (buttons.len() as f64 - 1.0) + c.size.width,
+        c.size.height,
+    ];
     let Some(container) = (unsafe { close.superview() }).and_then(|v| unsafe { v.superview() })
     else {
         return;
     };
+    let placed = c.origin.x == p.bar.lights_x && c.origin.y == y;
+    if placed && container.frame().size.height == p.bar.height {
+        return;
+    }
     let mut frame = container.frame();
     frame.size.height = p.bar.height;
     frame.origin.y = p.window.frame().size.height - p.bar.height;
@@ -496,17 +555,19 @@ fn take(p: &mut Platform, until: &NSDate) -> bool {
         // strip in full screen, a menu) is AppKit's alone: its position is
         // in that window, not ours.
         let elsewhere = is_pointer(kind) && ev.windowNumber() != p.window.windowNumber();
-        // A press in Goose's bar: AppKit's where it drags the window, else
+        // A press: in Goose's bar, AppKit's where it drags the window, else
         // Goose's alone, so that AppKit's title bar under it doesn't start
-        // a drag from a control.
-        let (mut appkits, mut in_bar, mut double) = (false, false, false);
-        if p.bar.height > 0.0 && pressing.contains(&kind) && !elsewhere {
+        // a drag from a control (see Press).
+        let mut press = Press::Goose;
+        if pressing.contains(&kind) && !elsewhere {
             let at = ev.locationInWindow();
             let (x, y) = (at.x, p.size.1 - at.y);
-            appkits = kind == NSEventType::LeftMouseDown && p.bar.drags(x, y);
-            in_bar = y < p.bar.height && !appkits;
-            double = appkits && ev.clickCount() == 2;
+            let left = kind == NSEventType::LeftMouseDown;
+            press = p.bar.press(p.size, x, y, left, ev.clickCount());
         }
+        let appkits = press == Press::AppKit || press == Press::TitleClick;
+        let in_bar = press == Press::Control;
+        let double = press == Press::TitleClick;
         let translated = if appkits || elsewhere {
             None
         } else {
@@ -1106,6 +1167,7 @@ mod tests {
             height: 40.0,
             lights_x: 14.0,
             full_screen: false,
+            lights: [14.0, 12.0, 60.0, 16.0],
             drag: vec![[0.0, 0.0, 1200.0, 40.0]],
             holes: vec![[72.0, 6.0, 80.0, 28.0], [290.0, 6.0, 620.0, 28.0]],
         };
@@ -1147,5 +1209,34 @@ mod tests {
         ] {
             assert!(!is_pointer(kind), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn a_press_goes_to_appkit_or_goose_by_where_it_is() {
+        let mut bar = Bar {
+            height: 40.0,
+            lights_x: 14.0,
+            full_screen: false,
+            lights: [14.0, 12.0, 60.0, 16.0],
+            drag: vec![[0.0, 0.0, 1200.0, 40.0]],
+            holes: vec![[90.0, 6.0, 80.0, 28.0]],
+        };
+        let size = (1200.0, 760.0);
+        let at = |bar: &Bar, x, y, left, clicks| bar.press(size, x, y, left, clicks);
+        // Off the content: the edges a window is resized by.
+        for (x, y) in [(10.0, -3.0), (-2.0, 20.0), (1200.0, 20.0), (600.0, 760.0)] {
+            assert_eq!(at(&bar, x, y, true, 1), Press::AppKit, "({x}, {y})");
+        }
+        assert_eq!(at(&bar, 20.0, 20.0, true, 1), Press::AppKit); // a traffic light
+        assert_eq!(at(&bar, 20.0, 20.0, false, 1), Press::AppKit);
+        assert_eq!(at(&bar, 300.0, 20.0, true, 1), Press::AppKit); // the bar's empty space
+        assert_eq!(at(&bar, 300.0, 20.0, true, 2), Press::TitleClick);
+        assert_eq!(at(&bar, 300.0, 20.0, false, 1), Press::Control); // a right click there
+        assert_eq!(at(&bar, 100.0, 20.0, true, 2), Press::Control); // a control
+        assert_eq!(at(&bar, 100.0, 40.0, true, 1), Press::Goose); // below the bar
+        bar.full_screen = true;
+        assert_eq!(at(&bar, 300.0, 20.0, true, 2), Press::AppKit);
+        bar.height = 0.0;
+        assert_eq!(at(&bar, 300.0, 20.0, true, 2), Press::Goose);
     }
 }
