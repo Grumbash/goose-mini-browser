@@ -542,6 +542,22 @@ fn on_main_thread() -> Result<(), i32> {
         .ok_or(ERR_NOT_MAIN_THREAD)
 }
 
+/// Sets Metal up (the device, the shaders and the pipeline) if it isn't yet.
+/// `tp_open` does this for a window; without one, call it before drawing, so
+/// the setup isn't counted as the first paint. ERR_NO_DEVICE on a Mac without
+/// a Metal device.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_start_metal() -> i32 {
+    guarded(|| {
+        on_main_thread()?;
+        start_metal()
+    })
+}
+
+fn start_metal() -> Result<i32, i32> {
+    with_compositor(|_| Ok(0))
+}
+
 /// Hands layer `layer` (0, the page, or 1, the overlay) a new display list.
 /// Positions are in points; `scale` is device pixels per point. The lists are
 /// copied, so Goose may reuse its arrays at once.
@@ -751,6 +767,7 @@ mod tests {
             len: 0,
         };
         let mut stats = GpFrameStats::default();
+        assert_eq!(tp_start_metal(), ERR_NOT_MAIN_THREAD);
         assert_eq!(tp_set_layer(0, items, text, 1.0), ERR_NOT_MAIN_THREAD);
         assert_eq!(
             tp_screenshot(path, 8.0, 8.0, 1.0, 0.0, 0xFFFF_FFFF),
@@ -758,5 +775,25 @@ mod tests {
         );
         assert_eq!(tp_frame_stats(&mut stats, false), ERR_NOT_MAIN_THREAD);
         assert!(COMPOSITOR.with(|cell| cell.borrow().is_none()));
+    }
+
+    #[test]
+    fn metal_starts_once_before_anything_is_drawn() {
+        // libtest runs each test on its own thread, so this one starts without
+        // a compositor. Off the main thread tp_start_metal refuses, so this
+        // checks what it runs.
+        let started = || COMPOSITOR.with(|cell| cell.borrow().is_some());
+        assert!(!started());
+        if MTLCreateSystemDefaultDevice().is_none() {
+            assert_eq!(start_metal(), Err(ERR_NO_DEVICE));
+            assert!(!started());
+            return;
+        }
+        assert_eq!(start_metal(), Ok(0));
+        assert!(started());
+        let queue = || with_compositor(|c| Ok(Retained::as_ptr(&c.queue))).unwrap();
+        let first = queue();
+        assert_eq!(start_metal(), Ok(0));
+        assert_eq!(queue(), first); // the same compositor, not a second setup
     }
 }
