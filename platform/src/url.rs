@@ -44,10 +44,15 @@ pub extern "C" fn tp_url_resolve(base: GSlice<u8>, href: GSlice<u8>, out: GSlice
             .map_err(|_| ERR_ARGUMENT)?;
         let url = resolve(base, href).ok_or(ERR_ARGUMENT)?;
         let len = i32::try_from(url.len()).map_err(|_| ERR_ARGUMENT)?;
-        if out.count() == Some(url.len()) {
-            unsafe { out.copy_from(url.as_bytes()) };
+        match out.count() {
+            Some(0) => Ok(len),
+            Some(n) if n == url.len() => {
+                unsafe { out.copy_from(url.as_bytes()) };
+                Ok(len)
+            }
+            // Neither empty nor as long: nothing is copied, and it says so.
+            _ => Err(ERR_ARGUMENT),
         }
-        Ok(len)
     })
 }
 

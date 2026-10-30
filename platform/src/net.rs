@@ -13,17 +13,21 @@
 //! opposite orders.
 
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+use block2::DynBlock;
+
+use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252, X_USER_DEFINED};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
-use objc2_core_foundation::{CFString, kCFStringEncodingInvalidId};
 use objc2_foundation::{
-    NSData, NSError, NSHTTPURLResponse, NSMutableURLRequest, NSObject, NSObjectProtocol,
-    NSOperationQueue, NSQualityOfService, NSString, NSURL, NSURLCache, NSURLRequestCachePolicy,
-    NSURLSession, NSURLSessionConfiguration, NSURLSessionDataDelegate, NSURLSessionDataTask,
-    NSURLSessionDelegate, NSURLSessionTask, NSURLSessionTaskDelegate,
+    NSCopying, NSData, NSError, NSHTTPURLResponse, NSMutableCopying, NSMutableURLRequest, NSObject,
+    NSObjectProtocol, NSOperationQueue, NSQualityOfService, NSString, NSURL, NSURLCache,
+    NSURLRequest, NSURLRequestCachePolicy, NSURLSession, NSURLSessionConfiguration,
+    NSURLSessionDataDelegate, NSURLSessionDataTask, NSURLSessionDelegate, NSURLSessionTask,
+    NSURLSessionTaskDelegate,
 };
 
 use crate::url::scheme_of;
@@ -49,7 +53,8 @@ pub const ERR_BLOCKED: i32 = -6;
 // Why a finished request has no body, beside NSURLErrorDomain's own codes
 // (all negative, -1001 a timeout, -1003 no such host, -1200 TLS...).
 pub const NET_TOO_BIG: i32 = -30001;
-pub const NET_FAILED: i32 = -30002; // an error from another domain
+pub const NET_FAILED: i32 = -30002; // an error from another domain, or a panic here
+pub const NET_BLOCKED: i32 = -30003; // redirected to a URL the page may not load
 
 // What one response may weigh, by kind: a sanity limit, not a budget.
 const CAPS: [usize; 4] = [0, 64 << 20, 16 << 20, 32 << 20];
@@ -83,6 +88,8 @@ struct Req {
     tab: i32,
     kind: i32,
     profile: usize,
+    from: String, // the page it is for; empty for a page we asked for
+    got: i64,     // the body's bytes received so far
     task: Retained<NSURLSessionDataTask>,
     done: bool,
     status: i32,
@@ -126,6 +133,8 @@ define_class!(
     unsafe impl NSObjectProtocol for Delegate {}
     unsafe impl NSURLSessionDelegate for Delegate {}
 
+    // A panic here would unwind into Foundation and end the whole browser:
+    // each method catches its own, and the request fails instead.
     unsafe impl NSURLSessionTaskDelegate for Delegate {
         #[unsafe(method(URLSession:task:didCompleteWithError:))]
         fn did_complete(
@@ -134,7 +143,28 @@ define_class!(
             task: &NSURLSessionTask,
             error: Option<&NSError>,
         ) {
-            finish(self.ivars().profile, task, error);
+            let profile = self.ivars().profile;
+            if catch_unwind(AssertUnwindSafe(|| finish(profile, task, error))).is_err() {
+                fail(profile, task);
+            }
+        }
+
+        #[unsafe(method(URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:))]
+        fn will_redirect(
+            &self,
+            _session: &NSURLSession,
+            task: &NSURLSessionTask,
+            _response: &NSHTTPURLResponse,
+            request: &NSURLRequest,
+            completion: &DynBlock<dyn Fn(*mut NSURLRequest)>,
+        ) {
+            let profile = self.ivars().profile;
+            let next =
+                catch_unwind(AssertUnwindSafe(|| redirect(profile, task, request))).unwrap_or(None);
+            match next {
+                Some(r) => completion.call((Retained::as_ptr(&r).cast_mut(),)),
+                None => completion.call((std::ptr::null_mut(),)),
+            }
         }
     }
 
@@ -146,7 +176,10 @@ define_class!(
             task: &NSURLSessionDataTask,
             data: &NSData,
         ) {
-            receive(self.ivars().profile, task, data);
+            let profile = self.ivars().profile;
+            if catch_unwind(AssertUnwindSafe(|| receive(profile, task, data))).is_err() {
+                task.cancel();
+            }
         }
     }
 );
@@ -167,7 +200,10 @@ fn session(profile: usize) -> Result<Retained<NSURLSession>, i32> {
         return Ok(s.clone());
     }
     let config = NSURLSessionConfiguration::ephemeralSessionConfiguration();
+    // 30 s with no bytes ends a request, and 5 minutes in all: a server that
+    // drips can't hold a page past that.
     config.setTimeoutIntervalForRequest(30.0);
+    config.setTimeoutIntervalForResource(300.0);
     let cache = unsafe {
         NSURLCache::initWithMemoryCapacity_diskCapacity_directoryURL(
             NSURLCache::alloc(),
@@ -242,8 +278,12 @@ pub extern "C" fn tp_net_open(
             return Err(ERR_BLOCKED);
         }
         let profile = usize::try_from(profile).map_err(|_| ERR_ARGUMENT)?;
+        // A request no mailbox would hear of would stay forever.
+        if !tabs::is_open(tab) {
+            return Err(ERR_ARGUMENT);
+        }
         let session = session(profile)?;
-        let nsurl = NSURL::URLWithString(&NSString::from_str(url)).ok_or(ERR_ARGUMENT)?;
+        let nsurl = NSURL::URLWithString(&NSString::from_str(&rfc3986(url))).ok_or(ERR_ARGUMENT)?;
         let request = NSMutableURLRequest::requestWithURL(&nsurl);
         request.setValue_forHTTPHeaderField(
             Some(&NSString::from_str(USER_AGENT)),
@@ -271,7 +311,11 @@ pub extern "C" fn tp_net_open(
         let task = session.dataTaskWithRequest(&request);
         let id = {
             let mut n = net();
+            // Past ids still in use, once they wrap.
             n.last = n.last % (MAX_ID - 1) + 1;
+            while n.reqs.contains_key(&n.last) {
+                n.last = n.last % (MAX_ID - 1) + 1;
+            }
             let id = n.last;
             n.tasks.insert((profile, task.taskIdentifier()), id);
             n.reqs.insert(
@@ -280,6 +324,8 @@ pub extern "C" fn tp_net_open(
                     tab,
                     kind,
                     profile,
+                    from: from.to_string(),
+                    got: 0,
                     task: task.clone(),
                     done: false,
                     status: 0,
@@ -323,6 +369,7 @@ fn receive(profile: usize, task: &NSURLSessionDataTask, data: &NSData) {
                 r.expected = task.countOfBytesExpectedToReceive();
             }
             r.body.extend_from_slice(bytes);
+            r.got = r.body.len() as i64;
             false
         }
     };
@@ -334,7 +381,7 @@ fn receive(profile: usize, task: &NSURLSessionDataTask, data: &NSData) {
 /// On the delegate's queue: a task ended. Its response is read, its body
 /// decoded to UTF-8 for a document or a sheet, and its tab woken.
 fn finish(profile: usize, task: &NSURLSessionTask, error: Option<&NSError>) {
-    let (id, tab, kind, too_big, body) = {
+    let (id, tab, kind, preset, body) = {
         let mut n = net();
         let Some(id) = n.tasks.remove(&(profile, task.taskIdentifier())) else {
             return;
@@ -342,13 +389,7 @@ fn finish(profile: usize, task: &NSURLSessionTask, error: Option<&NSError>) {
         let Some(r) = n.reqs.get_mut(&id) else {
             return;
         };
-        (
-            id,
-            r.tab,
-            r.kind,
-            r.error == NET_TOO_BIG,
-            std::mem::take(&mut r.body),
-        )
+        (id, r.tab, r.kind, r.error, std::mem::take(&mut r.body))
     };
     let response = task.response();
     let http = response
@@ -370,8 +411,13 @@ fn finish(profile: usize, task: &NSURLSessionTask, error: Option<&NSError>) {
         .as_ref()
         .and_then(|r| r.textEncodingName())
         .map(|s| s.to_string());
-    let (code, text) = if too_big {
+    let (code, text) = if preset == NET_TOO_BIG {
         (NET_TOO_BIG, b"too big to load".to_vec())
+    } else if preset == NET_BLOCKED {
+        (
+            NET_BLOCKED,
+            b"redirected to a URL the page may not load".to_vec(),
+        )
     } else {
         match error {
             None => (0, Vec::new()),
@@ -407,7 +453,90 @@ fn finish(profile: usize, task: &NSURLSessionTask, error: Option<&NSError>) {
         r.mime = mime;
         r.text = text;
     }
-    tabs::post_net(tab, id);
+    // A tab gone meanwhile hears nothing, and no one will take it.
+    if !tabs::post_net(tab, id) {
+        net().reqs.remove(&id);
+    }
+}
+
+/// On the delegate's queue: a panic made `task` end where it was. Its
+/// request fails, and its tab hears of it.
+fn fail(profile: usize, task: &NSURLSessionTask) {
+    let found = {
+        let mut n = net();
+        let id = n.tasks.remove(&(profile, task.taskIdentifier()));
+        id.and_then(|id| n.reqs.get_mut(&id).map(|r| (id, r)))
+            .map(|(id, r)| {
+                r.done = true;
+                r.error = NET_FAILED;
+                r.body = Vec::new();
+                r.text = b"Tusk failed loading it".to_vec();
+                (id, r.tab)
+            })
+    };
+    if let Some((id, tab)) = found {
+        tabs::post_net(tab, id);
+    }
+}
+
+/// On the delegate's queue: `task` is redirected to `request`. The new URL
+/// must pass what the first did (`allowed`): http and https only, and no
+/// http sheet or image for an https page. A page we asked for follows its
+/// own redirects for its cookies, so each hop's request has the new URL as
+/// its main document. None to stop there: the request then fails as
+/// NET_BLOCKED.
+fn redirect(
+    profile: usize,
+    task: &NSURLSessionTask,
+    request: &NSURLRequest,
+) -> Option<Retained<NSURLRequest>> {
+    let url = request.URL()?.absoluteString()?.to_string();
+    let mut n = net();
+    let id = *n.tasks.get(&(profile, task.taskIdentifier()))?;
+    let r = n.reqs.get_mut(&id)?;
+    if !allowed(r.kind, &url, &r.from) {
+        r.error = NET_BLOCKED;
+        return None;
+    }
+    if r.kind != NET_DOCUMENT || !r.from.is_empty() {
+        return Some(request.copy());
+    }
+    let next: Retained<NSMutableURLRequest> = request.mutableCopy();
+    next.setMainDocumentURL(request.URL().as_deref());
+    Some(Retained::into_super(next))
+}
+
+/// `url` (the url crate's serialization) as RFC 3986 takes it: past the
+/// authority, a byte RFC 3986 doesn't allow there (`[ ] | ^ \ { } "` and the
+/// like) becomes %XX, as does a % that starts no escape and a # after the
+/// first. NSURL would otherwise escape the whole URL again, %20 into %2520.
+fn rfc3986(url: &str) -> String {
+    let b = url.as_bytes();
+    let start = url.find("://").map_or(0, |k| {
+        let host = k + 3;
+        url[host..]
+            .find(['/', '?', '#'])
+            .map_or(url.len(), |e| host + e)
+    });
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&url[..start]);
+    let mut hashed = false;
+    for (i, &c) in b.iter().enumerate().skip(start) {
+        let plain = c.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?".contains(&c);
+        let escape = c == b'%'
+            && i + 2 < b.len()
+            && b[i + 1].is_ascii_hexdigit()
+            && b[i + 2].is_ascii_hexdigit();
+        if plain || escape {
+            out.push(c as char);
+        } else if c == b'#' && !hashed {
+            hashed = true;
+            out.push('#');
+        } else {
+            out.push_str(&format!("%{c:02X}"));
+        }
+    }
+    out
 }
 
 /// Request `req`'s state into `out`. Returns 1 when it has ended, 0 while it
@@ -478,6 +607,8 @@ pub extern "C" fn tp_net_cancel(req: i32) -> i32 {
             r
         };
         r.task.cancel();
+        // One that had ended and was told of says nothing more.
+        tabs::forget_net(r.tab, req);
         Ok(0)
     })
 }
@@ -508,123 +639,210 @@ pub(crate) fn cancel_tab(tab: i32) {
 
 // ------------------------------------------------------------------ charsets
 
-/// `body` as UTF-8, given the charset its response named, if any. In order:
-/// a byte order mark, then that charset, then for a document a `<meta>` one
-/// in its first 1024 bytes and for a sheet an `@charset` rule, then UTF-8
-/// if the bytes are UTF-8, and windows-1252 if not (WHATWG Encoding's
-/// fallback for English). What doesn't decode becomes U+FFFD.
+/// `body` as UTF-8, as WHATWG Encoding decodes it (encoding_rs): in order,
+/// a byte order mark; the charset its response named, if WHATWG knows the
+/// label; for a document a `<meta>` in its first 1024 bytes (HTML's
+/// prescan), for a sheet a leading `@charset`; then UTF-8 if the bytes are
+/// UTF-8, and windows-1252 if not (WHATWG's fallback for English). What
+/// doesn't decode becomes U+FFFD, a sequence at a time.
 fn to_utf8(body: Vec<u8>, charset: Option<&str>, kind: i32) -> Vec<u8> {
-    if let Some(rest) = body.strip_prefix(b"\xEF\xBB\xBF") {
-        return utf8_or_replaced(rest.to_vec());
+    if let Some((enc, bom)) = Encoding::for_bom(&body) {
+        return decoded(enc, body, bom);
     }
-    if body.starts_with(b"\xFE\xFF") {
-        return decode(&body[2..], "utf-16be").unwrap_or_default();
+    let declared = charset
+        .and_then(|l| Encoding::for_label(l.trim().as_bytes()))
+        .or_else(|| {
+            if kind == NET_DOCUMENT {
+                meta_charset(&body)
+            } else {
+                css_charset(&body)
+            }
+        });
+    match declared {
+        Some(enc) => decoded(enc, body, 0),
+        None if std::str::from_utf8(&body).is_ok() => body,
+        None => decoded(WINDOWS_1252, body, 0),
     }
-    if body.starts_with(b"\xFF\xFE") {
-        return decode(&body[2..], "utf-16le").unwrap_or_default();
+}
+
+/// `body` from byte `from` on, decoded from `enc` into UTF-8. UTF-8 that is
+/// already whole is handed back as it is.
+fn decoded(enc: &'static Encoding, body: Vec<u8>, from: usize) -> Vec<u8> {
+    if enc == UTF_8 && from == 0 && std::str::from_utf8(&body).is_ok() {
+        return body;
     }
-    let declared = charset.map(str::to_owned).or_else(|| {
-        if kind == NET_DOCUMENT {
-            meta_charset(&body)
-        } else {
-            css_charset(&body)
+    let (text, _) = enc.decode_without_bom_handling(&body[from..]);
+    text.into_owned().into_bytes()
+}
+
+/// A charset a document or a sheet declares itself in: UTF-16 there can only
+/// be a mistake (the bytes were read as ASCII to find it), so it means UTF-8,
+/// and x-user-defined means windows-1252 (HTML §13.2.3.2).
+fn declared_in_text(label: &[u8]) -> Option<&'static Encoding> {
+    let enc = Encoding::for_label(label)?;
+    if enc == UTF_16BE || enc == UTF_16LE {
+        return Some(UTF_8);
+    }
+    if enc == X_USER_DEFINED {
+        return Some(WINDOWS_1252);
+    }
+    Some(enc)
+}
+
+/// The charset the first 1024 bytes of a document declare in a `<meta>`, by
+/// HTML's prescan (§13.2.3.2): comments and other tags are stepped over; a
+/// `<meta charset>` counts, and a `<meta content="...; charset=x">` only with
+/// `http-equiv="content-type"`.
+fn meta_charset(body: &[u8]) -> Option<&'static Encoding> {
+    let b = &body[..body.len().min(1024)];
+    let mut i = 0;
+    while i < b.len() {
+        if b[i..].starts_with(b"<!--") {
+            i = find(&b[i + 2..], b"-->").map_or(b.len(), |e| i + 2 + e + 3);
+            continue;
         }
-    });
-    match declared.as_deref().map(label) {
-        Some("utf-8") | None if std::str::from_utf8(&body).is_ok() => body,
-        Some("utf-8") => utf8_or_replaced(body),
-        Some(other) => decode(&body, other)
-            .or_else(|| decode(&body, "windows-1252"))
-            .unwrap_or_else(|| utf8_or_replaced(body)),
-        None => decode(&body, "windows-1252").unwrap_or_else(|| utf8_or_replaced(body)),
-    }
-}
-
-fn utf8_or_replaced(body: Vec<u8>) -> Vec<u8> {
-    match String::from_utf8(body) {
-        Ok(s) => s.into_bytes(),
-        Err(e) => String::from_utf8_lossy(e.as_bytes())
-            .into_owned()
-            .into_bytes(),
-    }
-}
-
-/// A charset label as WHATWG Encoding reads it: the Latin-1 and ASCII names
-/// mean windows-1252, and UTF-8's aliases mean UTF-8.
-fn label(name: &str) -> &str {
-    let n = name.trim().trim_matches(|c| c == '"' || c == '\'');
-    if ["utf-8", "utf8", "unicode-1-1-utf-8"]
-        .iter()
-        .any(|l| n.eq_ignore_ascii_case(l))
-    {
-        return "utf-8";
-    }
-    if [
-        "iso-8859-1",
-        "iso8859-1",
-        "latin1",
-        "l1",
-        "us-ascii",
-        "ascii",
-        "cp1252",
-        "x-cp1252",
-    ]
-    .iter()
-    .any(|l| n.eq_ignore_ascii_case(l))
-    {
-        return "windows-1252";
-    }
-    n
-}
-
-/// `bytes` in the charset called `name`, through Core Foundation, as UTF-8;
-/// None for a name it doesn't know or bytes that aren't in that charset.
-fn decode(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
-    let cf = CFString::convert_iana_char_set_name_to_encoding(&CFString::from_str(name));
-    if cf == kCFStringEncodingInvalidId {
-        return None;
-    }
-    let encoding = CFString::convert_encoding_to_ns_string_encoding(cf) as usize;
-    let start = std::ptr::NonNull::new(bytes.as_ptr().cast_mut().cast())
-        .unwrap_or(std::ptr::NonNull::dangling());
-    let s: Option<Retained<NSString>> = unsafe {
-        NSString::initWithBytes_length_encoding(NSString::alloc(), start, bytes.len(), encoding)
-    };
-    s.map(|s| s.to_string().into_bytes())
-}
-
-/// The charset a `<meta>` names in the first 1024 bytes of `body`: as
-/// `charset=` in the tag, either alone or in `content`.
-fn meta_charset(body: &[u8]) -> Option<String> {
-    let head = &body[..body.len().min(1024)];
-    let lower: Vec<u8> = head.to_ascii_lowercase();
-    let mut at = 0;
-    while let Some(k) = find(&lower[at..], b"<meta") {
-        let start = at + k;
-        let end = find(&lower[start..], b">").map_or(lower.len(), |e| start + e);
-        let tag = &lower[start..end];
-        if let Some(c) = find(tag, b"charset=") {
-            let v = &head[start + c + 8..end];
-            let v: Vec<u8> = v
-                .iter()
-                .copied()
-                .skip_while(|&b| b == b'"' || b == b'\'' || b == b' ')
-                .take_while(|&b| !b" \"';/>\t\n\r".contains(&b))
-                .collect();
-            if !v.is_empty() {
-                return String::from_utf8(v).ok();
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let tag_start = i + 1;
+        let is_meta = b.len() >= tag_start + 5
+            && b[tag_start..tag_start + 4].eq_ignore_ascii_case(b"meta")
+            && (b[tag_start + 4].is_ascii_whitespace() || b[tag_start + 4] == b'/');
+        let is_tag = b.get(tag_start).is_some_and(|c| c.is_ascii_alphabetic())
+            || (b.get(tag_start) == Some(&b'/')
+                && b.get(tag_start + 1)
+                    .is_some_and(|c| c.is_ascii_alphabetic()));
+        if !is_tag {
+            // <!...>, <?...> and the like run to the next '>'.
+            i = find(&b[i..], b">").map_or(b.len(), |e| i + e + 1);
+            continue;
+        }
+        // The tag's name, then its attributes.
+        let mut j = tag_start;
+        while j < b.len() && !b[j].is_ascii_whitespace() && b[j] != b'>' {
+            j += 1;
+        }
+        let mut pragma = false;
+        let mut need_pragma: Option<bool> = None;
+        let mut charset: Option<&'static Encoding> = None;
+        while let Some((name, value, next)) = attribute(b, j) {
+            j = next;
+            if !is_meta {
+                continue;
+            }
+            match name.as_str() {
+                "http-equiv" => pragma = value.eq_ignore_ascii_case(b"content-type"),
+                "content" if charset.is_none() => {
+                    if let Some(label) = charset_in_content(&value) {
+                        charset = declared_in_text(&label);
+                        need_pragma = Some(true);
+                    }
+                }
+                "charset" => {
+                    charset = declared_in_text(value.trim_ascii());
+                    need_pragma = Some(false);
+                }
+                _ => {}
             }
         }
-        at = end;
+        if is_meta
+            && charset.is_some()
+            && (need_pragma == Some(false) || (need_pragma == Some(true) && pragma))
+        {
+            return charset;
+        }
+        i = j.max(i + 1);
     }
     None
 }
 
-/// The charset a sheet names in a leading `@charset "...";`.
-fn css_charset(body: &[u8]) -> Option<String> {
+/// The attribute at or after byte `i` of a tag in `b`: its name in lower
+/// case, its value, and where reading goes on; None at the tag's end.
+fn attribute(b: &[u8], mut i: usize) -> Option<(String, Vec<u8>, usize)> {
+    while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b'/') {
+        i += 1;
+    }
+    if i >= b.len() || b[i] == b'>' {
+        return None;
+    }
+    let mut name = Vec::new();
+    while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'=' && b[i] != b'>' && b[i] != b'/'
+    {
+        name.push(b[i].to_ascii_lowercase());
+        i += 1;
+    }
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut value = Vec::new();
+    if i < b.len() && b[i] == b'=' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < b.len() && (b[i] == b'"' || b[i] == b'\'') {
+            let q = b[i];
+            i += 1;
+            while i < b.len() && b[i] != q {
+                value.push(b[i]);
+                i += 1;
+            }
+            i += 1;
+        } else {
+            while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'>' {
+                value.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    Some((String::from_utf8_lossy(&name).into_owned(), value, i.max(1)))
+}
+
+/// The charset in a `<meta content>` such as "text/html; charset=x" (HTML
+/// §2.6.3).
+fn charset_in_content(v: &[u8]) -> Option<Vec<u8>> {
+    let lower = v.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(k) = find(&lower[from..], b"charset") {
+        let mut i = from + k + 7;
+        while i < v.len() && v[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= v.len() || v[i] != b'=' {
+            from = from + k + 7;
+            continue;
+        }
+        i += 1;
+        while i < v.len() && v[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let (start, end) = if i < v.len() && (v[i] == b'"' || v[i] == b'\'') {
+            let q = v[i];
+            let e = v[i + 1..].iter().position(|&c| c == q)?;
+            (i + 1, i + 1 + e)
+        } else {
+            let e = v[i..]
+                .iter()
+                .position(|&c| c == b';' || c.is_ascii_whitespace())
+                .unwrap_or(v.len() - i);
+            (i, i + e)
+        };
+        return if end > start {
+            Some(v[start..end].to_vec())
+        } else {
+            None
+        };
+    }
+    None
+}
+
+/// The charset a sheet names in a leading `@charset "...";` (CSS Syntax 3
+/// §3.2).
+fn css_charset(body: &[u8]) -> Option<&'static Encoding> {
     let rest = body.strip_prefix(b"@charset \"")?;
     let end = find(rest, b"\";")?;
-    String::from_utf8(rest[..end].to_vec()).ok()
+    declared_in_text(&rest[..end])
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1008,5 +1226,484 @@ mod tests {
             assert_eq!((status, error), (200, 0));
         }
         assert_eq!(tp_tab_drop(tab), 0);
+    }
+
+    // ------------------------------------------------------ redirects, ids and charsets
+
+    fn route2(path: &str) -> (Vec<u8>, u64) {
+        match path {
+            "/tofile" => (
+                reply("302 Found", "Location: file:///etc/hosts\r\n", b""),
+                0,
+            ),
+            "/todata" => (
+                reply(
+                    "302 Found",
+                    "Location: data:text/css,p%7Bcolor:red%7D\r\n",
+                    b"",
+                ),
+                0,
+            ),
+            "/gzip" => (
+                reply(
+                    "200 OK",
+                    "Content-Type: text/html\r\nContent-Encoding: gzip\r\n",
+                    include_bytes!(
+                        "/private/tmp/claude-501/-Users-v-Work-Kingpin/4a90dd99-fce4-4188-ab82-22545495676e/scratchpad/gz/body.gz"
+                    ),
+                ),
+                0,
+            ),
+            // UTF-16LE with a BOM and one unpaired surrogate (D800).
+            "/utf16" => (
+                reply(
+                    "200 OK",
+                    "Content-Type: text/html\r\n",
+                    b"\xFF\xFEa\x00\x00\xD8b\x00",
+                ),
+                0,
+            ),
+            "/slowA" => (reply("200 OK", "Content-Type: text/css\r\n", b"AAAA"), 1500),
+            "/slowB" => (reply("200 OK", "Content-Type: text/css\r\n", b"BBBB"), 4000),
+            other => route(other),
+        }
+    }
+
+    #[test]
+    fn a_redirect_to_another_scheme_is_not_followed() {
+        let port = serve(route2);
+        let tab = 9201;
+        assert_eq!(tp_tab_open(tab), 0);
+        let base = format!("http://127.0.0.1:{port}");
+        for p in ["/tofile", "/todata"] {
+            assert!(
+                open(
+                    tab,
+                    NET_STYLE,
+                    &format!("{base}{p}"),
+                    &format!("{base}/page")
+                ) > 0
+            );
+            let (head, body, url, _, _) = take(tab);
+            // The policy says http and https only: no body from another scheme.
+            assert!(
+                !url.starts_with("file:") && !url.starts_with("data:"),
+                "{p} followed to {url}"
+            );
+            let error = head.error;
+            assert!(error != 0 && body.is_empty(), "{p}: {error}");
+        }
+        assert_eq!(tp_tab_drop(tab), 0);
+    }
+
+    /// An https page's sheet that redirects to http: the policy is checked on
+    /// the first URL only. Live: `cargo test --release -- --ignored mixed_content`.
+    #[test]
+    #[ignore]
+    fn mixed_content_through_a_redirect_is_blocked() {
+        let tab = 9202;
+        assert_eq!(tp_tab_open(tab), 0);
+        let req = open(
+            tab,
+            NET_STYLE,
+            "https://httpbin.org/redirect-to?url=http://example.com/",
+            "https://a.org/",
+        );
+        assert!(req > 0);
+        let (head, _, url, ..) = take(tab);
+        let error = head.error;
+        assert_eq!(tp_tab_drop(tab), 0);
+        assert!(
+            !(url.starts_with("http:") && error == 0),
+            "an https page loaded an http sheet through a redirect: {url}"
+        );
+    }
+
+    #[test]
+    fn progress_with_a_gzipped_body() {
+        let port = serve(route2);
+        let tab = 9203;
+        assert_eq!(tp_tab_open(tab), 0);
+        open(
+            tab,
+            NET_DOCUMENT,
+            &format!("http://127.0.0.1:{port}/gzip"),
+            "",
+        );
+        let (head, body, ..) = take(tab);
+        let expected = head.expected;
+        assert_eq!(tp_tab_drop(tab), 0);
+        assert!(
+            expected < 0 || expected >= body.len() as i64,
+            "progress would read {} of {expected}",
+            body.len()
+        );
+    }
+
+    #[test]
+    fn a_lone_surrogate_becomes_a_replacement_character() {
+        // Straight through the decoder first.
+        let got = to_utf8(b"\xFF\xFEa\x00\x00\xD8b\x00".to_vec(), None, NET_DOCUMENT);
+        let odd = to_utf8(b"\xFF\xFEa\x00b".to_vec(), None, NET_DOCUMENT);
+        assert_eq!(got, "a\u{FFFD}b".as_bytes(), "lone surrogate");
+        assert_eq!(odd, "a\u{FFFD}".as_bytes(), "odd length");
+    }
+
+    #[test]
+    fn a_request_cancelled_after_it_ended_never_answers() {
+        let port = serve(route2);
+        let tab = 9204;
+        assert_eq!(tp_tab_open(tab), 0);
+        let req = open(
+            tab,
+            NET_STYLE,
+            &format!("http://127.0.0.1:{port}/sheet"),
+            "",
+        );
+        // Ends; its MSG_NET is posted. The worker then gives up on it (a
+        // wave's timeout landing at the same moment).
+        let mut head = NetHead::default();
+        let start = std::time::Instant::now();
+        while tp_net_head(req, &mut head) != 1 {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(tp_net_cancel(req), 0);
+        let mut m = TabMsg::default();
+        let got = tp_tab_next(tab, 500, &mut m);
+        let (kind, a) = (m.kind, m.a);
+        assert_eq!(tp_tab_drop(tab), 0);
+        assert_eq!(
+            got, 0,
+            "cancelled request {req} still answered: kind {kind} a {a}"
+        );
+    }
+
+    #[test]
+    fn wrapped_ids_pass_over_live_requests() {
+        let port = serve(route2);
+        let tab = 9205;
+        assert_eq!(tp_tab_open(tab), 0);
+        let base = format!("http://127.0.0.1:{port}");
+        let a = open(tab, NET_STYLE, &format!("{base}/slowA"), "");
+        // 2^24 requests later the counter comes round to `a` again, while
+        // `a` still runs.
+        net().last = a - 1;
+        let b = open(tab, NET_STYLE, &format!("{base}/slowB"), "");
+        let (head, body, url, ..) = take(tab);
+        let req = head.req;
+        assert_eq!(tp_tab_drop(tab), 0);
+        assert!(
+            a != b,
+            "B got A's id {a}; the first answer for it was {url} {:?} (req {req})",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    #[test]
+    fn charset_labels_as_whatwg_reads_them() {
+        let doc = |bytes: &[u8], cs: Option<&str>| {
+            String::from_utf8(to_utf8(bytes.to_vec(), cs, NET_DOCUMENT)).unwrap()
+        };
+        let mut bad = Vec::new();
+        let mut check = |what: &str, got: String, want: &str| {
+            if !got.ends_with(want) {
+                bad.push(what.to_string());
+            }
+        };
+        // WHATWG: gb2312 is a label of GBK; 0x81 0x40 is GBK-only.
+        check(
+            "gb2312+GBK",
+            doc(b"\xc4\xe3\xba\xc3\x81\x40", Some("gb2312")),
+            "你好丂",
+        );
+        // WHATWG: shift_jis is windows-31J; 0x87 0x40 is NEC's circled 1.
+        check(
+            "shift_jis+NEC",
+            doc(b"\x82\xa0\x87\x40", Some("shift_jis")),
+            "あ①",
+        );
+        // WHATWG: euc-kr is windows-949; 0x8C 0x63 is UHC-only.
+        check(
+            "euc-kr+UHC",
+            doc(b"\xc7\xd1\x8c\x63", Some("euc-kr")),
+            "한똠",
+        );
+        check(
+            "ks_c_5601-1987",
+            doc(b"\xc7\xd1", Some("ks_c_5601-1987")),
+            "한",
+        );
+        // WHATWG: iso_8859-1 and iso88591 are windows-1252 labels too.
+        check("iso_8859-1", doc(b"\x93q\x94", Some("iso_8859-1")), "“q”");
+        check("iso88591", doc(b"\x93q\x94", Some("iso88591")), "“q”");
+        // WHATWG: iso-8859-9 is windows-1254; tis-620 windows-874.
+        check("iso-8859-9", doc(b"\x93", Some("iso-8859-9")), "“");
+        check("tis-620", doc(b"\x93", Some("tis-620")), "“");
+        // WHATWG prescan: a meta naming UTF-16 means UTF-8.
+        check(
+            "meta utf-16",
+            doc("<meta charset=\"utf-16\"><p>héllo".as_bytes(), None),
+            "héllo",
+        );
+        // WHATWG prescan: comments are skipped.
+        check(
+            "meta in comment",
+            doc("<!-- <meta charset=\"koi8-r\"> --><p>café".as_bytes(), None),
+            "café",
+        );
+        // WHATWG prescan: spaces around '=' are allowed.
+        check(
+            "meta charset = x",
+            doc(b"<meta charset = \"windows-1251\">\xcf\xf0\xe8", None),
+            "При",
+        );
+        // A charset in another meta's content, not http-equiv: ignored.
+        check(
+            "meta name content",
+            doc(
+                "<meta name=\"description\" content=\"About charset=koi8-r\"><p>café".as_bytes(),
+                None,
+            ),
+            "café",
+        );
+        assert!(bad.is_empty(), "decoded unlike WHATWG: {bad:?}");
+    }
+}
+
+#[cfg(test)]
+mod redirects_and_urls {
+    use super::*;
+    use crate::tabs::{MSG_NET, TabMsg, tp_tab_drop, tp_tab_next, tp_tab_open};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    fn open(tab: i32, kind: i32, url: &str, from: &str) -> i32 {
+        let mut url = url.as_bytes().to_vec();
+        let mut from = from.as_bytes().to_vec();
+        let s = |v: &mut Vec<u8>| GSlice {
+            data: if v.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                v.as_mut_ptr()
+            },
+            len: v.len() as i64,
+        };
+        tp_net_open(tab, PROFILE_SANDBOX, kind, s(&mut url), s(&mut from), 0)
+    }
+
+    fn wait(tab: i32) -> (i32, String) {
+        let mut m = TabMsg::default();
+        assert_eq!(tp_tab_next(tab, 10_000, &mut m), 1);
+        let (kind, a) = (m.kind, m.a);
+        assert_eq!(kind, MSG_NET);
+        let req = a as i32;
+        let mut head = NetHead::default();
+        assert_eq!(tp_net_head(req, &mut head), 1);
+        let n = net();
+        let r = n.reqs.get(&req).unwrap();
+        (r.status, String::from_utf8_lossy(&r.url).into_owned())
+    }
+
+    #[test]
+    fn a_page_keeps_the_cookies_its_redirects_set() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.split(' ').nth(1).unwrap_or("/").to_string();
+                let mut cookie = String::new();
+                let mut host = String::new();
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                        break;
+                    }
+                    let l = h.to_ascii_lowercase();
+                    if l.starts_with("cookie:") {
+                        cookie = h.trim().to_string();
+                    }
+                    if l.starts_with("host:") {
+                        host = h.trim().to_string();
+                    }
+                }
+                log.lock().unwrap().push((format!("{host} {path}"), cookie));
+                let resp = match path.as_str() {
+                    // On 127.0.0.1: sends the page on to localhost.
+                    "/go" => format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                    // On localhost: the site's own session cookie.
+                    "/login" => "HTTP/1.1 200 OK\r\nSet-Cookie: sid=1; Path=/\r\nContent-Type: text/html\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string(),
+                    _ => "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string(),
+                };
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let tab = 9301;
+        assert_eq!(tp_tab_open(tab), 0);
+        // A document through a cross-site redirect (a link shortener, a
+        // sign-in), then the site's next page.
+        open(
+            tab,
+            NET_DOCUMENT,
+            &format!("http://127.0.0.1:{port}/go"),
+            "",
+        );
+        wait(tab);
+        open(
+            tab,
+            NET_DOCUMENT,
+            &format!("http://localhost:{port}/next"),
+            "",
+        );
+        wait(tab);
+        assert_eq!(tp_tab_drop(tab), 0);
+        let seen = seen.lock().unwrap().clone();
+        let next = seen.iter().find(|(p, _)| p.ends_with("/next")).unwrap();
+        assert!(
+            !next.1.is_empty(),
+            "the redirect target's cookie was dropped: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn nsurl_keeps_what_rfc3986_hands_it() {
+        for s in [
+            "https://a.org/x?q=a|b",
+            "https://a.org/back/slash?q=\\",
+            "https://a.org/a^b{c}`d",
+            "https://a.org/%zz?x=%",
+            "https://a.org/p#frag|x",
+            "https://a.org/wiki/Ü|x",
+            "https://a.org/css?family=Roboto|Open+Sans&t=%E2%9C%93",
+            "https://a.org/caf%C3%A9?d=50%",
+            "https://a.org/a b^c.css",
+            "https://a.org/q?a=[1]&b=%20",
+        ] {
+            let ser = rfc3986(::url::Url::parse(s).unwrap().as_str());
+            let ns = NSURL::URLWithString(&NSString::from_str(&ser))
+                .and_then(|u| u.absoluteString())
+                .map(|u| u.to_string());
+            assert_eq!(ns.as_deref(), Some(ser.as_str()), "{s}");
+        }
+    }
+
+    #[test]
+    fn the_server_gets_the_url_crates_serialization() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let paths: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = paths.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                        break;
+                    }
+                }
+                log.lock()
+                    .unwrap()
+                    .push(line.split(' ').nth(1).unwrap_or("").to_string());
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        let tab = 9302;
+        assert_eq!(tp_tab_open(tab), 0);
+        // What tp_url_resolve hands the worker for href="q?filter[tag]=a%20b".
+        let url = crate::url::resolve(&format!("http://127.0.0.1:{port}/"), "q?filter[tag]=a%20b")
+            .unwrap();
+        assert!(open(tab, NET_STYLE, &url, "") > 0);
+        wait(tab);
+        assert_eq!(tp_tab_drop(tab), 0);
+        let got = paths.lock().unwrap().clone();
+        assert!(
+            !got[0].contains("%2520"),
+            "a%20b reached the server as {}",
+            got[0]
+        );
+    }
+}
+
+#[cfg(test)]
+mod surrogates {
+    use super::*;
+    #[test]
+    fn other_routes_to_a_lone_surrogate() {
+        // UTF-7 is no label WHATWG knows: the bytes are read as UTF-8.
+        let utf7 = to_utf8(b"a+2AA-b".to_vec(), Some("utf-7"), NET_DOCUMENT);
+        assert_eq!(utf7, b"a+2AA-b");
+        // An Arabic page in UTF-8 that mislabels itself UTF-16 in its meta:
+        // a page that says so in itself is UTF-8.
+        let mut arabic = b"<meta charset=\"utf-16\">".to_vec();
+        arabic.extend_from_slice("مرحبا بالعالم".as_bytes());
+        let len = arabic.len();
+        let got = to_utf8(arabic, None, NET_DOCUMENT);
+        assert_eq!(got.len(), len);
+        assert!(
+            std::str::from_utf8(&got)
+                .unwrap()
+                .ends_with("مرحبا بالعالم")
+        );
+        // So is a sheet: what isn't UTF-8 in it becomes U+FFFD.
+        let sheet = to_utf8(b"@charset \"utf-16le\";\x00\xd8".to_vec(), None, NET_STYLE);
+        assert!(
+            std::str::from_utf8(&sheet)
+                .unwrap()
+                .ends_with("\u{0}\u{FFFD}")
+        );
+    }
+}
+
+#[cfg(test)]
+mod header_labels {
+    use super::*;
+    #[test]
+    fn an_unknown_header_label_falls_through_to_the_meta() {
+        let got = to_utf8(
+            b"<meta charset=windows-1251>\xcf\xf0\xe8".to_vec(),
+            Some("x-nonsense"),
+            NET_DOCUMENT,
+        );
+        assert!(got.ends_with("При".as_bytes()));
+    }
+}
+
+#[cfg(test)]
+mod closing_mailboxes {
+    use crate::tabs::{TabMsg, tp_tab_drop, tp_tab_next, tp_tab_open};
+    use std::time::{Duration, Instant};
+    #[test]
+    fn closing_a_mailbox_wakes_a_worker_waiting_on_it() {
+        let tab = 9401;
+        assert_eq!(tp_tab_open(tab), 0);
+        let worker = std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut m = TabMsg::default();
+            let got = tp_tab_next(tab, 3000, &mut m);
+            (got, start.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(tp_tab_drop(tab), 0);
+        let (got, took) = worker.join().unwrap();
+        assert!(
+            took < Duration::from_millis(1000),
+            "slept {took:?} past the close"
+        );
+        // Woken, it finds the mailbox gone: an error, which ends a worker.
+        assert!(got < 0, "{got}");
     }
 }
