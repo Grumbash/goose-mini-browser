@@ -26,6 +26,7 @@ use objc2_foundation::{
     NSURLSessionDelegate, NSURLSessionTask, NSURLSessionTaskDelegate,
 };
 
+use crate::url::scheme_of;
 use crate::{ERR_ARGUMENT, GSlice, guarded, tabs};
 
 // What a request is for; the Goose side mirrors these numbers.
@@ -202,20 +203,6 @@ pub extern "C" fn tp_net_start() -> i32 {
         }
         Ok(0)
     })
-}
-
-/// The scheme of `url`, lower case, or "" with none.
-fn scheme_of(url: &str) -> String {
-    match url.split_once(':') {
-        Some((s, _))
-            if !s.is_empty()
-                && s.bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c)) =>
-        {
-            s.to_ascii_lowercase()
-        }
-        _ => String::new(),
-    }
 }
 
 /// Whether a page at `from` (empty for a load we asked for ourselves) may

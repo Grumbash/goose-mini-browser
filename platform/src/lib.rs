@@ -18,6 +18,7 @@ mod memory;
 pub mod net;
 pub mod tabs;
 pub mod text;
+pub mod url;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;

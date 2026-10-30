@@ -14,6 +14,7 @@ import engine.layout;
 import app from "../app";
 import app.tab;
 import app.ui;
+import app.net;
 
 var failures = 0;
 
@@ -124,7 +125,33 @@ fn test_document() {
     yes("an empty title is the file's name", find(narrow[..], "<b>page.html</b><span class=\"host\">") >= 0);
 }
 
+fn test_urls() {
+    var out: u8[>..] = [];
+    yes("a relative href resolves against the page", resolve_url("https://a.org/b/c?q#f", "../d", out));
+    check("to an absolute URL", out[..], "https://a.org/d");
+    var none: u8[>..] = [];
+    yes("one that can't be doesn't", !resolve_url("https://a.org/", "https://exa mple.com/", none));
+    check("and adds nothing", str(none.len), "0");
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html("<base href='/docs/'><a href=x>x</a>", d);
+    var base: u8[>..] = [];
+    doc_base(d, "https://a.org/one/page.html", base);
+    check("<base href> moves where a page's URLs resolve", base[..], "https://a.org/docs/");
+    var plain_nodes: Node[>..] = [];
+    var plain_attrs: Attr[>..] = [];
+    var plain_bytes: u8[>..] = [];
+    let plain = Doc { nodes: plain_nodes, attrs: plain_attrs, bytes: plain_bytes };
+    parse_html("<p>x", plain);
+    var page: u8[>..] = [];
+    doc_base(plain, "https://a.org/one/page.html", page);
+    check("without one, they resolve against the page's URL", page[..], "https://a.org/one/page.html");
+}
+
 fn main() {
+    test_urls();
     test_one_line();
     test_elements();
     test_document();

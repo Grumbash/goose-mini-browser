@@ -30,7 +30,22 @@ fn tree_of(src: const u8[:]) -> u8[>..] {
     return out;
 }
 
+fn base_of(src: const u8[:]) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    let href, has = base_href(d);
+    var out: u8[>..] = [];
+    if has { out.append(href); } else { out.append("none"); }
+    return out;
+}
+
 fn test_html() {
+    check("the first <base> with an href is the page's base",
+          base_of("<base target=_top><base href='/docs/'><base href='/other/'><p>x"), "/docs/");
+    check("a page with no <base href> has none", base_of("<base target=x><p>x"), "none");
     check("implied structure and an unclosed p",
           tree_of("<title>T</title><p>One<p>Two &amp; <b>three</b>"),
           "#document\n  html\n    head\n      title\n        \"T\"\n    body\n      p\n        \"One\"\n      p\n        \"Two & \"\n        b\n          \"three\"\n");
