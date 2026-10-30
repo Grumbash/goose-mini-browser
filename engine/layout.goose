@@ -433,7 +433,7 @@ fn layout_page(L: Layout, width: f32, height: f32) -> f32 {
         guard L.d.nodes[n].kind == NODE_ELEMENT && s.display != K_NONE else { continue; }
         if s.position != K_STATIC { positioned = true; }
         if s.position == K_RELATIVE { relative = true; }
-        if s.clips != 0 && s.display != K_INLINE { clips = true; }
+        if s.clips != 0 && is_box(s) { clips = true; }
         if transforms(L, n as i32) { transformed = true; }
     }
     if positioned {
@@ -489,34 +489,84 @@ fn is_atomic(L: Layout, n: i32) -> bool {
     return d == K_INLINE_BLOCK || d == K_INLINE_FLEX || (d == K_INLINE && L.styles[n].svg == 1);
 }
 
-// An <svg>'s content box, sized as a replaced element (CSS 2.2 §10.3.2,
-// §10.6.2): its width and height from CSS, its attributes among them; one
-// that is auto from the other through its viewBox's ratio; both auto, as
-// wide as `avail` (less its margins, borders and padding) with a viewBox,
-// else 300 × 150.
-fn svg_size(L: Layout, n: i32, avail: f32) -> f32, f32 {
-    let s = L.styles[n];
+// An <svg>'s content box, w × h, sized from style s as a replaced element
+// whose ratio is its viewBox's (CSS 2.2 §10.3.2, §10.4, §10.6.2): its width
+// and height, its attributes among them; one that is auto from the other
+// through the ratio, else 300 or 150; both auto, as wide as `avail` less its
+// margins, borders and padding, or, when `avail` is -1 (its own size, for
+// shrink-to-fit), fitted inside 300 × 150; 300 × 150 without a ratio. Then
+// within its minimum and maximum width and height, at the same ratio when
+// both were auto.
+fn svg_size(L: Layout, n: i32, s: Style, avail: f32) -> f32, f32 {
     let hz = s.bl + s.pl + s.pr + s.br;
     let vt = s.bt + s.pt + s.pb + s.bb;
-    let inside_w: f32 = if s.border_box != 0 { hz } else { 0.0 };
-    let inside_h: f32 = if s.border_box != 0 { vt } else { 0.0 };
+    let in_w: f32 = if s.border_box != 0 { hz } else { 0.0 };
+    let in_h: f32 = if s.border_box != 0 { vt } else { 0.0 };
     var w: f32 = -1.0;
-    if s.width >= 0.0 { w = max(s.width - inside_w, 0.0); }
-    else if s.width_pct >= 0.0 && avail >= 0.0 { w = max(avail * s.width_pct / 100.0 - inside_w, 0.0); }
+    if s.width >= 0.0 { w = max(s.width - in_w, 0.0); }
+    else if s.width_pct >= 0.0 && avail >= 0.0 { w = max(avail * s.width_pct / 100.0 - in_w, 0.0); }
     var h: f32 = -1.0;
-    if s.height >= 0.0 { h = max(s.height - inside_h, 0.0); }
+    if s.height >= 0.0 { h = max(s.height - in_h, 0.0); }
+    var lo_w = max(s.min_width - in_w, 0.0);
+    if s.min_width_pct >= 0.0 { lo_w = if avail >= 0.0 { max(avail * s.min_width_pct / 100.0 - in_w, 0.0) } else { 0.0 }; }
+    var hi_w: f32 = NO_LIMIT;
+    if s.max_width >= 0.0 { hi_w = max(s.max_width - in_w, 0.0); }
+    else if s.max_width_pct >= 0.0 && avail >= 0.0 { hi_w = max(avail * s.max_width_pct / 100.0 - in_w, 0.0); }
+    let lo_h = max(s.min_height - in_h, 0.0);
+    var hi_h: f32 = NO_LIMIT;
+    if s.max_height >= 0.0 { hi_h = max(s.max_height - in_h, 0.0); }
+    // A minimum beats a maximum.
+    hi_w = max(hi_w, lo_w);
+    hi_h = max(hi_h, lo_h);
     let ratio = view_ratio(L.d, n);
-    if w < 0.0 && h >= 0.0 { w = if ratio > 0.0 { h / ratio } else { 300.0 }; }
-    else if h < 0.0 && w >= 0.0 { h = if ratio > 0.0 { w * ratio } else { 150.0 }; }
-    else if w < 0.0 {
-        if ratio > 0.0 && avail > 0.0 {
-            w = max(avail - s.ml - s.mr - hz, 0.0);
-            h = w * ratio;
-        } else {
-            w = 300.0;
-            h = 150.0;
-        }
+    if w >= 0.0 && h >= 0.0 { return clamp(w, lo_w, hi_w), clamp(h, lo_h, hi_h); }
+    if w >= 0.0 {
+        let cw = clamp(w, lo_w, hi_w);
+        return cw, clamp(if ratio > 0.0 { cw * ratio } else { 150.0 }, lo_h, hi_h);
     }
+    if h >= 0.0 {
+        let ch = clamp(h, lo_h, hi_h);
+        return clamp(if ratio > 0.0 { ch / ratio } else { 300.0 }, lo_w, hi_w), ch;
+    }
+    guard ratio > 0.0 else { return clamp(300.0, lo_w, hi_w), clamp(150.0, lo_h, hi_h); }
+    var tw: f32 = 150.0 / ratio;
+    var th: f32 = 150.0;
+    if avail >= 0.0 {
+        tw = max(avail - s.ml - s.mr - hz, 0.0);
+        th = tw * ratio;
+    } else if ratio <= 0.5 {
+        tw = 300.0;
+        th = 300.0 * ratio;
+    }
+    return within(tw, th, lo_w, hi_w, lo_h, hi_h);
+}
+
+// No maximum.
+let NO_LIMIT: f32 = 1.0e30;
+
+// A replaced element's width and height, w × h with both auto, within their
+// limits, keeping their ratio where the limits let it (CSS 2.2 §10.4's
+// table).
+fn within(w: f32, h: f32, lo_w: f32, hi_w: f32, lo_h: f32, hi_h: f32) -> f32, f32 {
+    guard w > 0.0 && h > 0.0 else { return clamp(w, lo_w, hi_w), clamp(h, lo_h, hi_h); }
+    let over_w = w > hi_w;
+    let under_w = w < lo_w;
+    let over_h = h > hi_h;
+    let under_h = h < lo_h;
+    if over_w && over_h {
+        if hi_w / w <= hi_h / h { return hi_w, max(lo_h, hi_w * h / w); }
+        return max(lo_w, hi_h * w / h), hi_h;
+    }
+    if under_w && under_h {
+        if lo_w / w <= lo_h / h { return min(hi_w, lo_h * w / h), lo_h; }
+        return lo_w, min(hi_h, lo_w * h / w);
+    }
+    if under_w && over_h { return lo_w, hi_h; }
+    if over_w && under_h { return hi_w, lo_h; }
+    if over_w { return hi_w, max(hi_w * h / w, lo_h); }
+    if under_w { return lo_w, min(lo_w * h / w, hi_h); }
+    if over_h { return max(hi_h * w / h, lo_w), hi_h; }
+    if under_h { return min(lo_h * w / h, hi_w), lo_h; }
     return w, h;
 }
 
@@ -635,7 +685,8 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
     let svg = s.svg == 1;
     var svg_h: f32 = 0.0;
     if svg {
-        let sw, sh = svg_size(L, n, avail);
+        // Its size, limits and percentages applied, is its box's.
+        let sw, sh = svg_size(L, n, s, avail);
         s.width = sw + (if s.border_box != 0 { hz } else { 0.0 });
         s.width_pct = -1.0;
         svg_h = sh;
@@ -1374,15 +1425,21 @@ recursive fn place_atomic(L: Layout, line: Line&, n: i32) {
     let hz = s.bl + s.pl + s.pr + s.br;
     let inside: f32 = if s.border_box != 0 { hz } else { 0.0 };
     var w: f32 = 0.0;
-    if s.width >= 0.0 { w = s.width - inside; }
-    else if s.width_pct >= 0.0 { w = line.width * s.width_pct / 100.0 - inside; }
-    else {
-        let least, most = content_widths(L, n);
-        w = min(max(least, line.width - s.ml - s.mr), most) - hz;
+    if s.svg == 1 {
+        // An <svg> on a line is as wide as a block one would be in its place.
+        let sw, sh = svg_size(L, n, s, line.width);
+        w = sw;
+    } else {
+        if s.width >= 0.0 { w = s.width - inside; }
+        else if s.width_pct >= 0.0 { w = line.width * s.width_pct / 100.0 - inside; }
+        else {
+            let least, most = content_widths(L, n);
+            w = min(max(least, line.width - s.ml - s.mr), most) - hz;
+        }
+        if s.max_width >= 0.0 { w = min(w, s.max_width - inside); }
+        else if s.max_width_pct >= 0.0 { w = min(w, line.width * s.max_width_pct / 100.0 - inside); }
+        w = max(max(w, (if s.min_width_pct >= 0.0 { line.width * s.min_width_pct / 100.0 } else { s.min_width }) - inside), 0.0);
     }
-    if s.max_width >= 0.0 { w = min(w, s.max_width - inside); }
-    else if s.max_width_pct >= 0.0 { w = min(w, line.width * s.max_width_pct / 100.0 - inside); }
-    w = max(max(w, (if s.min_width_pct >= 0.0 { line.width * s.min_width_pct / 100.0 } else { s.min_width }) - inside), 0.0);
     let outer = s.ml + w + hz + s.mr;
     let wraps = s.ws == K_NORMAL || s.ws == K_PRE_WRAP;
     if wraps && line.content && line.x + outer > line.width + 0.01 { close_line(L, line, false); }
@@ -1659,8 +1716,12 @@ fn clip_parent(L: Layout, e: i32) -> i32 {
 // Whether element n cuts what is in it: its overflow isn't visible, and it
 // holds blocks (overflow doesn't apply to inline boxes).
 fn clips_content(L: Layout, n: i32) -> bool {
-    return L.styles[n].clips != 0 && L.styles[n].display != K_INLINE;
+    return L.styles[n].clips != 0 && is_box(L.styles[n]);
 }
+
+// Whether a styled element is a box that overflow and transforms apply to:
+// not an inline box, though an <svg> on a line is one, being replaced.
+fn is_box(s: Style) -> bool { return s.display != K_INLINE || s.svg == 1; }
 
 // Moves each relatively positioned element, and everything in it, by its
 // offsets (CSS 2.2 §9.4.3): the items they paint and their boxes.
@@ -1729,7 +1790,7 @@ recursive fn content_widths(L: Layout, n: i32) -> f32, f32 {
     let hz = s.bl + s.pl + s.pr + s.br;
     let inside: f32 = if s.border_box != 0 { 0.0 } else { hz };
     if s.svg == 1 {
-        let sw, sh = svg_size(L, n, -1.0);
+        let sw, sh = svg_size(L, n, s, -1.0);
         return sw + hz, sw + hz;
     }
     if s.width >= 0.0 {
@@ -1751,6 +1812,11 @@ recursive fn content_widths(L: Layout, n: i32) -> f32, f32 {
 recursive fn inner_widths(L: Layout, n: i32) -> f32, f32 {
     let s = L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;
+    if s.svg == 1 {
+        // What is in an <svg> is drawn to its size.
+        let sw, sh = svg_size(L, n, s, -1.0);
+        return sw + hz, sw + hz;
+    }
     var p = Widths { min: 0.0, max: 0.0, line: 0.0, word: 0.0, space: 0.0, start: true };
     if is_flex(L, n) {
         flex_widths(L, n, p);
@@ -1904,7 +1970,7 @@ fn z_index(L: Layout, e: i32) -> i32 {
 // Whether a styled element starts a stacking context of its own: a
 // positioned one with a z-index, a fixed one, and a transformed one.
 fn stacks(s: Style) -> bool {
-    return s.position == K_FIXED || (s.position != K_STATIC && s.z_auto == 0) || (s.xf_count > 0 && s.display != K_INLINE);
+    return s.position == K_FIXED || (s.position != K_STATIC && s.z_auto == 0) || (s.xf_count > 0 && is_box(s));
 }
 
 fn emit_own(P: Paint, n: i32) {
@@ -2527,7 +2593,8 @@ recursive fn size_item(L: Layout, i: i64, n: i32, row: bool, main_size: f32, cro
     if s.basis_kind == 1 { base = s.basis - inside; }
     else if s.basis_kind == 2 && main_size >= 0.0 { base = main_size * s.basis / 100.0 - inside; }
     else if s.basis_kind == K_AUTO { base = size; }
-    let auto_min = (if row { s.min_w_auto } else { s.min_h_auto }) != 0 && s.clips == 0;
+    // overflow doesn't make a replaced element a scroll container.
+    let auto_min = (if row { s.min_w_auto } else { s.min_h_auto }) != 0 && (s.clips == 0 || s.svg == 1);
     var least: f32 = 0.0;
     var most: f32 = 0.0;
     if base < 0.0 || auto_min {
@@ -2783,7 +2850,7 @@ fn is_axis_aligned(m: Mat) -> bool { return abs(m.b) < 0.000001 && abs(m.c) < 0.
 fn transforms(L: Layout, n: i32) -> bool {
     guard L.d.nodes[n].kind == NODE_ELEMENT else { return false; }
     let s = L.styles[n];
-    return s.xf_count > 0 && s.display != K_INLINE && s.display != K_NONE;
+    return s.xf_count > 0 && is_box(s) && s.display != K_NONE;
 }
 
 // Element n's transform about its origin, in page points: its functions in

@@ -882,6 +882,32 @@ fn test_svg() {
     check("svg sizes", layout_probe(sizes, 400.0, PROBE_GEOMETRY),
           "a x 0.0 y 0.0 w 40.0 h 20.0\nb x 0.0 y 20.0 w 30.0 h 20.0\nc x 0.0 y 40.0 w 300.0 h 150.0\nd x 0.0 y 190.0 w 400.0 h 100.0\ne x 0.0 y 290.0 w 20.0 h 10.0\n");
 
+    // Sized as a replaced element everywhere: in a flex row from its height
+    // and ratio, and no narrower than that; under a max-width at its ratio;
+    // both auto, within its limits at its ratio; with only a viewBox, as wide
+    // as its line.
+    let replaced = """
+        <style>body { margin: 0; padding: 0; max-width: none } p { margin: 0 }</style>
+        <nav style="display: flex; align-items: center"><svg id=a viewBox="0 0 120 30" height="24"></svg></nav>
+        <div style="width: 200px"><svg id=b width="400" viewBox="0 0 400 200" style="display: block; max-width: 100%"></svg></div>
+        <svg id=d viewBox="0 0 4 1" style="display: block; max-width: 100px"></svg>
+        <svg id=e viewBox="0 0 2 1" style="display: block; max-height: 50px"></svg>
+        <svg id=h width=10 height=100 style="display: block; max-height: 30px"></svg>
+        <div style="font-size: 0"><div id=k style="display: inline-block"><svg width=400 height=10 style="display: block; max-width: 100px"></svg></div></div>
+        <div style="display: flex; width: 50px"><svg id=m width=80 height=10></svg></div>
+        <p style="width: 200px"><svg id=c viewBox="0 0 2 1"></svg></p>
+        """;
+    check("svg sized as a replaced element", layout_probe(replaced, 400.0, PROBE_GEOMETRY),
+          str("a x 0.0 y 0.0 w 96.0 h 24.0\nb x 0.0 y 24.0 w 200.0 h 100.0\nd x 0.0 y 124.0 w 100.0 h 25.0\n",
+              "e x 0.0 y 149.0 w 100.0 h 50.0\nh x 0.0 y 199.0 w 10.0 h 30.0\nk x 0.0 y 229.0 w 100.0 h 10.0\n",
+              "m x 0.0 y 239.0 w 80.0 h 10.0\nc x 0.0 y 249.0 w 200.0 h 100.0\n")[..]);
+    // On a line it is a box: it clips what is in it, and turns.
+    let inline_box = """
+        <style>body { margin: 0; padding: 0; max-width: none } p { margin: 0; font-size: 10px; line-height: 1 }</style>
+        <p><svg id=f width=20 height=20><circle cx=10 cy=10 r=50 /></svg><svg id=g width=20 height=20 style="transform: rotate(90deg)"><rect width=5 height=5 /></svg></p>
+        """;
+    check("svg on a line clips and turns", layout_probe(inline_box, 400.0, PROBE_XF), "f plain, clip plain\ng 0.00,1.00,-1.00,0.00,40.00,-20.00\n");
+
     // Path data: moves, lines across and down, closes, relative commands and
     // the lines after a move, an error that ends it, curves smooth and
     // quadratic, and arcs, their flags run together too.
