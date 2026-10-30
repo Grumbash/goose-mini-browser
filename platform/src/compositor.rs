@@ -24,7 +24,7 @@ use objc2_metal::{
 use objc2_quartz_core::CAMetalDrawable;
 
 use crate::cg::*;
-use crate::text::{Atlas, PHASES, Text, unit_starts, with_text};
+use crate::text::{Atlas, PHASES, Sheet, Text, unit_starts, with_text};
 use crate::{ERR_ARGUMENT, ERR_METAL, ERR_NO_DEVICE, ERR_NOT_MAIN_THREAD, GSlice, guarded};
 
 // Display item kinds; engine/layout.goose mirrors these numbers.
@@ -106,7 +106,9 @@ pub struct DItem {
 }
 
 /// One quad, in device pixels: solid when `uv[2]` is 0, otherwise the atlas
-/// mask at `uv` (in texels) times `color`, which is premultiplied. A box
+/// mask at `uv` (in texels) times `color`, which is premultiplied: a glyph's,
+/// or with `border[0]` 1 a path's, sampled between texels when `border[1]` is
+/// 1 because it was drawn smaller. A box
 /// (`border[2]` 1) is drawn by distance from its rounded edge: `radii` from
 /// the top left, clockwise, and borders `widths` wide (top, right, bottom,
 /// left) in `border_color`, dashed when `border[1]` is 1, over its fill. Any
@@ -216,7 +218,8 @@ float rounded_rect(float2 p, float2 size, float4 r) {
     return d;
 }
 
-fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[texture(0)]]) {
+fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[texture(0)]],
+                              texture2d<float> paths [[texture(1)]]) {
     // Inside the clip, if there is one, blended over its edge's pixel. A
     // transformed quad's distances shrink or grow on screen: dividing by how
     // fast they change per pixel keeps its edges one pixel soft.
@@ -231,7 +234,9 @@ fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[text
     if (in.textured > 0.5) {
         constexpr sampler nearest(coord::pixel, filter::nearest, address::clamp_to_edge);
         constexpr sampler between(coord::pixel, filter::linear, address::clamp_to_edge);
-        float a = in.smooth > 0.5 ? atlas.sample(between, in.uv).r : atlas.sample(nearest, in.uv).r;
+        bool soft = in.smooth > 0.5 || in.border.y > 0.5;
+        float a = in.border.x > 0.5 ? (soft ? paths.sample(between, in.uv).r : paths.sample(nearest, in.uv).r)
+                                    : (soft ? atlas.sample(between, in.uv).r : atlas.sample(nearest, in.uv).r);
         return in.color * (a * cover);
     }
     if (in.border.z < 0.5) {
@@ -301,14 +306,20 @@ struct Stats {
 struct Layer {
     instances: Vec<Instance>,
     buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    // What it was last set to, to build it again when the atlas starts again.
+    items: Vec<DItem>,
+    text: Vec<u8>,
+    paths: Vec<f32>,
 }
 
 pub struct Compositor {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    atlas: Retained<ProtocolObject<dyn MTLTexture>>,
+    atlas: Retained<ProtocolObject<dyn MTLTexture>>, // the glyphs' sheet
     atlas_rows: u32,
+    path_atlas: Retained<ProtocolObject<dyn MTLTexture>>, // the paths' sheet
+    path_rows: u32,
     layers: [Layer; LAYERS],
     stats: Stats,
     last_frame: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
@@ -341,12 +352,15 @@ impl Compositor {
             .newRenderPipelineStateWithDescriptor_error(&desc)
             .map_err(|_| ERR_METAL)?;
         let atlas = new_atlas_texture(&device, 1024, 1)?;
+        let path_atlas = new_atlas_texture(&device, 1024, 1)?;
         Ok(Compositor {
             device,
             queue,
             pipeline,
             atlas,
             atlas_rows: 1,
+            path_atlas,
+            path_rows: 1,
             layers: Default::default(),
             stats: Stats::default(),
             last_frame: None,
@@ -354,7 +368,10 @@ impl Compositor {
     }
 
     /// Turns a display list into layer `layer`'s instances and uploads them,
-    /// with any glyphs the atlas gained.
+    /// with any masks the atlas gained. When a sheet of the atlas runs out of
+    /// room, or the backing scale changes, the atlas starts again and every
+    /// layer is built again from what it was last set to. A path's mask that
+    /// still doesn't fit is drawn smaller; a glyph draws nothing this time.
     fn set_layer(
         &mut self,
         layer: usize,
@@ -363,86 +380,59 @@ impl Compositor {
         paths: &[f32],
         scale: f64,
     ) -> Result<(), i32> {
-        let mut instances = std::mem::take(&mut self.layers[layer].instances);
-        instances.clear();
-        let mut rescaled = false;
-        with_text(|t| {
-            if t.atlas.scale != scale {
-                // Glyphs drawn for another backing scale are of no use now.
+        let l = &mut self.layers[layer];
+        l.items.clear();
+        l.items.extend_from_slice(items);
+        l.text.clear();
+        l.text.extend_from_slice(text);
+        l.paths.clear();
+        l.paths.extend_from_slice(paths);
+        let all = with_text(|t| {
+            // Masks drawn for another backing scale are of no use now.
+            t.atlas.paths.tight = false;
+            let mut all = t.atlas.scale != scale;
+            if all {
                 t.atlas = Atlas::new(scale);
-                self.atlas_rows = 0;
-                rescaled = true;
+                for l in self.layers.iter_mut() {
+                    build_layer(l, scale, t);
+                }
+            } else {
+                build_layer(&mut self.layers[layer], scale, t);
             }
-            build(items, text, paths, scale, t, &mut instances);
-            self.upload_atlas(&mut t.atlas)
+            if t.atlas.glyphs.full || t.atlas.paths.full {
+                // A sheet ran out of room: it starts again with the masks the
+                // layers draw now.
+                if t.atlas.glyphs.full {
+                    t.atlas.clear_glyphs();
+                }
+                if t.atlas.paths.full {
+                    t.atlas.clear_paths();
+                    t.atlas.paths.tight = true;
+                }
+                all = true;
+                for l in self.layers.iter_mut() {
+                    build_layer(l, scale, t);
+                }
+            }
+            upload_sheet(
+                &self.device,
+                &mut self.atlas,
+                &mut self.atlas_rows,
+                &mut t.atlas.glyphs,
+            )?;
+            upload_sheet(
+                &self.device,
+                &mut self.path_atlas,
+                &mut self.path_rows,
+                &mut t.atlas.paths,
+            )?;
+            Ok::<bool, i32>(all)
         })?;
-        if rescaled {
-            // The other layers' glyphs point into the old atlas: they draw
-            // nothing until they are set again at the new scale.
-            for (i, other) in self.layers.iter_mut().enumerate() {
-                if i != layer {
-                    *other = Layer::default();
-                }
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            if all || i == layer {
+                l.buffer = buffer_of(&self.device, &l.instances)?;
             }
         }
-        self.layers[layer].buffer = if instances.is_empty() {
-            None
-        } else {
-            let bytes = std::mem::size_of_val(instances.as_slice());
-            let ptr = NonNull::new(instances.as_ptr() as *mut std::ffi::c_void).ok_or(ERR_METAL)?;
-            Some(
-                unsafe {
-                    self.device.newBufferWithBytes_length_options(
-                        ptr,
-                        bytes,
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                }
-                .ok_or(ERR_METAL)?,
-            )
-        };
-        self.layers[layer].instances = instances;
-        Ok(())
-    }
-
-    fn upload_atlas(&mut self, atlas: &mut Atlas) -> Result<(), i32> {
-        let rows = if self.atlas_rows != atlas.height {
-            self.atlas = new_atlas_texture(&self.device, atlas.width, atlas.height)?;
-            self.atlas_rows = atlas.height;
-            Some((0, atlas.height))
-        } else {
-            atlas.dirty
-        };
-        atlas.dirty = None;
-        let Some((first, end)) = rows else {
-            return Ok(());
-        };
-        if end <= first {
-            return Ok(());
-        }
-        let region = MTLRegion {
-            origin: MTLOrigin {
-                x: 0,
-                y: first as usize,
-                z: 0,
-            },
-            size: MTLSize {
-                width: atlas.width as usize,
-                height: (end - first) as usize,
-                depth: 1,
-            },
-        };
-        let start = (first * atlas.width) as usize;
-        let ptr = NonNull::new(atlas.pixels[start..].as_ptr() as *mut std::ffi::c_void)
-            .ok_or(ERR_METAL)?;
-        unsafe {
-            self.atlas.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                region,
-                0,
-                ptr,
-                atlas.width as usize,
-            )
-        };
         Ok(())
     }
 
@@ -473,7 +463,10 @@ impl Compositor {
             .renderCommandEncoderWithDescriptor(&pass)
             .ok_or(ERR_METAL)?;
         encoder.setRenderPipelineState(&self.pipeline);
-        unsafe { encoder.setFragmentTexture_atIndex(Some(&self.atlas), 0) };
+        unsafe {
+            encoder.setFragmentTexture_atIndex(Some(&self.atlas), 0);
+            encoder.setFragmentTexture_atIndex(Some(&self.path_atlas), 1);
+        }
         let viewport = [target.width() as f32, target.height() as f32];
         for (i, layer) in self.layers.iter().enumerate() {
             let Some(buffer) = &layer.buffer else {
@@ -588,6 +581,86 @@ impl Compositor {
         unsafe { target.getBytes_bytesPerRow_fromRegion_mipmapLevel(ptr, width * 4, region, 0) };
         Ok(pixels)
     }
+}
+
+/// Builds a layer's instances again from what it was last set to.
+fn build_layer(layer: &mut Layer, scale: f64, t: &mut Text) {
+    let mut instances = std::mem::take(&mut layer.instances);
+    instances.clear();
+    build(
+        &layer.items,
+        &layer.text,
+        &layer.paths,
+        scale,
+        t,
+        &mut instances,
+    );
+    layer.instances = instances;
+}
+
+/// Uploads the rows of `sheet` written since the last upload into `texture`,
+/// all of it into a new texture when the sheet has grown; `rows` is how many
+/// rows the texture has.
+fn upload_sheet(
+    device: &ProtocolObject<dyn MTLDevice>,
+    texture: &mut Retained<ProtocolObject<dyn MTLTexture>>,
+    rows: &mut u32,
+    sheet: &mut Sheet,
+) -> Result<(), i32> {
+    let range = if *rows != sheet.height || texture.width() != sheet.width as usize {
+        *texture = new_atlas_texture(device, sheet.width, sheet.height)?;
+        *rows = sheet.height;
+        Some((0, sheet.height))
+    } else {
+        sheet.dirty
+    };
+    sheet.dirty = None;
+    let Some((first, end)) = range else {
+        return Ok(());
+    };
+    if end <= first {
+        return Ok(());
+    }
+    let region = MTLRegion {
+        origin: MTLOrigin {
+            x: 0,
+            y: first as usize,
+            z: 0,
+        },
+        size: MTLSize {
+            width: sheet.width as usize,
+            height: (end - first) as usize,
+            depth: 1,
+        },
+    };
+    let start = (first * sheet.width) as usize;
+    let ptr =
+        NonNull::new(sheet.pixels[start..].as_ptr() as *mut std::ffi::c_void).ok_or(ERR_METAL)?;
+    unsafe {
+        texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+            region,
+            0,
+            ptr,
+            sheet.width as usize,
+        )
+    };
+    Ok(())
+}
+
+/// A Metal buffer holding `instances`, or None for none.
+fn buffer_of(
+    device: &ProtocolObject<dyn MTLDevice>,
+    instances: &[Instance],
+) -> Result<Option<Retained<ProtocolObject<dyn MTLBuffer>>>, i32> {
+    if instances.is_empty() {
+        return Ok(None);
+    }
+    let bytes = std::mem::size_of_val(instances);
+    let ptr = NonNull::new(instances.as_ptr() as *mut std::ffi::c_void).ok_or(ERR_METAL)?;
+    let buffer = unsafe {
+        device.newBufferWithBytes_length_options(ptr, bytes, MTLResourceOptions::StorageModeShared)
+    };
+    buffer.map(Some).ok_or(ERR_METAL)
 }
 
 fn new_atlas_texture(
@@ -852,19 +925,46 @@ pub fn build(
                 }
             };
             let ((px, phase_x), (py, phase_y)) = (phase(ox), phase(oy));
-            let e = t.atlas.path(data, size, font, phase_x, phase_y);
+            // Unturned, it shows only inside its clips, so its mask needs no
+            // more than that: in device pixels from its corner's pixel.
+            let mut seen: Option<[i32; 4]> = None;
+            if !transformed && cxt[2] == 0.0 {
+                for r in [clip, oclip] {
+                    if r[2] > 0.0 {
+                        let b = [
+                            (r[0] as f64 - px).floor() as i32,
+                            (r[1] as f64 - py).floor() as i32,
+                            (r[0] as f64 + r[2] as f64 - px).ceil() as i32,
+                            (r[1] as f64 + r[3] as f64 - py).ceil() as i32,
+                        ];
+                        seen = Some(match seen {
+                            Some(s) => [
+                                s[0].max(b[0]),
+                                s[1].max(b[1]),
+                                s[2].min(b[2]),
+                                s[3].min(b[3]),
+                            ],
+                            None => b,
+                        });
+                    }
+                }
+            }
+            let e = t.atlas.path(data, size, font, phase_x, phase_y, seen);
             if e.w == 0 {
                 continue;
             }
+            // A mask drawn smaller is stretched back to its size.
+            let div = e.div.max(1) as f32;
             out.push(Instance {
                 rect: [
                     (px + e.left as f64) as f32,
                     (py + e.top as f64) as f32,
-                    e.w as f32,
-                    e.h as f32,
+                    e.w as f32 * div,
+                    e.h as f32 * div,
                 ],
                 uv: [e.x as f32, e.y as f32, e.w as f32, e.h as f32],
                 color,
+                border: [1.0, if e.div > 1 { 1.0 } else { 0.0 }, 0.0, 0.0],
                 ..common
             });
         }
@@ -1585,5 +1685,117 @@ mod tests {
         let first = queue();
         assert_eq!(start_metal(), Ok(0));
         assert_eq!(queue(), first); // the same compositor, not a second setup
+    }
+
+    #[test]
+    fn a_full_path_sheet_starts_again_with_what_the_layers_draw() {
+        if MTLCreateSystemDefaultDevice().is_none() {
+            eprintln!("no Metal device here: the paths' sheet isn't checked");
+            return;
+        }
+        // Twelve squares a little under 1000 points wide, at a pixel a
+        // point: three quarters of the paths' sheet each time.
+        let squares = |side: f32| {
+            let mut items = Vec::new();
+            let mut paths = Vec::new();
+            for k in 0..12 {
+                let s = side + k as f32;
+                items.push(path_item(
+                    0.0,
+                    0.0,
+                    paths.len() as i32,
+                    13,
+                    0xFF00_0000,
+                    0.0,
+                    0,
+                ));
+                paths.extend_from_slice(&[0.0, 0.0, 0.0, 1.0, s, 0.0, 1.0, s, s, 1.0, 0.0, s, 3.0]);
+            }
+            (items, paths)
+        };
+        let (a, pa) = squares(900.0);
+        let (b, pb) = squares(950.0);
+        let tri = [0.0, 0.0, 0.0, 1.0, 9.5, 0.0, 1.0, 0.0, 9.5, 3.0];
+        let (drawn, other) = with_compositor(|c| {
+            c.set_layer(
+                1,
+                &[path_item(0.0, 0.0, 0, 10, 0xFF00_0000, 0.0, 0)],
+                b"",
+                &tri,
+                1.0,
+            )?;
+            c.set_layer(0, &a, b"", &pa, 1.0)?;
+            // The second twelve don't fit beside the first: the sheet starts
+            // again with them and the other layer's triangle.
+            c.set_layer(0, &b, b"", &pb, 1.0)?;
+            Ok((c.layers[0].instances.len(), c.layers[1].instances[0].uv))
+        })
+        .unwrap();
+        assert_eq!(drawn, 12);
+        // The other layer points at its triangle where the sheet has it now.
+        let e = with_text(|t| t.atlas.path(&tri, 0.0, 0, 0, 0, None));
+        assert_eq!(other, [e.x as f32, e.y as f32, e.w as f32, e.h as f32]);
+    }
+
+    #[test]
+    fn a_layer_needing_more_than_the_paths_sheet_draws_every_path() {
+        if MTLCreateSystemDefaultDevice().is_none() {
+            eprintln!("no Metal device here: the paths' sheet isn't checked");
+            return;
+        }
+        // Twenty squares 1000 points wide at a pixel a point, where sixteen
+        // fill the sheet.
+        let mut items = Vec::new();
+        let mut paths = Vec::new();
+        for k in 0..20 {
+            let s = 1000.0 + k as f32;
+            items.push(path_item(
+                0.0,
+                0.0,
+                paths.len() as i32,
+                13,
+                0xFF00_0000,
+                0.0,
+                0,
+            ));
+            paths.extend_from_slice(&[0.0, 0.0, 0.0, 1.0, s, 0.0, 1.0, s, s, 1.0, 0.0, s, 3.0]);
+        }
+        let (drawn, after) = with_compositor(|c| {
+            c.set_layer(1, &[], b"", &[], 1.0)?;
+            c.set_layer(0, &items, b"", &paths, 1.0)?;
+            let drawn = c.layers[0].instances.len();
+            // A new square set next, with room for it, is drawn at its size.
+            let big = [
+                0.0, 0.0, 0.0, 1.0, 1100.0, 0.0, 1.0, 1100.0, 1100.0, 1.0, 0.0, 1100.0, 3.0,
+            ];
+            c.set_layer(0, &items[..1], b"", &big, 1.0)?;
+            Ok((drawn, c.layers[0].instances[0].uv[2]))
+        })
+        .unwrap();
+        assert_eq!(drawn, 20);
+        assert!(after > 1100.0, "{after}");
+    }
+
+    #[test]
+    fn a_clipped_path_has_a_mask_only_as_big_as_what_shows() {
+        // A bar 10000 points long, its clip 100 wide.
+        let paths = [
+            0.0, 0.0, 0.0, 1.0, 10000.0, 0.0, 1.0, 10000.0, 4.0, 1.0, 0.0, 4.0, 3.0,
+        ];
+        let mut item = path_item(0.0, 0.0, 0, 13, 0xFF00_0000, 0.0, 0);
+        item.clip_w = 100.0;
+        item.clip_h = 4.0;
+        let mut out = Vec::new();
+        let scale = with_text(|t| {
+            let scale = t.atlas.scale;
+            build(&[item], b"", &paths, scale, t, &mut out);
+            scale
+        });
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].uv[2] as f64 <= 100.0 * scale + 2.0,
+            "{:?}",
+            out[0].uv
+        );
     }
 }

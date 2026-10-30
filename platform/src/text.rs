@@ -600,7 +600,8 @@ fn next_char(s: &[u8]) -> (char, usize) {
 
 /// Where a glyph's bitmap is in the atlas, and where its top-left corner sits
 /// from the glyph's pen position on the baseline, in device pixels with y down.
-/// A glyph with nothing to draw, such as a space, has zero size.
+/// A glyph with nothing to draw, such as a space, has zero size. A path's mask
+/// too big for its sheet is `div` times smaller than it draws (0 or 1: not).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AtlasEntry {
     pub x: u16,
@@ -609,6 +610,7 @@ pub struct AtlasEntry {
     pub h: u16,
     pub left: i16,
     pub top: i16,
+    pub div: u8,
 }
 
 struct Shelf {
@@ -617,38 +619,135 @@ struct Shelf {
     x: u32,
 }
 
-/// Coverage masks of every glyph drawn so far, one byte per device pixel, at
-/// one backing scale. Glyphs are packed on shelves of similar height; the atlas
-/// grows downwards when full, so rows already uploaded never move.
-pub struct Atlas {
+/// Masks of one kind for one texture, one byte per device pixel, packed on
+/// shelves of similar height. It grows downwards when full, up to its most
+/// rows, so rows already uploaded never move until it is cleared.
+pub struct Sheet {
     pub width: u32,
     pub height: u32,
+    max_height: u32,
     pub pixels: Vec<u8>,
-    pub scale: f64,
     /// Rows written since the compositor last uploaded, as [first, end).
     pub dirty: Option<(u32, u32)>,
-    entries: HashMap<(u32, u16, u8), AtlasEntry>,
-    paths: HashMap<u64, AtlasEntry>, // by path_key
     shelves: Vec<Shelf>,
-    raster_fonts: HashMap<u32, Cf>, // font index -> that font at size × scale
+    /// Whether a mask found no room since it was last cleared.
+    pub full: bool,
+    /// Whether a path's mask that finds no room is drawn smaller instead:
+    /// once the sheet has been cleared and still can't hold what is drawn.
+    pub tight: bool,
 }
 
-const ATLAS_WIDTH: u32 = 1024;
-const ATLAS_MAX_HEIGHT: u32 = 16384;
+impl Sheet {
+    fn new(width: u32, max_height: u32) -> Self {
+        let height = 256.min(max_height);
+        Sheet {
+            width,
+            height,
+            max_height,
+            pixels: vec![0; (width * height) as usize],
+            dirty: None,
+            shelves: Vec::new(),
+            full: false,
+            tight: false,
+        }
+    }
+
+    /// A free w × h place: on a shelf of about that height, or on a new shelf
+    /// below the last one, growing the sheet when it runs out of rows. None
+    /// when there is no room.
+    fn place(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+        let width = self.width;
+        if let Some(s) = self
+            .shelves
+            .iter_mut()
+            .find(|s| h <= s.h && s.h <= h + h / 4 + 2 && s.x + w <= width)
+        {
+            let x = s.x;
+            s.x += w + 1;
+            return Some((x, s.y));
+        }
+        // A new shelf is an eighth taller than what opens it, so that masks
+        // a little taller share it rather than each opening its own.
+        let y = self.shelves.last().map_or(0, |s| s.y + s.h + 1);
+        let shelf_h = (h + h / 8 + 3) & !3;
+        while y + shelf_h > self.height {
+            if self.height * 2 > self.max_height {
+                return None;
+            }
+            self.height *= 2;
+            self.pixels.resize((self.width * self.height) as usize, 0);
+        }
+        self.shelves.push(Shelf {
+            y,
+            h: shelf_h,
+            x: w + 1,
+        });
+        Some((0, y))
+    }
+
+    /// Copies mask `mask`, w × h with its first row its top, to (x, y).
+    fn put(&mut self, x: u32, y: u32, w: u32, h: u32, mask: &[u8]) {
+        for row in 0..h {
+            let from = (row * w) as usize;
+            let to = ((y + row) * self.width + x) as usize;
+            self.pixels[to..to + w as usize].copy_from_slice(&mask[from..from + w as usize]);
+        }
+        self.dirty = Some(match self.dirty {
+            Some((a, b)) => (a.min(y), b.max(y + h)),
+            None => (y, y + h),
+        });
+    }
+
+    /// Empties it, to draw the masks in use again; all of it is uploaded.
+    pub fn clear(&mut self) {
+        self.shelves.clear();
+        self.pixels.fill(0);
+        self.full = false;
+        self.dirty = Some((0, self.height));
+    }
+}
+
+/// The coverage masks drawn so far at one backing scale: glyphs in one sheet
+/// and SVG's paths in another, so that big paths never take the glyphs' room.
+pub struct Atlas {
+    pub scale: f64,
+    pub glyphs: Sheet,
+    pub paths: Sheet,
+    entries: HashMap<(u32, u16, u8), AtlasEntry>,
+    path_entries: HashMap<u64, AtlasEntry>, // by path_key
+    raster_fonts: HashMap<u32, Cf>,         // font index -> that font at size × scale
+}
+
+/// The glyphs' sheet: 1024 pixels wide, up to 16 MB.
+const GLYPHS_WIDTH: u32 = 1024;
+const GLYPHS_MAX_HEIGHT: u32 = 16384;
+/// The paths' sheet: wide enough for a path 2048 points across at 2x, up to
+/// 16 MB.
+const PATHS_WIDTH: u32 = 4096;
+const PATHS_MAX_HEIGHT: u32 = 4096;
 
 impl Atlas {
     pub fn new(scale: f64) -> Self {
         Atlas {
-            width: ATLAS_WIDTH,
-            height: 256,
-            pixels: vec![0; (ATLAS_WIDTH * 256) as usize],
             scale,
-            dirty: None,
+            glyphs: Sheet::new(GLYPHS_WIDTH, GLYPHS_MAX_HEIGHT),
+            paths: Sheet::new(PATHS_WIDTH, PATHS_MAX_HEIGHT),
             entries: HashMap::new(),
-            paths: HashMap::new(),
-            shelves: Vec::new(),
+            path_entries: HashMap::new(),
             raster_fonts: HashMap::new(),
         }
+    }
+
+    /// Empties the glyphs' sheet, and forgets the glyphs that were in it.
+    pub fn clear_glyphs(&mut self) {
+        self.glyphs.clear();
+        self.entries.clear();
+    }
+
+    /// Empties the paths' sheet, and forgets the paths that were in it.
+    pub fn clear_paths(&mut self) {
+        self.paths.clear();
+        self.path_entries.clear();
     }
 
     /// The atlas entry for glyph `id` of font `font`, rasterized at subpixel
@@ -686,10 +785,13 @@ impl Atlas {
         let y0 = rect.origin.y.floor() as i32 - 1;
         let y1 = (rect.origin.y + rect.size.height).ceil() as i32 + 1;
         let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
-        if w > self.width || h > 2048 {
+        if w > self.glyphs.width || h > 2048 {
             return None;
         }
-        let (ax, ay) = self.place(w, h)?;
+        let Some((ax, ay)) = self.glyphs.place(w, h) else {
+            self.glyphs.full = true;
+            return None;
+        };
 
         let mut mask = vec![0u8; (w * h) as usize];
         {
@@ -723,15 +825,7 @@ impl Atlas {
             }
         }
         // The bitmap's first row is its top.
-        for row in 0..h {
-            let from = (row * w) as usize;
-            let to = ((ay + row) * self.width + ax) as usize;
-            self.pixels[to..to + w as usize].copy_from_slice(&mask[from..from + w as usize]);
-        }
-        self.dirty = Some(match self.dirty {
-            Some((a, b)) => (a.min(ay), b.max(ay + h)),
-            None => (ay, ay + h),
-        });
+        self.glyphs.put(ax, ay, w, h, &mask);
         Some(AtlasEntry {
             x: ax as u16,
             y: ay as u16,
@@ -739,6 +833,7 @@ impl Atlas {
             h: h as u16,
             left: x0 as i16,
             top: y1 as i16,
+            div: 0,
         })
     }
 
@@ -747,7 +842,9 @@ impl Atlas {
     /// or stroked `stroke` points wide, as `flags` say, from (`phase_x`,
     /// `phase_y`) in 1/PHASES of a device pixel past a pixel's corner. Its
     /// `left` and `top` are where its mask's corner is from that pixel, in
-    /// device pixels. A path bigger than the atlas allows has zero size.
+    /// device pixels. One bigger than its sheet is drawn smaller. With
+    /// `seen`, the part of the device pixels from that pixel that can show,
+    /// as x0, y0, x1, y1, its mask covers no more than that.
     pub fn path(
         &mut self,
         data: &[f32],
@@ -755,15 +852,16 @@ impl Atlas {
         flags: i32,
         phase_x: u8,
         phase_y: u8,
+        seen: Option<[i32; 4]>,
     ) -> AtlasEntry {
-        let key = path_key(data, stroke, flags, phase_x, phase_y);
-        if let Some(e) = self.paths.get(&key) {
+        let key = path_key(data, stroke, flags, phase_x, phase_y, seen);
+        if let Some(e) = self.path_entries.get(&key) {
             return *e;
         }
         let entry = self
-            .rasterize_path(data, stroke, flags, phase_x, phase_y)
+            .rasterize_path(data, stroke, flags, phase_x, phase_y, seen)
             .unwrap_or_default();
-        self.paths.insert(key, entry);
+        self.path_entries.insert(key, entry);
         entry
     }
 
@@ -774,6 +872,7 @@ impl Atlas {
         flags: i32,
         phase_x: u8,
         phase_y: u8,
+        seen: Option<[i32; 4]>,
     ) -> Option<AtlasEntry> {
         let (own, clip) = split_clip(data);
         let (dx, dy) = (
@@ -826,6 +925,16 @@ impl Atlas {
             r.size.width = x1 - x0;
             r.size.height = y1 - y0;
         }
+        if let Some([sx0, sy0, sx1, sy1]) = seen {
+            let x0 = r.origin.x.max(sx0 as f64);
+            let y0 = r.origin.y.max(sy0 as f64);
+            let x1 = (r.origin.x + r.size.width).min(sx1 as f64);
+            let y1 = (r.origin.y + r.size.height).min(sy1 as f64);
+            r.origin.x = x0;
+            r.origin.y = y0;
+            r.size.width = x1 - x0;
+            r.size.height = y1 - y0;
+        }
         if !(r.size.width > 0.0 && r.size.height > 0.0) {
             return None;
         }
@@ -834,20 +943,47 @@ impl Atlas {
         let x1 = (r.origin.x + r.size.width).ceil() as i32 + 1;
         let y0 = r.origin.y.floor() as i32 - 1;
         let y1 = (r.origin.y + r.size.height).ceil() as i32 + 1;
-        let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
-        if w > self.width || h > 2048 || x0 < i16::MIN as i32 || y0 < i16::MIN as i32 {
+        if !(i16::MIN as i32..=i16::MAX as i32).contains(&x0)
+            || !(i16::MIN as i32..=i16::MAX as i32).contains(&y0)
+        {
             return None;
         }
-        let (ax, ay) = self.place(w, h)?;
-        let mut mask = vec![0u8; (w * h) as usize];
+        // A mask too big for the sheet is drawn smaller, by a power of two,
+        // and stretched back: its edges soften a little, at a size where that
+        // doesn't show.
+        let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        let mut div = 1;
+        while w.div_ceil(div) > self.paths.width || h.div_ceil(div) > self.paths.max_height {
+            div *= 2;
+        }
+        // When the sheet can't hold what the layers draw, a big mask (over a
+        // 64th of the sheet) is drawn at half the size, and any that still
+        // finds no room smaller again, rather than not at all.
+        if self.paths.tight
+            && w.div_ceil(div) * h.div_ceil(div) > self.paths.width * self.paths.max_height / 64
+        {
+            div *= 2;
+        }
+        let (mw, mh, ax, ay) = loop {
+            let (mw, mh) = (w.div_ceil(div), h.div_ceil(div));
+            if let Some((ax, ay)) = self.paths.place(mw, mh) {
+                break (mw, mh, ax, ay);
+            }
+            if !self.paths.tight || div >= 16 {
+                self.paths.full = true;
+                return None;
+            }
+            div *= 2;
+        };
+        let mut mask = vec![0u8; (mw * mh) as usize];
         {
             let context = Cf::take(unsafe {
                 CGBitmapContextCreate(
                     mask.as_mut_ptr().cast(),
-                    w as usize,
-                    h as usize,
+                    mw as usize,
+                    mh as usize,
                     8,
-                    w as usize,
+                    mw as usize,
                     null(),
                     kCGImageAlphaOnly,
                 )
@@ -858,6 +994,7 @@ impl Atlas {
                 CGContextSetShouldAntialias(c, true);
                 CGContextSetGrayFillColor(c, 1.0, 1.0);
                 // Device pixels have y down; the bitmap's first row is its top.
+                CGContextScaleCTM(c, 1.0 / div as f64, 1.0 / div as f64);
                 CGContextTranslateCTM(c, -x0 as f64, y1 as f64);
                 CGContextScaleCTM(c, 1.0, -1.0);
                 if let Some(clip) = &clip {
@@ -872,53 +1009,16 @@ impl Atlas {
                 }
             }
         }
-        for row in 0..h {
-            let from = (row * w) as usize;
-            let to = ((ay + row) * self.width + ax) as usize;
-            self.pixels[to..to + w as usize].copy_from_slice(&mask[from..from + w as usize]);
-        }
-        self.dirty = Some(match self.dirty {
-            Some((a, b)) => (a.min(ay), b.max(ay + h)),
-            None => (ay, ay + h),
-        });
+        self.paths.put(ax, ay, mw, mh, &mask);
         Some(AtlasEntry {
             x: ax as u16,
             y: ay as u16,
-            w: w as u16,
-            h: h as u16,
+            w: mw as u16,
+            h: mh as u16,
             left: x0 as i16,
             top: y0 as i16,
+            div: div as u8,
         })
-    }
-
-    /// A free w × h place: on a shelf of about that height, or on a new shelf
-    /// below the last one, growing the atlas when it runs out of rows.
-    fn place(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
-        let width = self.width;
-        if let Some(s) = self
-            .shelves
-            .iter_mut()
-            .find(|s| h <= s.h && s.h <= h + h / 4 + 2 && s.x + w <= width)
-        {
-            let x = s.x;
-            s.x += w + 1;
-            return Some((x, s.y));
-        }
-        let y = self.shelves.last().map_or(0, |s| s.y + s.h + 1);
-        let shelf_h = (h + 3) & !3;
-        while y + shelf_h > self.height {
-            if self.height * 2 > ATLAS_MAX_HEIGHT {
-                return None;
-            }
-            self.height *= 2;
-            self.pixels.resize((self.width * self.height) as usize, 0);
-        }
-        self.shelves.push(Shelf {
-            y,
-            h: shelf_h,
-            x: w + 1,
-        });
-        Some((0, y))
     }
 }
 
@@ -1013,15 +1113,22 @@ fn device_polygon(corners: &[f32], scale: f64, dx: f64, dy: f64) -> Option<Cf> {
 }
 
 /// What tells two path masks apart: the path's points to a 64th of a point,
-/// its stroke, flags and phases.
-fn path_key(data: &[f32], stroke: f32, flags: i32, phase_x: u8, phase_y: u8) -> u64 {
+/// its stroke, flags and phases, and what of it can show.
+fn path_key(
+    data: &[f32],
+    stroke: f32,
+    flags: i32,
+    phase_x: u8,
+    phase_y: u8,
+    seen: Option<[i32; 4]>,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for &v in data {
         ((v * 64.0).round() as i32).hash(&mut h);
     }
     stroke.to_bits().hash(&mut h);
-    (flags, phase_x, phase_y).hash(&mut h);
+    (flags, phase_x, phase_y, seen).hash(&mut h);
     h.finish()
 }
 
@@ -1311,8 +1418,8 @@ mod tests {
             // T's bar is at the top: the upper rows carry more ink.
             let ink = |rows: std::ops::Range<u16>| -> u32 {
                 rows.map(|r| {
-                    let start = ((e.y + r) as u32 * t.atlas.width + e.x as u32) as usize;
-                    t.atlas.pixels[start..start + e.w as usize]
+                    let start = ((e.y + r) as u32 * t.atlas.glyphs.width + e.x as u32) as usize;
+                    t.atlas.glyphs.pixels[start..start + e.w as usize]
                         .iter()
                         .map(|&p| p as u32)
                         .sum::<u32>()
@@ -1381,11 +1488,11 @@ mod tests {
         ];
         let mut half = square.to_vec();
         half.extend_from_slice(&[4.0, 4.0, 0.0, 0.0, 10.0, 0.0, 10.0, 20.0, 0.0, 20.0]);
-        let a = atlas.path(&square, 0.0, 0, 0, 0);
-        let b = atlas.path(&half, 0.0, 0, 0, 0);
+        let a = atlas.path(&square, 0.0, 0, 0, 0, None);
+        let b = atlas.path(&half, 0.0, 0, 0, 0, None);
         let at = |e: AtlasEntry, x: i32, y: i32| {
             let (mx, my) = ((x - e.left as i32) as u32, (y - e.top as i32) as u32);
-            atlas.pixels[((e.y as u32 + my) * atlas.width + e.x as u32 + mx) as usize]
+            atlas.paths.pixels[((e.y as u32 + my) * atlas.paths.width + e.x as u32 + mx) as usize]
         };
         assert!(a.w >= 20 && b.w < a.w && b.h == a.h, "{a:?} {b:?}");
         assert_eq!(at(a, 15, 10), 255);
@@ -1402,10 +1509,10 @@ mod tests {
             0.0, 0.0, 0.0, 1.0, 20.0, 0.0, 1.0, 20.0, 20.0, 1.0, 0.0, 20.0, 3.0,
         ];
         corner.extend_from_slice(&[4.0, 3.0, 0.0, 0.0, 20.0, 0.0, 0.0, 20.0]);
-        let e = atlas.path(&corner, 0.0, 0, 0, 0);
+        let e = atlas.path(&corner, 0.0, 0, 0, 0, None);
         let at = |x: i32, y: i32| {
             let (mx, my) = ((x - e.left as i32) as u32, (y - e.top as i32) as u32);
-            atlas.pixels[((e.y as u32 + my) * atlas.width + e.x as u32 + mx) as usize]
+            atlas.paths.pixels[((e.y as u32 + my) * atlas.paths.width + e.x as u32 + mx) as usize]
         };
         assert_eq!(at(4, 4), 255);
         assert_eq!(at(15, 15), 0);
@@ -1415,9 +1522,112 @@ mod tests {
     fn a_path_mask_is_drawn_at_its_phase() {
         let mut atlas = Atlas::new(1.0);
         let triangle = [0.0, 0.0, 0.0, 1.0, 9.5, 0.0, 1.0, 0.0, 9.5, 3.0];
-        let a = atlas.path(&triangle, 0.0, 0, 0, 0);
-        let b = atlas.path(&triangle, 0.0, 0, 2, 0);
+        let a = atlas.path(&triangle, 0.0, 0, 0, 0, None);
+        let b = atlas.path(&triangle, 0.0, 0, 2, 0, None);
         assert_ne!(a, b);
-        assert_eq!(atlas.path(&triangle, 0.0, 0, 0, 0), a);
+        assert_eq!(atlas.path(&triangle, 0.0, 0, 0, 0, None), a);
+    }
+
+    /// A square path `side` points wide, as path data.
+    fn square(side: f32) -> Vec<f32> {
+        vec![
+            0.0, 0.0, 0.0, 1.0, side, 0.0, 1.0, side, side, 1.0, 0.0, side, 3.0,
+        ]
+    }
+
+    #[test]
+    fn a_path_too_big_for_its_sheet_is_drawn_smaller() {
+        let mut atlas = Atlas::new(1.0);
+        let wide = [
+            0.0, 0.0, 0.0, 1.0, 6000.0, 0.0, 1.0, 6000.0, 20.0, 1.0, 0.0, 20.0, 3.0,
+        ];
+        let e = atlas.path(&wide, 0.0, 0, 0, 0, None);
+        assert_eq!(e.div, 2, "{e:?}");
+        assert!(
+            e.w as u32 <= atlas.paths.width && e.w as u32 * 2 >= 6000,
+            "{e:?}"
+        );
+        let row = (e.y as u32 + e.h as u32 / 2) * atlas.paths.width;
+        assert_eq!(
+            atlas.paths.pixels[(row + e.x as u32 + e.w as u32 / 2) as usize],
+            255
+        );
+        // One that fits is drawn at its size.
+        assert!(atlas.path(&square(100.0), 0.0, 0, 0, 0, None).div <= 1);
+    }
+
+    #[test]
+    fn a_sheet_with_no_room_says_so_until_cleared() {
+        let mut atlas = Atlas::new(1.0);
+        let mut side = 1000.0;
+        while atlas.path(&square(side), 0.0, 0, 0, 0, None).w > 0 {
+            assert!(!atlas.paths.full);
+            side += 1.0;
+        }
+        assert!(atlas.paths.full && !atlas.glyphs.full);
+        atlas.clear_paths();
+        assert!(!atlas.paths.full);
+        assert!(atlas.path(&square(side), 0.0, 0, 0, 0, None).w > 0);
+    }
+
+    #[test]
+    fn a_tight_sheet_draws_masks_smaller_rather_than_not_at_all() {
+        let mut atlas = Atlas::new(1.0);
+        atlas.paths.tight = true;
+        let entries: Vec<AtlasEntry> = (0..24)
+            .map(|k| atlas.path(&square(1000.0 + k as f32), 0.0, 0, 0, 0, None))
+            .collect();
+        // Twenty-four squares 1000 wide, where sixteen fill the sheet: all
+        // drawn, at half the size.
+        assert!(entries.iter().all(|e| e.w > 0 && e.div == 2), "{entries:?}");
+        assert!(!atlas.paths.full);
+        // A small one keeps its size.
+        assert!(atlas.path(&square(100.0), 0.0, 0, 0, 0, None).div <= 1);
+    }
+
+    #[test]
+    fn a_tight_sheet_draws_smaller_any_mask_with_no_room() {
+        let mut atlas = Atlas::new(1.0);
+        atlas.paths.tight = true;
+        // A hundred and twenty squares 400 wide, where a hundred fill the
+        // sheet: the last ones drawn as much smaller as the room left needs.
+        let entries: Vec<AtlasEntry> = (0..120)
+            .map(|k| atlas.path(&square(400.0 + k as f32 / 8.0), 0.0, 0, 0, 0, None))
+            .collect();
+        assert!(entries.iter().all(|e| e.w > 0));
+        assert!(
+            entries[0].div <= 1 && entries[119].div >= 2,
+            "{:?}",
+            entries[119]
+        );
+    }
+
+    #[test]
+    fn masks_a_little_taller_share_a_shelf() {
+        let mut atlas = Atlas::new(1.0);
+        // Eight 100 wide, each a point taller than the one before: one shelf.
+        let ys: Vec<u16> = (0..8)
+            .map(|k| {
+                let h = 100.0 + k as f32;
+                let d = [
+                    0.0, 0.0, 0.0, 1.0, 100.0, 0.0, 1.0, 100.0, h, 1.0, 0.0, h, 3.0,
+                ];
+                atlas.path(&d, 0.0, 0, 0, 0, None).y
+            })
+            .collect();
+        assert!(ys.iter().all(|&y| y == ys[0]), "{ys:?}");
+    }
+
+    #[test]
+    fn a_mask_covers_no_more_than_can_show() {
+        let mut atlas = Atlas::new(1.0);
+        // A bar 10000 points long, of which 200 show.
+        let bar = [
+            0.0, 0.0, 0.0, 1.0, 10000.0, 0.0, 1.0, 10000.0, 4.0, 1.0, 0.0, 4.0, 3.0,
+        ];
+        let e = atlas.path(&bar, 0.0, 0, 0, 0, Some([0, 0, 200, 20]));
+        assert!(e.w <= 202 && e.div <= 1, "{e:?}");
+        // What shows is another mask than the whole bar's.
+        assert_ne!(atlas.path(&bar, 0.0, 0, 0, 0, None), e);
     }
 }
