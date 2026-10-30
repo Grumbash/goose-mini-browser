@@ -509,6 +509,27 @@ impl Compositor {
         l.text.extend_from_slice(text);
         l.paths.clear();
         l.paths.extend_from_slice(paths);
+        self.build(layer, scale)
+    }
+
+    /// As set_layer, taking lists a tab worker handed over, without copying
+    /// them again.
+    pub fn set_layer_owned(
+        &mut self,
+        layer: usize,
+        items: Vec<DItem>,
+        text: Vec<u8>,
+        paths: Vec<f32>,
+        scale: f64,
+    ) -> Result<(), i32> {
+        let l = &mut self.layers[layer];
+        (l.items, l.text, l.paths) = (items, text, paths);
+        self.build(layer, scale)
+    }
+
+    /// Builds layer `layer`'s instances from its lists, and every layer's
+    /// when the atlas starts again; then uploads what changed.
+    fn build(&mut self, layer: usize, scale: f64) -> Result<(), i32> {
         self.scale = scale;
         let all = with_text(|t| {
             // Masks drawn for another backing scale are of no use now.
@@ -1205,7 +1226,7 @@ pub fn with_compositor<R>(f: impl FnOnce(&mut Compositor) -> Result<R, i32>) -> 
 /// Metal objects live on the main thread only (docs/adr/0005). Off it, the
 /// entry points here refuse rather than set up a second compositor, one the
 /// window never shows.
-fn on_main_thread() -> Result<(), i32> {
+pub(crate) fn on_main_thread() -> Result<(), i32> {
     MainThreadMarker::new()
         .map(|_| ())
         .ok_or(ERR_NOT_MAIN_THREAD)

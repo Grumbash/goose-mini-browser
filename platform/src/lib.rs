@@ -15,6 +15,7 @@
 mod cg;
 pub mod compositor;
 mod memory;
+pub mod tabs;
 pub mod text;
 
 use std::cell::RefCell;
@@ -35,6 +36,7 @@ use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NS
 use objc2_metal::MTLPixelFormat;
 use objc2_quartz_core::{CAMetalLayer, kCAGravityTopLeft};
 
+pub(crate) use compositor::on_main_thread;
 use compositor::with_compositor;
 
 // Error codes returned to Goose. Zero or positive means success.
@@ -57,6 +59,8 @@ const EV_WAKE: i32 = 6; // code: the token passed to tp_wake
 const EV_MOUSE_UP: i32 = 7; // that button went up: as EV_MOUSE; one for each EV_MOUSE, none without
 const EV_MOUSE_MOVE: i32 = 8; // the pointer moved: x, y; code: the buttons of EV_MOUSEs still held (bit b for button b); w: modifiers
 const EV_MOUSE_LEAVE: i32 = 9; // the pointer left the content
+pub(crate) const EV_FRAME: i32 = 10; // code: a tab whose display list waits (tabs.rs)
+pub(crate) const EV_REPLY: i32 = 11; // code: a tab whose reply waits
 
 /// One input event, laid out as Goose's `struct Event { kind: i32, code: i32,
 /// x: f64, y: f64, w: f64, h: f64 }`.
@@ -407,8 +411,9 @@ fn release_waiting(p: &Platform, button: i32) -> bool {
 fn translate(p: &mut Platform, ev: &NSEvent) -> Option<GpEvent> {
     let kind = ev.r#type();
     if kind == NSEventType::ApplicationDefined {
+        // post_to_main's: the kind in data2, the code in data1.
         return Some(GpEvent {
-            kind: EV_WAKE,
+            kind: ev.data2() as i32,
             code: ev.data1() as i32,
             ..Default::default()
         });
@@ -604,27 +609,46 @@ pub(crate) fn refresh_hz() -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_wake(token: i32) -> i32 {
     guarded(|| {
-        dispatch2::DispatchQueue::main().exec_async(move || {
-            let Some(mtm) = MainThreadMarker::new() else { return };
-            let app = NSApplication::sharedApplication(mtm);
-            let event = unsafe {
-                NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
-                    NSEventType::ApplicationDefined,
-                    NSPoint::new(0.0, 0.0),
-                    NSEventModifierFlags::empty(),
-                    0.0,
-                    0,
-                    None,
-                    0,
-                    token as isize,
-                    0,
-                )
-            };
-            if let Some(event) = event {
-                app.postEvent_atStart(&event, false);
-            }
-        });
+        post_to_main(EV_WAKE, token);
         Ok(0)
+    })
+}
+
+/// Posts an event of `kind` with `code` to the main thread's queue, from any
+/// thread, for tp_next_event to hand to Goose.
+pub(crate) fn post_to_main(kind: i32, code: i32) {
+    dispatch2::DispatchQueue::main().exec_async(move || {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let app = NSApplication::sharedApplication(mtm);
+        let event = unsafe {
+            NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+                NSEventType::ApplicationDefined,
+                NSPoint::new(0.0, 0.0),
+                NSEventModifierFlags::empty(),
+                0.0,
+                0,
+                None,
+                0,
+                code as isize,
+                kind as isize,
+            )
+        };
+        if let Some(event) = event {
+            app.postEvent_atStart(&event, false);
+        }
+    });
+}
+
+/// Sets the window's title to `title`, UTF-8.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_set_title(title: GSlice<u8>) -> i32 {
+    guarded(|| {
+        let title = unsafe { title.as_slice() }.ok_or(ERR_ARGUMENT)?;
+        with_platform(|p| {
+            p.window
+                .setTitle(&NSString::from_str(&String::from_utf8_lossy(title)));
+            Ok(0)
+        })
     })
 }
 
