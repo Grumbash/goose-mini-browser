@@ -47,7 +47,8 @@ const LAYERS: usize = 2; // 0: the page, scrolled; 1: the overlay, fixed
 /// corners rounded by `clip_tl`, `clip_tr`, `clip_br` and `clip_bl`. A
 /// transformed item has a matrix (`m_a` … `m_f`, as CSS's matrix() takes
 /// them, points to points; all 0: none), and its clip one that takes its
-/// points to the clip's (`c_a` … `c_f`; all 0: they are the same).
+/// points to the clip's (`c_a` … `c_f`; all 0: they are the same). A second
+/// clip (`oclip_w` above 0) cuts it square on the page, after its transform.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct DItem {
@@ -92,6 +93,10 @@ pub struct DItem {
     pub c_d: f32,
     pub c_e: f32,
     pub c_f: f32,
+    pub oclip_x: f32,
+    pub oclip_y: f32,
+    pub oclip_w: f32,
+    pub oclip_h: f32,
 }
 
 /// One quad, in device pixels: solid when `uv[2]` is 0, otherwise the atlas
@@ -103,7 +108,8 @@ pub struct DItem {
 /// rounded by `clip_radii`. A transformed quad (`xt[2]` 1) goes where the
 /// matrix `xf` (a, b, c, d) and `xt` (e, f, in device pixels) take it, its
 /// edges smoothed and glyphs sampled between texels; its clip is tested
-/// where `cxf` and `cxt` take its points, when `cxt[2]` is 1.
+/// where `cxf` and `cxt` take its points, when `cxt[2]` is 1. `oclip` (its
+/// width above 0) cuts it square where it lands on the page.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Instance {
@@ -120,6 +126,7 @@ pub struct Instance {
     pub xt: [f32; 4],
     pub cxf: [f32; 4],
     pub cxt: [f32; 4],
+    pub oclip: [f32; 4],
 }
 
 #[repr(C)]
@@ -133,13 +140,13 @@ const SHADERS: &str = r#"
 using namespace metal;
 
 struct Instance { float4 rect; float4 uv; float4 color; float4 radii; float4 border; float4 border_color; float4 widths; float4 clip; float4 clip_radii;
-                  float4 xf; float4 xt; float4 cxf; float4 cxt; };
+                  float4 xf; float4 xt; float4 cxf; float4 cxt; float4 oclip; };
 struct Uniforms { float2 viewport; float2 scroll; };
 struct Out {
     float4 position [[position]];
     float2 uv; float4 color; float textured;
     float2 local; float2 size; float4 radii; float4 border; float4 border_color; float4 widths; float4 clip; float4 clip_radii;
-    float2 clip_pos; float smooth;
+    float2 clip_pos; float smooth; float4 oclip; float2 page;
 };
 
 vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
@@ -147,19 +154,30 @@ vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
                        constant Uniforms& u [[buffer(1)]]) {
     Instance q = instances[i];
     float2 corner = float2(v & 1, v >> 1);
+    // A transformed box reaches a pixel or so further on screen, so that its
+    // edges' soft outer half is drawn too.
+    float2 lo = float2(0.0);
+    float2 hi = q.rect.zw;
+    if (q.xt.z > 0.5 && q.border.z > 0.5) {
+        float pad = 1.0 / max(min(length(q.xf.xy), length(q.xf.zw)), 0.25);
+        lo -= pad;
+        hi += pad;
+    }
+    float2 local = mix(lo, hi, corner);
     // On the page, then where its transform takes it, then scrolled.
-    float2 p = q.rect.xy + corner * q.rect.zw;
+    float2 p = q.rect.xy + local;
     float2 t = p;
     if (q.xt.z > 0.5) {
         t = float2(q.xf.x * p.x + q.xf.z * p.y + q.xt.x, q.xf.y * p.x + q.xf.w * p.y + q.xt.y);
     }
-    t -= u.scroll;
     Out o;
+    o.page = t;
+    t -= u.scroll;
     o.position = float4(t.x / u.viewport.x * 2.0 - 1.0, 1.0 - t.y / u.viewport.y * 2.0, 0.0, 1.0);
     o.uv = q.uv.xy + corner * q.uv.zw;
     o.color = q.color;
     o.textured = q.uv.z > 0.0 ? 1.0 : 0.0;
-    o.local = corner * q.rect.zw;
+    o.local = local;
     o.size = q.rect.zw;
     o.radii = q.radii;
     o.border = q.border;
@@ -172,6 +190,7 @@ vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
         o.clip_pos = float2(q.cxf.x * p.x + q.cxf.z * p.y + q.cxt.x, q.cxf.y * p.x + q.cxf.w * p.y + q.cxt.y);
     }
     o.smooth = q.xt.z;
+    o.oclip = q.oclip;
     return o;
 }
 
@@ -193,6 +212,11 @@ fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[text
     float dc = rounded_rect(in.clip_pos - in.clip.xy, in.clip.zw, in.clip_radii);
     float gc = in.smooth > 0.5 ? max(length(float2(dfdx(dc), dfdy(dc))), 0.0001) : 1.0;
     float cover = in.clip.z > 0.0 ? clamp(0.5 - dc / gc, 0.0, 1.0) : 1.0;
+    if (in.oclip.z > 0.0) {
+        float2 a = in.page - in.oclip.xy;
+        float2 b = in.oclip.xy + in.oclip.zw - in.page;
+        cover *= clamp(min(min(a.x, a.y), min(b.x, b.y)) + 0.5, 0.0, 1.0);
+    }
     if (in.textured > 0.5) {
         constexpr sampler nearest(coord::pixel, filter::nearest, address::clamp_to_edge);
         constexpr sampler between(coord::pixel, filter::linear, address::clamp_to_edge);
@@ -613,6 +637,18 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
         };
         let k = scale as f32;
         let clip_radii = [clip_tl * k, clip_tr * k, clip_br * k, clip_bl * k];
+        let DItem {
+            oclip_x,
+            oclip_y,
+            oclip_w,
+            oclip_h,
+            ..
+        } = item;
+        let oclip = if oclip_w > 0.0 && oclip_h > 0.0 {
+            snapped(oclip_x, oclip_y, oclip_w, oclip_h, scale)
+        } else {
+            [0.0; 4]
+        };
         // Matrices map points to points; in device pixels only their
         // translations scale.
         let DItem {
@@ -649,6 +685,7 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
             xt,
             cxf,
             cxt,
+            oclip,
             ..Default::default()
         };
         let DItem {
@@ -967,21 +1004,26 @@ mod tests {
 
     #[test]
     fn items_match_the_goose_layout() {
-        assert_eq!(std::mem::size_of::<DItem>(), 164);
+        assert_eq!(std::mem::size_of::<DItem>(), 180);
         assert_eq!(std::mem::align_of::<DItem>(), 1);
         assert_eq!(std::mem::size_of::<GpFrameStats>(), 28);
-        // The shader reads instances as thirteen float4s.
-        assert_eq!(std::mem::size_of::<Instance>(), 208);
+        // The shader reads instances as fourteen float4s.
+        assert_eq!(std::mem::size_of::<Instance>(), 224);
     }
 
     /// The BGRA pixels of `items` drawn offscreen on white, `w` × `h` at one
     /// pixel a point; None without a Metal device.
     fn drawn(items: &[DItem], w: usize, h: usize) -> Option<Vec<u8>> {
+        drawn_at(items, w, h, 0.0)
+    }
+
+    /// `items` drawn `w` × `h` on white, the page scrolled down `scroll`.
+    fn drawn_at(items: &[DItem], w: usize, h: usize, scroll: f64) -> Option<Vec<u8>> {
         MTLCreateSystemDefaultDevice()?;
         let pixels = with_compositor(|c| {
             c.set_layer(0, items, b"", 1.0)?;
             c.set_layer(1, &[], b"", 1.0)?;
-            c.render_pixels(w, h, 0.0, 0xFFFF_FFFF)
+            c.render_pixels(w, h, scroll, 0xFFFF_FFFF)
         })
         .unwrap();
         Some(pixels)
@@ -1110,6 +1152,45 @@ mod tests {
         assert_eq!(at(12, 8), [255, 255, 255, 255]); // past it: the background
         assert_eq!(at(24, 8), [255, 0, 0, 255]); // the circle's middle: blue
         assert_eq!(at(16, 0), [255, 255, 255, 255]); // its corner, rounded away
+    }
+
+    #[test]
+    fn outer_clips_cut_where_items_land() {
+        // A red square 16 across at (0, 8), moved 10 right by its matrix, in a
+        // second clip 20 wide on the page round it, the page scrolled down 8:
+        // it shows from 10 to 20 across, all the way down, not past.
+        let mut red = rect(0.0, 8.0, 16.0, 16.0, 0xFFFF_0000);
+        (red.m_a, red.m_d, red.m_e) = (1.0, 1.0, 10.0);
+        (red.oclip_x, red.oclip_y, red.oclip_w, red.oclip_h) = (0.0, 8.0, 20.0, 16.0);
+        let Some(p) = drawn_at(&[red], 32, 16, 8.0) else {
+            eprintln!("no Metal device here: outer clips aren't checked");
+            return;
+        };
+        let at = |x: usize, y: usize| &p[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
+        assert_eq!(at(5, 8), [255, 255, 255, 255]); // where it was: the background
+        assert_eq!(at(15, 2), [0, 0, 255, 255]); // inside the clip, at its top: red (BGRA)
+        assert_eq!(at(15, 13), [0, 0, 255, 255]); // and at its bottom
+        assert_eq!(at(23, 8), [255, 255, 255, 255]); // past the clip: cut
+    }
+
+    #[test]
+    fn turned_edges_are_soft_on_both_sides() {
+        // A black square 20 across turned 20° about its middle: the pixels
+        // its edges cross are partly covered outside the edge as well as
+        // inside, so some are covered less than half.
+        let (s, c) = (20f32.to_radians().sin(), 20f32.to_radians().cos());
+        let mut black = rect(10.0, 10.0, 20.0, 20.0, 0xFF00_0000);
+        (black.m_a, black.m_b, black.m_c, black.m_d) = (c, s, -s, c);
+        (black.m_e, black.m_f) = (20.0 - (c * 20.0 - s * 20.0), 20.0 - (s * 20.0 + c * 20.0));
+        let Some(p) = drawn(&[black], 40, 40) else {
+            eprintln!("no Metal device here: edges aren't checked");
+            return;
+        };
+        let light = p
+            .chunks(4)
+            .filter(|px| (0.1..0.45).contains(&(1.0 - px[0] as f32 / 255.0)))
+            .count();
+        assert!(light > 20, "{light} pixels a little covered");
     }
 
     #[test]

@@ -1071,9 +1071,20 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
         return;
     }
     if name == "transform" || name == "transform-origin" {
+        // Parsed when applied, where em and percentages are known; checked now,
+        // so that an invalid one is dropped, as CSS has it.
         let prop = if name == "transform" { P_TRANSFORM } else { P_TRANSFORM_ORIGIN };
-        if value == "none" { push_decl(out, decl(prop, V_KEYWORD, K_NONE, 0, 0, important)); }
-        else { push_decl(out, text_decl(prop, V_STRING, important, value, "", bytes)); }
+        if value == "inherit" { push_decl(out, decl(prop, V_INHERIT, 0.0, 0, 0, important)); return; }
+        let initial = value == "initial" || value == "unset";
+        if prop == P_TRANSFORM && (initial || value == "none") { push_decl(out, decl(prop, V_KEYWORD, K_NONE, 0, 0, important)); return; }
+        var probe = root_style();
+        if prop == P_TRANSFORM {
+            parse_transform(value, probe);
+            if probe.xf_count == 0 { return; }
+        } else if !initial && !parse_origin(value, probe) {
+            return;
+        }
+        push_decl(out, text_decl(prop, V_STRING, important, if initial { "50% 50%" } else { value }, "", bytes));
         return;
     }
     if name == "box-shadow" {
@@ -2060,9 +2071,10 @@ fn parse_transform(text: const u8[:], s: Style&) {
         var one = no_xform();
         let room: i32 = if f == "matrix" { 3 } else { 1 };
         if !ok || s.xf_count + room > 6 { s.xf_count = 0; return; }
-        // Units: 0 a number, 1 a length, 2 a percentage, 3 an angle.
-        let len0 = count >= 1 && (unit[0] == 1 || unit[0] == 2);
-        let len1 = count >= 2 && (unit[1] == 1 || unit[1] == 2);
+        // Units: 0 a number, 1 a length, 2 a percentage, 3 an angle. A 0 with
+        // none is a length or an angle too.
+        let len0 = count >= 1 && (unit[0] == 1 || unit[0] == 2 || (unit[0] == 0 && v[0] == 0.0));
+        let len1 = count >= 2 && (unit[1] == 1 || unit[1] == 2 || (unit[1] == 0 && v[1] == 0.0));
         if (f == "translate" && len0 && (count == 1 || (count == 2 && len1))) || ((f == "translatex" || f == "translatey") && count == 1 && len0) {
             one.kind = XF_TRANSLATE;
             if f == "translatey" {
@@ -2081,7 +2093,7 @@ fn parse_transform(text: const u8[:], s: Style&) {
             one.kind = XF_SCALE;
             one.x = if f == "scaley" { 1.0 } else { v[0] };
             one.y = if f == "scalex" { 1.0 } else if count == 2 { v[1] } else { v[0] };
-        } else if (f == "rotate" || f == "rotatez") && count == 1 && (unit[0] == 3 || (unit[0] == 1 && v[0] == 0.0)) {
+        } else if (f == "rotate" || f == "rotatez") && count == 1 && (unit[0] == 3 || (unit[0] == 0 && v[0] == 0.0)) {
             one.kind = XF_ROTATE;
             one.x = v[0];
         } else if f == "matrix" && count == 6 {
@@ -2124,23 +2136,28 @@ fn transform_arg(w: const u8[:], s: Style) -> f32, i32, bool {
 
 // transform-origin: one or two of left, center, right, top, bottom, lengths
 // and percentages; x then y, unless keywords say otherwise. A third value
-// (depth) is ignored.
-fn parse_origin(text: const u8[:], s: Style&) {
+// (depth) is ignored. Whether it was valid: anything else, or more, isn't.
+fn parse_origin(text: const u8[:], s: Style&) -> bool {
     var x: f32 = 50.0;
     var y: f32 = 50.0;
     var pct: i32 = 3;
     var count = 0;
     var x_set = false;
     var y_set = false;
+    var ok = true;
     each_word(text) {
         let w = it;
-        if count < 2 {
+        if count >= 2 {
+            let v, u, wok = transform_arg(w, s);
+            if count > 2 || !wok || !(u == 1 || (u == 0 && v == 0.0)) { ok = false; }
+        } else {
             if w == "left" || w == "right" { x = if w == "left" { 0.0 } else { 100.0 }; pct = pct | 1; x_set = true; }
             else if w == "top" || w == "bottom" { y = if w == "top" { 0.0 } else { 100.0 }; pct = pct | 2; y_set = true; }
             else if w == "center" { }
             else {
-                let v, u, ok = transform_arg(w, s);
-                if ok && (u == 1 || u == 2 || (u == 0 && v == 0.0)) {
+                let v, u, wok = transform_arg(w, s);
+                if !wok || !(u == 1 || u == 2 || (u == 0 && v == 0.0)) { ok = false; }
+                else {
                     let into_x = !x_set && (count == 0 || y_set);
                     if into_x {
                         x = v;
@@ -2159,6 +2176,7 @@ fn parse_origin(text: const u8[:], s: Style&) {
     s.origin_x = x;
     s.origin_y = y;
     s.origin_pct = pct;
+    return ok && count > 0;
 }
 
 // box-shadow: up to two shadows, separated by commas, each `x y [blur
