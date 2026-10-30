@@ -48,6 +48,16 @@ fn run(p: Parser&) {
         let c = s[p.pos];
         if c == '<' && p.pos + 1 < s.len {
             let n = s[p.pos + 1];
+            if n == '!' && starts_with(s[p.pos..], "<![CDATA[") && svg_root(p) >= 0 {
+                // In foreign content a CDATA section is text, as it is.
+                if text_start < 0 { text_start = p.d.bytes.len; }
+                let from = p.pos + 9;
+                let k = find(s[from..], "]]>");
+                let end = if k < 0 { s.len } else { from + k };
+                p.d.bytes.append(s[from..end]);
+                p.pos = if k < 0 { s.len } else { end + 3 };
+                continue;
+            }
             if is_alpha(n) || n == '/' || n == '!' || n == '?' {
                 flush_text(p, text_start);
                 text_start = -1;
@@ -103,9 +113,13 @@ fn start_tag(p: Parser&) {
     let attr_start = p.d.attrs.len;
     let self_closing = read_attributes(p);
     let name = p.d.bytes[name_start..name_start + name_len];
+    // Foreign content ends at an HTML element it can't hold: what is open of
+    // the <svg> closes first (HTML §13.2.6.5).
+    let root = svg_root(p);
+    if root >= 0 && breaks_out(p, name, attr_start) { pop_to(p, root); }
     // Inside <svg>, foreign content: a tag that ends in /> closes itself,
     // and HTML's implied closings don't apply.
-    let foreign = name == "svg" || in_svg(p);
+    let foreign = name == "svg" || svg_root(p) >= 0;
 
     if name == "html" || name == "body" {
         let target = if name == "html" { p.d.nodes[p.head].parent } else { p.body };
@@ -148,10 +162,37 @@ fn start_tag(p: Parser&) {
     }
 }
 
-// Whether an <svg> is open, so that what starts now is foreign content.
-fn in_svg(p: Parser&) -> bool {
-    for e in p.open { if node_name(p.d, e) == "svg" { return true; } }
-    return false;
+// Where foreign content starts among the open elements, so that what starts
+// now is in it: the outermost open <svg>, or -1 when none is open or a
+// <foreignObject> in it holds HTML again.
+fn svg_root(p: Parser&) -> i64 {
+    var root: i64 = -1;
+    for e, k in p.open {
+        let n = node_name(p.d, e);
+        if root < 0 && n == "svg" { root = k; }
+        else if root >= 0 && n == "foreignobject" { root = -1; }
+    }
+    return root;
+}
+
+// An HTML start tag that foreign content can't hold (HTML §13.2.6.5); a
+// <font> only with a color, face or size.
+fn breaks_out(p: Parser&, name: const u8[:], attr_start: i64) -> bool {
+    if name == "font" {
+        for ai in attr_start..p.d.attrs.len {
+            let a = p.d.attrs[ai];
+            let an = p.d.bytes[a.name..a.name + a.name_len];
+            if an == "color" || an == "face" || an == "size" { return true; }
+        }
+        return false;
+    }
+    return name == "b" || name == "big" || name == "blockquote" || name == "body" || name == "br" || name == "center"
+        || name == "code" || name == "dd" || name == "div" || name == "dl" || name == "dt" || name == "em" || name == "embed"
+        || name == "h1" || name == "h2" || name == "h3" || name == "h4" || name == "h5" || name == "h6" || name == "head"
+        || name == "hr" || name == "i" || name == "img" || name == "li" || name == "listing" || name == "menu"
+        || name == "meta" || name == "nobr" || name == "ol" || name == "p" || name == "pre" || name == "ruby" || name == "s"
+        || name == "small" || name == "span" || name == "strong" || name == "strike" || name == "sub" || name == "sup"
+        || name == "table" || name == "tt" || name == "u" || name == "ul" || name == "var";
 }
 
 // The deepest the open elements go; Blink's parser stops at the same depth.
@@ -216,7 +257,10 @@ fn read_raw_text(p: Parser&, id: i32, name_start: i64, name_len: i64) {
     if name[..] == "style" || name[..] == "title" || name[..] == "textarea" {
         let t = append_node(p.d, NODE_TEXT, id);
         p.d.nodes[t].text = p.d.bytes.len as i32;
-        if name[..] == "style" {
+        if name[..] == "style" && svg_root(p) >= 0 {
+            // An <svg>'s style sheet may wrap its rules in CDATA markers.
+            unwrap_cdata(s[p.pos..end], p.d.bytes);
+        } else if name[..] == "style" {
             p.d.bytes.append(s[p.pos..end]);
         } else {
             decode_into(s, p.pos, end, p.d.bytes);
@@ -225,6 +269,18 @@ fn read_raw_text(p: Parser&, id: i32, name_start: i64, name_len: i64) {
     }
     p.pos = end;
     if p.pos < s.len { skip_past(p, ">"); }
+}
+
+// Appends `src` to `out` without the <![CDATA[ and ]]> around its sections.
+fn unwrap_cdata(src: const u8[:], out: u8[>..]&) {
+    var i: i64 = 0;
+    var open = false;
+    while i < src.len {
+        if !open && starts_with(src[i..], "<![CDATA[") { i += 9; open = true; continue; }
+        if open && starts_with(src[i..], "]]>") { i += 3; open = false; continue; }
+        out.push(src[i]);
+        i += 1;
+    }
 }
 
 // Whether s[i..] starts with `name` (any case) followed by the end of a tag name.
@@ -242,6 +298,11 @@ fn end_tag(p: Parser&) {
     while p.pos < s.len && !is_ws(s[p.pos]) && s[p.pos] != '>' { name.push(lower(s[p.pos])); p.pos += 1; }
     skip_past(p, ">");
     if name[..] == "html" || name[..] == "body" || name[..] == "head" { return; }
+    // </p> and </br> end foreign content first, as those start tags do.
+    if name[..] == "p" || name[..] == "br" {
+        let root = svg_root(p);
+        if root >= 0 { pop_to(p, root); }
+    }
     if name[..] == "br" {                    // browsers read a stray </br> as <br>
         p.in_body = true;
         let br = make_element(p.d, "br", current_parent(p));
@@ -371,7 +432,8 @@ fn find_open_row(p: Parser&) -> i64 {
     return -1;
 }
 
-// <!-- comments -->, <!DOCTYPE ...> and <![CDATA[ ... ]]> leave no node.
+// <!-- comments -->, <!DOCTYPE ...> and, outside foreign content,
+// <![CDATA[ ... ]]> leave no node.
 fn skip_declaration(p: Parser&) {
     let s = p.src;
     if p.pos + 3 < s.len && s[p.pos + 2] == '-' && s[p.pos + 3] == '-' {

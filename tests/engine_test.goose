@@ -844,6 +844,17 @@ fn test_svg() {
     // Inside <svg>, /> closes a tag; outside, an HTML element isn't void for it.
     check("svg tags that close themselves", tree_of("""<svg><path d="M0 0"/><circle r="1"/><g><rect/></g></svg><div/>x"""),
           "#document\n  html\n    head\n    body\n      svg\n        path d=\"M0 0\"\n        circle r=\"1\"\n        g\n          rect\n      div\n        \"x\"\n");
+    // An HTML element that SVG can't hold ends it, open or not; a
+    // <foreignObject> holds HTML; </p> ends it too.
+    check("html ends svg content", tree_of("""<p>one</p><svg><circle/><p>two</p><div>three</div>"""),
+          "#document\n  html\n    head\n    body\n      p\n        \"one\"\n      svg\n        circle\n      p\n        \"two\"\n      div\n        \"three\"\n");
+    check("foreignObject and font in svg", tree_of("""<svg><foreignObject><div>a</div></foreignObject><font>b</font><font color=red>c</font>"""),
+          "#document\n  html\n    head\n    body\n      svg\n        foreignobject\n          div\n            \"a\"\n        font\n          \"b\"\n      font color=\"red\"\n        \"c\"\n");
+    check("</p> and </br> end svg content", tree_of("""<svg><circle/></p>b<svg><rect/></br>c"""),
+          "#document\n  html\n    head\n    body\n      svg\n        circle\n      \"b\"\n      svg\n        rect\n      br\n      \"c\"\n");
+    // In SVG a CDATA section is text, and a style sheet's rules may be in one.
+    check("cdata in svg", tree_of("""<svg><style><![CDATA[.a{}]]></style><text><![CDATA[x<y]]></text></svg><![CDATA[gone]]>"""),
+          "#document\n  html\n    head\n    body\n      svg\n        style\n          \".a{}\"\n        text\n          \"x<y\"\n");
 
     // Paint from CSS and presentation attributes, which any rule beats; a
     // url() paint takes its fallback, else none.
