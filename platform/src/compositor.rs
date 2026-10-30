@@ -24,7 +24,7 @@ use objc2_quartz_core::CAMetalDrawable;
 
 use crate::cg::*;
 use crate::text::{Atlas, PHASES, Text, with_text};
-use crate::{ERR_ARGUMENT, ERR_METAL, GSlice, guarded};
+use crate::{ERR_ARGUMENT, ERR_METAL, ERR_NO_DEVICE, GSlice, guarded};
 
 // Display item kinds; engine/layout.goose mirrors these numbers.
 pub const ITEM_RECT: i32 = 1;
@@ -143,7 +143,7 @@ pub struct Compositor {
 
 impl Compositor {
     fn new() -> Result<Self, i32> {
-        let device = MTLCreateSystemDefaultDevice().ok_or(ERR_METAL)?;
+        let device = MTLCreateSystemDefaultDevice().ok_or(ERR_NO_DEVICE)?;
         let queue = device.newCommandQueue().ok_or(ERR_METAL)?;
         let library = device
             .newLibraryWithSource_options_error(&NSString::from_str(SHADERS), None)

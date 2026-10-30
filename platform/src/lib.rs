@@ -40,6 +40,7 @@ pub(crate) const ERR_NOT_MAIN_THREAD: i32 = -1;
 pub(crate) const ERR_NOT_OPEN: i32 = -2;
 pub(crate) const ERR_METAL: i32 = -3;
 pub(crate) const ERR_ARGUMENT: i32 = -4;
+pub(crate) const ERR_NO_DEVICE: i32 = -5;
 pub(crate) const ERR_PANIC: i32 = -100;
 
 // Event kinds; the Goose side mirrors these numbers.
