@@ -28,11 +28,13 @@ use objc2::{AllocAnyThread, ClassType, MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEvent,
     NSEventMask, NSEventModifierFlags, NSEventType, NSTrackingArea, NSTrackingAreaOptions,
-    NSWindow, NSWindowStyleMask,
+    NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
-use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString, NSUserDefaults,
+};
 use objc2_metal::MTLPixelFormat;
 use objc2_quartz_core::{CAMetalLayer, kCAGravityTopLeft};
 
@@ -139,6 +141,30 @@ struct Platform {
     tracking: Retained<NSTrackingArea>, // the content's, whose exit is the pointer leaving
     pressed: u32,   // the buttons whose presses Goose was given, bit b for button b
     at: (f64, f64), // where the pointer was last, in the content
+    bar: Bar,
+}
+
+/// The window's own bar, when Goose draws one (tp_open): its height, where
+/// the traffic lights start in it, and where a press drags the window
+/// (tp_set_drag_regions). Rects are x, y, w, h in points from the content's
+/// top left.
+#[derive(Default)]
+struct Bar {
+    height: f64, // 0: none, and the system's title bar shows
+    lights_x: f64,
+    full_screen: bool, // the window is, and its title bar is AppKit's
+    drag: Vec<[f64; 4]>,
+    holes: Vec<[f64; 4]>, // controls inside the drag regions
+}
+
+impl Bar {
+    /// Whether a press at (x, y) is AppKit's, to drag the window (or zoom
+    /// it, on a double click, or press a traffic light): in a drag region,
+    /// on none of its controls.
+    fn drags(&self, x: f64, y: f64) -> bool {
+        let inside = |r: &[f64; 4]| x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3];
+        self.height > 0.0 && self.drag.iter().any(inside) && !self.holes.iter().any(inside)
+    }
 }
 
 thread_local! {
@@ -166,12 +192,24 @@ fn with_platform(f: impl FnOnce(&mut Platform) -> Result<i32, i32>) -> Result<i3
     })
 }
 
-/// Opens the browser window with a Metal layer. Call once, on the main thread.
+/// Opens the browser window with a Metal layer, `width` × `height` points.
+/// With `bar` above 0 Goose draws the window's bar, that tall: the content
+/// takes the whole window, the system's title bar is see-through and its
+/// title hidden, and the traffic lights sit in Goose's bar, centred down it
+/// and starting `lights_x` across. Call once, on the main thread.
 #[unsafe(no_mangle)]
-pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: i64) -> i32 {
+pub extern "C" fn tp_open(
+    width: f64,
+    height: f64,
+    bar: f64,
+    lights_x: f64,
+    title: *const u8,
+    title_len: i64,
+) -> i32 {
     guarded(|| {
         let mtm = MainThreadMarker::new().ok_or(ERR_NOT_MAIN_THREAD)?;
-        if !(width > 0.0 && height > 0.0) || title_len < 0 || (title.is_null() && title_len > 0) {
+        let sizes = width > 0.0 && height > 0.0 && (0.0..height).contains(&bar) && lights_x >= 0.0;
+        if !sizes || title_len < 0 || (title.is_null() && title_len > 0) {
             return Err(ERR_ARGUMENT);
         }
         let title = if title_len == 0 {
@@ -186,10 +224,13 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
         app.finishLaunching();
 
         let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
-        let style = NSWindowStyleMask::Titled
+        let mut style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable
             | NSWindowStyleMask::Resizable;
+        if bar > 0.0 {
+            style |= NSWindowStyleMask::FullSizeContentView;
+        }
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -201,6 +242,14 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
         };
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str(&title));
+        if bar > 0.0 {
+            // The window is the size asked for, its content all of it.
+            window.setTitlebarAppearsTransparent(true);
+            window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+            let mut frame = window.frame();
+            frame.size = NSSize::new(width, height);
+            window.setFrame_display(frame, false);
+        }
         window.center();
 
         let device = with_compositor(|c| Ok(c.device.clone()))?;
@@ -275,9 +324,104 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
                 tracking,
                 pressed: 0,
                 at: (-1.0, -1.0),
+                bar: Bar {
+                    height: bar,
+                    lights_x,
+                    ..Default::default()
+                },
             })
         });
-        Ok(0)
+        with_platform(|p| {
+            place_lights(p);
+            Ok(0)
+        })
+    })
+}
+
+/// Puts the traffic lights in Goose's bar: AppKit's title bar made as tall
+/// as it, and the three buttons centred down it from `lights_x`, as far
+/// apart as AppKit puts them. AppKit lays its title bar out again now and
+/// then (a resize, a new title), so this runs after every event, and moves
+/// nothing when they are where they should be.
+fn place_lights(p: &Platform) {
+    // In full screen the title bar is AppKit's, in a strip of its own that
+    // slides down when the pointer goes to the top: it is left as it is.
+    if p.bar.height <= 0.0 || p.window.styleMask().contains(NSWindowStyleMask::FullScreen) {
+        return;
+    }
+    let kinds = [
+        NSWindowButton::CloseButton,
+        NSWindowButton::MiniaturizeButton,
+        NSWindowButton::ZoomButton,
+    ];
+    let buttons: Vec<_> = kinds
+        .iter()
+        .filter_map(|&k| p.window.standardWindowButton(k))
+        .collect();
+    let (Some(close), Some(next)) = (buttons.first(), buttons.get(1)) else {
+        return;
+    };
+    let (c, n) = (close.frame(), next.frame());
+    let y = ((p.bar.height - c.size.height) / 2.0).round();
+    if c.origin.x == p.bar.lights_x && c.origin.y == y {
+        return;
+    }
+    let step = n.origin.x - c.origin.x;
+    let Some(container) = (unsafe { close.superview() }).and_then(|v| unsafe { v.superview() })
+    else {
+        return;
+    };
+    let mut frame = container.frame();
+    frame.size.height = p.bar.height;
+    frame.origin.y = p.window.frame().size.height - p.bar.height;
+    container.setFrame(frame);
+    for (k, b) in buttons.iter().enumerate() {
+        b.setFrameOrigin(NSPoint::new(p.bar.lights_x + step * k as f64, y));
+    }
+}
+
+/// Where the traffic lights end across Goose's bar, in points: the zoom
+/// button's right edge. 0 without a bar, or a window. Their size and gaps
+/// are AppKit's, and differ between versions of macOS.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_lights_end() -> f64 {
+    let mut end = 0.0;
+    guarded(|| {
+        with_platform(|p| {
+            if p.bar.height > 0.0
+                && let Some(zoom) = p.window.standardWindowButton(NSWindowButton::ZoomButton)
+            {
+                let f = zoom.frame();
+                end = f.origin.x + f.size.width;
+            }
+            Ok(0)
+        })
+    });
+    end
+}
+
+/// Where a press in Goose's bar drags the window: `drag` and `holes` hold
+/// x, y, w, h rects in points from the content's top left, four numbers
+/// each; a press in a drag rect and in no hole is AppKit's, which moves the
+/// window, zooms it on a double click, or presses a traffic light. Every
+/// other press in the bar is Goose's.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_set_drag_regions(drag: GSlice<f32>, holes: GSlice<f32>) -> i32 {
+    guarded(|| {
+        let rects = |g: &GSlice<f32>| -> Result<Vec<[f64; 4]>, i32> {
+            let n = g.count().ok_or(ERR_ARGUMENT)?;
+            if n % 4 != 0 {
+                return Err(ERR_ARGUMENT);
+            }
+            Ok((0..n / 4)
+                .map(|r| std::array::from_fn(|i| unsafe { g.get(r * 4 + i) } as f64))
+                .collect())
+        };
+        let (drag, holes) = (rects(&drag)?, rects(&holes)?);
+        with_platform(|p| {
+            (p.bar.drag, p.bar.holes) = (drag, holes);
+            Ok(0)
+        })
     })
 }
 
@@ -342,15 +486,56 @@ fn take(p: &mut Platform, until: &NSDate) -> bool {
             )
         };
         let Some(ev) = next else { return false };
-        let translated = translate(p, &ev);
+        let kind = ev.r#type();
+        let pressing = [
+            NSEventType::LeftMouseDown,
+            NSEventType::RightMouseDown,
+            NSEventType::OtherMouseDown,
+        ];
+        // The pointer over another of AppKit's windows (the title bar's own
+        // strip in full screen, a menu) is AppKit's alone: its position is
+        // in that window, not ours.
+        let elsewhere = is_pointer(kind) && ev.windowNumber() != p.window.windowNumber();
+        // A press in Goose's bar: AppKit's where it drags the window, else
+        // Goose's alone, so that AppKit's title bar under it doesn't start
+        // a drag from a control.
+        let (mut appkits, mut in_bar, mut double) = (false, false, false);
+        if p.bar.height > 0.0 && pressing.contains(&kind) && !elsewhere {
+            let at = ev.locationInWindow();
+            let (x, y) = (at.x, p.size.1 - at.y);
+            appkits = kind == NSEventType::LeftMouseDown && p.bar.drags(x, y);
+            in_bar = y < p.bar.height && !appkits;
+            double = appkits && ev.clickCount() == 2;
+        }
+        let translated = if appkits || elsewhere {
+            None
+        } else {
+            translate(p, &ev)
+        };
         // Our own wake events and key presses stop here: AppKit would beep
         // at keys no responder handles.
-        let kind = ev.r#type();
         let ours = kind == NSEventType::ApplicationDefined && ev.subtype().0 == OURS;
-        if !ours && kind != NSEventType::KeyDown {
+        if double {
+            // With its title bar see-through, AppKit leaves a double click
+            // on it to the app: it does what System Settings says.
+            let key = NSString::from_str("AppleActionOnDoubleClick");
+            let pref = NSUserDefaults::standardUserDefaults().stringForKey(&key);
+            match title_click(pref.map(|s| s.to_string()).as_deref()) {
+                TitleClick::Zoom => p.window.zoom(None),
+                TitleClick::Minimize => p.window.miniaturize(None),
+                TitleClick::Nothing => {}
+            }
+        } else if in_bar {
+            // What a click would have done: bring the window and Tusk forward.
+            if !p.window.isKeyWindow() {
+                p.window.makeKeyAndOrderFront(None);
+                p.app.activate();
+            }
+        } else if !ours && kind != NSEventType::KeyDown {
             p.app.sendEvent(&ev);
         }
         check_window(p);
+        place_lights(p);
         if let Some(e) = translated {
             let phase = if kind == NSEventType::ScrollWheel {
                 ev.phase().0 as u64 | (ev.momentumPhase().0 as u64) << 32
@@ -362,11 +547,6 @@ fn take(p: &mut Platform, until: &NSDate) -> bool {
         // A press can start a loop of AppKit's own (a menu, a window drag)
         // that keeps its release: Goose gets the release of each press it
         // was given whose button is up now, unless that is still to come.
-        let pressing = [
-            NSEventType::LeftMouseDown,
-            NSEventType::RightMouseDown,
-            NSEventType::OtherMouseDown,
-        ];
         if p.pressed != 0 && pressing.contains(&kind) {
             let held = NSEvent::pressedMouseButtons() as u32;
             for button in 0..32 {
@@ -387,6 +567,37 @@ fn take(p: &mut Platform, until: &NSDate) -> bool {
         }
         true
     })
+}
+
+/// Whether an AppKit event is the pointer's: a press, a release, a move, a
+/// scroll, or its entering or leaving.
+fn is_pointer(kind: NSEventType) -> bool {
+    pointer(kind, 0).is_some()
+        || [
+            NSEventType::ScrollWheel,
+            NSEventType::MouseEntered,
+            NSEventType::MouseExited,
+        ]
+        .contains(&kind)
+}
+
+/// What a double click on a window's title bar does: System Settings'
+/// "Double-click a window's title bar to", as AppleActionOnDoubleClick
+/// holds it. Zoom when it was never set; Fill fills the screen, which zoom
+/// comes closest to.
+#[derive(Debug, PartialEq)]
+enum TitleClick {
+    Zoom,
+    Minimize,
+    Nothing,
+}
+
+fn title_click(pref: Option<&str>) -> TitleClick {
+    match pref {
+        Some("Minimize") => TitleClick::Minimize,
+        Some("None") => TitleClick::Nothing,
+        _ => TitleClick::Zoom,
+    }
 }
 
 /// Whether AppKit holds a release of `button` still to be taken.
@@ -542,8 +753,23 @@ fn queue(pending: &mut VecDeque<(GpEvent, u64)>, e: GpEvent, phase: u64) {
     pending.push_back((e, phase));
 }
 
-/// After AppKit has handled an event: notice a closed window or a new size.
+/// After AppKit has handled an event: notice a closed window or a new size,
+/// and the window going full screen or coming back.
 fn check_window(p: &mut Platform) {
+    // In full screen AppKit shows the title bar, with the traffic lights, in
+    // a strip that slides down with the menu bar: an opaque one, with its
+    // title, or it shows nothing there. Back in a window, the bar is Goose's
+    // again.
+    let full = p.window.styleMask().contains(NSWindowStyleMask::FullScreen);
+    if p.bar.height > 0.0 && full != p.bar.full_screen {
+        p.bar.full_screen = full;
+        p.window.setTitlebarAppearsTransparent(!full);
+        p.window.setTitleVisibility(if full {
+            NSWindowTitleVisibility::Visible
+        } else {
+            NSWindowTitleVisibility::Hidden
+        });
+    }
     // A minimized window, and every window of a hidden app, isn't visible
     // either: only a window that is none of these has been closed.
     let closed = !p.window.isVisible() && !p.window.isMiniaturized() && !p.app.isHidden();
@@ -655,6 +881,7 @@ pub extern "C" fn tp_set_title(title: GSlice<u8>) -> i32 {
         with_platform(|p| {
             p.window
                 .setTitle(&NSString::from_str(&String::from_utf8_lossy(title)));
+            place_lights(p);
             Ok(0)
         })
     })
@@ -758,7 +985,7 @@ mod tests {
         // refuse with an error code instead of crashing.
         let title = b"Tusk";
         assert_eq!(
-            tp_open(800.0, 600.0, title.as_ptr(), title.len() as i64),
+            tp_open(800.0, 600.0, 40.0, 14.0, title.as_ptr(), title.len() as i64),
             ERR_NOT_MAIN_THREAD
         );
         let mut e = GpEvent::default();
@@ -871,5 +1098,54 @@ mod tests {
     #[test]
     fn bad_arguments_are_rejected() {
         assert_eq!(tp_next_event(0, std::ptr::null_mut()), ERR_ARGUMENT);
+    }
+
+    #[test]
+    fn a_press_drags_the_window_in_a_drag_region_off_its_controls() {
+        let bar = Bar {
+            height: 40.0,
+            lights_x: 14.0,
+            full_screen: false,
+            drag: vec![[0.0, 0.0, 1200.0, 40.0]],
+            holes: vec![[72.0, 6.0, 80.0, 28.0], [290.0, 6.0, 620.0, 28.0]],
+        };
+        assert!(bar.drags(20.0, 20.0)); // the traffic lights
+        assert!(bar.drags(200.0, 39.0)); // between controls
+        assert!(!bar.drags(100.0, 20.0)); // the plate
+        assert!(!bar.drags(500.0, 20.0)); // the address
+        assert!(!bar.drags(200.0, 40.0)); // below the bar
+        assert!(!bar.drags(1200.0, 20.0)); // past its right edge
+        let none = Bar { height: 0.0, ..bar };
+        assert!(!none.drags(20.0, 20.0));
+    }
+
+    #[test]
+    fn a_double_click_on_the_bar_does_what_system_settings_say() {
+        assert_eq!(title_click(None), TitleClick::Zoom);
+        assert_eq!(title_click(Some("Maximize")), TitleClick::Zoom);
+        assert_eq!(title_click(Some("Fill")), TitleClick::Zoom);
+        assert_eq!(title_click(Some("Minimize")), TitleClick::Minimize);
+        assert_eq!(title_click(Some("None")), TitleClick::Nothing);
+    }
+
+    #[test]
+    fn the_pointers_events_are_told_from_the_rest() {
+        for kind in [
+            NSEventType::LeftMouseDown,
+            NSEventType::RightMouseUp,
+            NSEventType::MouseMoved,
+            NSEventType::OtherMouseDragged,
+            NSEventType::ScrollWheel,
+            NSEventType::MouseExited,
+        ] {
+            assert!(is_pointer(kind), "{kind:?}");
+        }
+        for kind in [
+            NSEventType::KeyDown,
+            NSEventType::ApplicationDefined,
+            NSEventType::FlagsChanged,
+        ] {
+            assert!(!is_pointer(kind), "{kind:?}");
+        }
     }
 }

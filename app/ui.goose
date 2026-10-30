@@ -25,11 +25,12 @@ extern "tusk_platform" {
 // The files the interface is made of, read once.
 struct UiFiles { css: u8[>..]&, sprite: u8[>..]&, rest: u8[>..]&, run: u8[>..]& }
 
-// What the interface shows that isn't a tab's: the window's size, which tab
-// is shown, the dev panel and its tab, the window's oil (MB), CPU (%) and
-// frames a second, and whether the boar is out running a load.
+// What the interface shows that isn't a tab's: the window's size, where the
+// traffic lights end in its bar (0: none), which tab is shown, the dev panel
+// and its tab, the window's oil (MB), CPU (%) and frames a second, and
+// whether the boar is out running a load.
 struct Ui {
-    w: f32, h: f32, cur: i64, dev: bool, dev_tab: i32,
+    w: f32, h: f32, lights: f32, cur: i64, dev: bool, dev_tab: i32,
     oil: f32, cpu: f32, fps: i32, running: bool,
 }
 
@@ -142,23 +143,32 @@ fn ui_html(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, frames: const f32[:
 // The top bar: the board, back, forward, reload, the address; then board
 // view, the command bar and the dev panel's switch.
 fn bar(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
-    out.append("<div class=\"bar\"><span class=\"plate\"><span class=\"bn\">");
+    // The design leaves the traffic lights up to 72 points; AppKit's own may
+    // need more, and the plate, the arrows and the address make way.
+    let shift = max(U.lights + 10.0 - 72.0, 0.0);
+    out.append("<div class=\"bar\" data-drag><span class=\"plate\" data-nodrag style=\"left:");
+    px(out, 72.0 + shift);
+    out.append("\"><span class=\"bn\">");
     esc(out, board_of(T));
     out.append("</span>");
     icon(out, "i-chev-r");
-    out.append("</span><span class=\"nav\">");
+    out.append("</span><span class=\"nav\" data-nodrag style=\"left:");
+    px(out, 168.0 + shift);
+    out.append("\">");
     icon(out, "i-chev-l");
     icon(out, "i-chev-r");
     icon(out, "i-reload");
-    out.append("</span><span class=\"url\" style=\"width:");
-    px(out, max(U.w - 290.0 - 190.0, 120.0));
+    out.append("</span><span class=\"url\" data-nodrag style=\"left:");
+    px(out, 290.0 + shift);
+    out.append("; width:");
+    px(out, max(U.w - 290.0 - shift - 190.0, 120.0));
     out.append("\"><span class=\"env\">FILE</span><span class=\"u\"><i>file://</i>");
     let p = path_of(T, U.cur);
     let name = T.names[U.cur] - (if U.cur == 0 { 0 } else { T.path_ends[U.cur - 1] });
     esc(out, p[..name]);
     out.append("<b>");
     esc(out, p[name..]);
-    out.append("</b></span></span><span class=\"tools\"><span class=\"bv\">");
+    out.append("</b></span></span><span class=\"tools\" data-nodrag><span class=\"bv\">");
     icon(out, "i-grid");
     out.append("<kbd>⌘B</kbd></span><kbd>⌘K</kbd><span");
     if U.dev { out.append(" class=\"on\""); }
@@ -572,9 +582,12 @@ fn fract(v: f32) -> f32 { return v - floor(v); }
 // ------------------------------------------------------------------ laying it out
 
 // Lays document `html` out `w` × `h` at `scale` into layer `layer`, and finds
-// its slot: the box of the element with data-slot (none: a width of 0).
+// its slot: the box of the element with data-slot (none: a width of 0); and
+// where a press drags the window: the boxes of the elements with data-drag
+// into `drag`, and of those with data-nodrag into `holes`, x, y, w, h each.
 // Returns what it took, in ms.
-fn show_doc(html: const u8[:], w: f32, h: f32, scale: f32, layer: i32, slot: Rect&) -> f32 {
+fn show_doc(html: const u8[:], w: f32, h: f32, scale: f32, layer: i32, slot: Rect&,
+            drag: f32[>..<]&, holes: f32[>..<]&) -> f32 {
     let t0 = clock_ns();
     var nodes: Node[>..] = [];
     var attrs: Attr[>..] = [];
@@ -616,10 +629,12 @@ fn show_doc(html: const u8[:], w: f32, h: f32, scale: f32, layer: i32, slot: Rec
     for n, k in nodes {
         guard n.kind == NODE_ELEMENT && k < boxes.len else { continue; }
         let v, has = attr_value(d, k as i32, "data-slot");
-        if has {
-            slot = boxes[k];
-            break;
-        }
+        if has { slot = boxes[k]; }
+        let dv, dragged = attr_value(d, k as i32, "data-drag");
+        let hv, hole = attr_value(d, k as i32, "data-nodrag");
+        let b = boxes[k];
+        if dragged { drag.push(b.x); drag.push(b.y); drag.push(b.w); drag.push(b.h); }
+        if hole { holes.push(b.x); holes.push(b.y); holes.push(b.w); holes.push(b.h); }
     }
     let rc = tp_set_layer(layer, items[..], text[..], paths[..], scale);
     if rc != 0 {

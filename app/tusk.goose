@@ -54,7 +54,9 @@ struct FrameStats {
 }
 
 extern "tusk_platform" {
-    fn tp_open(width: f64, height: f64, title: const u8&, title_len: i64) -> i32;
+    fn tp_open(width: f64, height: f64, bar: f64, lights_x: f64, title: const u8&, title_len: i64) -> i32;
+    fn tp_set_drag_regions(drag: const f32[:], holes: const f32[:]) -> i32;
+    fn tp_lights_end() -> f64;
     fn tp_next_event(timeout_ms: i64, out: Event&) -> i32;
     fn tp_render(background: u32) -> i32;
     fn tp_start_metal() -> i32;
@@ -110,6 +112,7 @@ let WINDOW_H: f32 = 760.0;
 let SNAPSHOT_W: f32 = 960.0;     // what a snapshot lays the page out at
 let SNAPSHOT_H: f32 = 694.0;
 let STEEL: u32 = 0xFF1D1F22;     // the window's colour under the interface
+let LIGHTS_X: f32 = 14.0;        // where the traffic lights start in the bar, as the design has them
 let SETTLE_MS: i64 = 5000;       // how long after a frame the oil is weighed again
 let TICK_MS: i64 = 500;          // how often the window's line is measured while frames come
 let RUN_AFTER_MS: i64 = 400;     // a load longer than this sends the boar running
@@ -246,8 +249,13 @@ fn show_ui(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, last_ms: f32, scale
     tp_frame_stats(stats, false);
     var html: u8[>..] = [];
     ui_html(F, U, tabs, T, times[..n], stats.dropped, last_ms, html);
-    let took = show_doc(html[..], U.w, U.h, scale, LAYER_UI, slot);
+    var drag: f32[>..<] = [];
+    var holes: f32[>..<] = [];
+    let took = show_doc(html[..], U.w, U.h, scale, LAYER_UI, slot, drag, holes);
     place_at(LAYER_UI, 0.0, 0);
+    // Pressed there, the bar moves the window; its controls are Goose's. No
+    // window, no regions (a screenshot).
+    tp_set_drag_regions(drag[..], holes[..]);
     return took;
 }
 
@@ -259,7 +267,9 @@ fn show_loader(F: UiFiles, U: Ui, t: f32, scale: f32) {
     var html: u8[>..] = [];
     loader_html(F, U.w, p, t, html);
     var none = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
-    show_doc(html[..], U.w, LOADER_H, scale, LAYER_LOADER, none);
+    var drag: f32[>..<] = [];
+    var holes: f32[>..<] = [];
+    show_doc(html[..], U.w, LOADER_H, scale, LAYER_LOADER, none, drag, holes);
     place_at(LAYER_LOADER, U.h - PANEL_H - LOADER_H, 2);
 }
 
@@ -408,7 +418,7 @@ fn main() {
     let T = UiText { paths: paths, path_ends: path_ends, names: names, notes: notes };
     // Its text is mostly what it was, each time it is laid out.
     tp_text_cache(SHAPE_CACHE);
-    var U = Ui { w: WINDOW_W, h: WINDOW_H, cur: 0, dev: true, dev_tab: dev_tab,
+    var U = Ui { w: WINDOW_W, h: WINDOW_H, lights: 0.0, cur: 0, dev: true, dev_tab: dev_tab,
                  oil: tp_memory_footprint() / 1048576.0, cpu: 0.0, fps: 0, running: false };
     var slot = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
 
@@ -460,11 +470,13 @@ fn main() {
     // The window opens at once, before any page is ready: its tabs come as
     // their workers finish.
     let title = "Tusk";
-    guard tp_open(WINDOW_W, WINDOW_H, title[0], title.len) == 0 else {
+    // The window's bar is the interface's: the traffic lights go in it.
+    guard tp_open(WINDOW_W, WINDOW_H, BAR_H, LIGHTS_X, title[0], title.len) == 0 else {
         write_stderr("tusk: could not open a window\n");
         exit(1);
         return;
     }
+    U.lights = tp_lights_end() as f32;
 
     var worker: i64 = -1;
     if mode == MODE_WAKE_TEST { worker = thread_spawn_contained(wake_after, 300, 42); }
