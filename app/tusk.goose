@@ -29,10 +29,13 @@ struct Event { kind: i32, code: i32, x: f64, y: f64, w: f64, h: f64 }
 
 // Where a layer goes (platform/src/compositor.rs, Place), in points: its
 // content's point (scroll_x, scroll_y) lands on the window's (x, y), and a, b,
-// c, d turn and scale it about there (all 0: none). With clip_w above 0 it
+// c, d turn and scale it about there (all 0: none). With clip_w 0 or more it
 // shows only inside its clip, measured from where it lands, its corners
-// rounded by radius; it is faded by opacity and drawn over the layers of a
-// lower z, and only when shown isn't 0. Placing a layer rebuilds nothing.
+// rounded by radius (at most half its shorter side); a clip with no area shows
+// nothing, and clip_w below 0 is none. Opacity fades each thing in it, so
+// where two overlap the one below shows through. It is drawn over the layers
+// of a lower z, and only when shown isn't 0. Points are at most 1e7 from 0
+// and a, b, c, d at most 1e4. Placing a layer rebuilds nothing.
 struct Place {
     x: f32, y: f32, scroll_x: f32, scroll_y: f32, a: f32, b: f32, c: f32, d: f32,
     clip_x: f32, clip_y: f32, clip_w: f32, clip_h: f32, radius: f32, opacity: f32, z: i32, shown: i32,
@@ -121,10 +124,12 @@ fn set_layer(layer: i32, items: const DItem[:], text: const u8[:], paths: const 
 }
 
 // The page's layer: scrolled by `scroll`, and shown only in its view, `width`
-// × `view_h` at the window's corner, which spares the GPU the rest.
+// × `view_h` at the window's corner, which spares the GPU the rest. A window
+// shorter than the bar has no view, and the page doesn't show.
 fn place_page(scroll: f32, width: f32, view_h: f32) {
     let p = Place { x: 0.0, y: 0.0, scroll_x: 0.0, scroll_y: scroll, a: 0.0, b: 0.0, c: 0.0, d: 0.0,
-                    clip_x: 0.0, clip_y: 0.0, clip_w: width, clip_h: view_h, radius: 0.0, opacity: 1.0, z: 0, shown: 1 };
+                    clip_x: 0.0, clip_y: 0.0, clip_w: max(width, 0.0), clip_h: max(view_h, 0.0),
+                    radius: 0.0, opacity: 1.0, z: 0, shown: 1 };
     let rc = tp_place_layer(LAYER_PAGE, p);
     guard rc != 0 else { return; }
     write_stderr(str("tusk: the compositor refused the page's place (error ", rc, ")\n"));

@@ -142,11 +142,15 @@ pub struct Instance {
 /// Where a layer goes, laid out as Goose's `struct Place`, in points: its
 /// content's point (`scroll_x`, `scroll_y`) lands on the window's (`x`, `y`),
 /// and the matrix `a`, `b`, `c`, `d` (as CSS's matrix() takes them; all 0 for
-/// none) turns and scales the layer about there. With `clip_w` above 0 it
+/// none) turns and scales the layer about there. With `clip_w` 0 or more it
 /// shows only inside its clip, a rectangle in its own space measured from that
-/// landing point, its corners rounded by `radius`. `opacity` fades it all; it
+/// landing point, its corners rounded by `radius` (at most half its shorter
+/// side); a clip with no area shows nothing, and `clip_w` below 0 is none.
+/// `opacity` fades each thing in the layer, so where two overlap the one
+/// below shows through: a layer isn't drawn to a texture of its own yet. It
 /// is drawn over the layers of a lower `z`, or of the same `z` and a lower
-/// number, and not at all when `shown` is 0.
+/// number, and not at all when `shown` is 0. Its points are at most 1e7 from
+/// 0, and its matrix's entries at most 1e4.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Place {
@@ -182,7 +186,7 @@ impl Default for Place {
             d: 0.0,
             clip_x: 0.0,
             clip_y: 0.0,
-            clip_w: 0.0,
+            clip_w: -1.0,
             clip_h: 0.0,
             radius: 0.0,
             opacity: 1.0,
@@ -193,6 +197,29 @@ impl Default for Place {
 }
 
 impl Place {
+    /// Whether tp_place_layer takes it: within the bounds the type's comment
+    /// gives (so nothing overflows once scaled, and NaN is out), a clip of no
+    /// negative height, a radius of 0 or more, opacity from 0 to 1.
+    fn valid(&self) -> bool {
+        let points = [
+            self.x,
+            self.y,
+            self.scroll_x,
+            self.scroll_y,
+            self.clip_x,
+            self.clip_y,
+            self.clip_w,
+            self.clip_h,
+            self.radius,
+        ];
+        let matrix = [self.a, self.b, self.c, self.d];
+        points.iter().all(|v| v.abs() <= 1e7)
+            && matrix.iter().all(|v| v.abs() <= 1e4)
+            && (self.clip_w < 0.0 || self.clip_h >= 0.0)
+            && self.radius >= 0.0
+            && (0.0..=1.0).contains(&{ self.opacity })
+    }
+
     /// Its matrix, or None for none (all 0, or the identity).
     fn matrix(&self) -> Option<[f32; 4]> {
         let m = [self.a, self.b, self.c, self.d];
@@ -233,12 +260,15 @@ vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
                        constant Uniforms& u [[buffer(1)]]) {
     Instance q = instances[i];
     float2 corner = float2(v & 1, v >> 1);
-    // A transformed box reaches a pixel or so further on screen, so that its
-    // edges' soft outer half is drawn too.
+    // A transformed box or rectangle, by its own transform or its layer's,
+    // reaches a pixel or so further on screen, so that its edges' soft outer
+    // half is drawn too.
     float2 lo = float2(0.0);
     float2 hi = q.rect.zw;
-    if (q.xt.z > 0.5 && q.border.z > 0.5) {
-        float pad = 1.0 / max(min(length(q.xf.xy), length(q.xf.zw)), 0.25);
+    if (max(q.xt.z, u.style.z) > 0.5 && q.uv.z == 0.0) {
+        float own = q.xt.z > 0.5 ? min(length(q.xf.xy), length(q.xf.zw)) : 1.0;
+        float layer = u.style.z > 0.5 ? min(length(u.matrix.xy), length(u.matrix.zw)) : 1.0;
+        float pad = 1.0 / max(own * layer, 0.25);
         lo -= pad;
         hi += pad;
     }
@@ -323,7 +353,8 @@ fragment float4 quad_fragment(Out in [[stage_in]], constant Uniforms& u [[buffer
                                     : (soft ? atlas.sample(between, in.uv).r : atlas.sample(nearest, in.uv).r);
         return in.color * (a * cover);
     }
-    if (in.border.z < 0.5) {
+    // A transformed rectangle's edges are smoothed as a box's are.
+    if (in.border.z < 0.5 && in.smooth < 0.5) {
         return in.color * cover;
     }
     // A box: covered inside its rounded edge, its borders between that edge
@@ -545,7 +576,7 @@ impl Compositor {
     }
 
     /// Encodes one frame into `target`: cleared to `background`, then each
-    /// layer, the page moved up by `scroll` device pixels.
+    /// layer in z order, where its place puts it.
     fn encode(
         &self,
         target: &ProtocolObject<dyn MTLTexture>,
@@ -701,11 +732,21 @@ fn uniforms(p: &Place, scale: f64, tw: usize, th: usize) -> Option<(Uniforms, MT
     let (ox, oy) = (snap(p.x * k), snap(p.y * k));
     let (sx, sy) = (snap(p.scroll_x * k), snap(p.scroll_y * k));
     let [a, b, c, d] = m.unwrap_or([1.0, 0.0, 0.0, 1.0]);
-    let clipped = p.clip_w > 0.0 && p.clip_h > 0.0;
+    let clipped = p.clip_w >= 0.0;
+    if clipped && (p.clip_w == 0.0 || p.clip_h == 0.0) {
+        return None;
+    }
     let clip = if clipped {
         [p.clip_x * k, p.clip_y * k, p.clip_w * k, p.clip_h * k]
     } else {
         [0.0; 4]
+    };
+    // A radius past half the clip's shorter side would bite into its middle:
+    // as in CSS, it is that half, a pill.
+    let radius = if clipped {
+        p.radius.min(p.clip_w.min(p.clip_h) / 2.0)
+    } else {
+        0.0
     };
     // The scissor: where the clip lands on the target, whole pixels out.
     let (mut x0, mut y0, mut x1, mut y1) = (0.0f32, 0.0f32, tw as f32, th as f32);
@@ -738,7 +779,7 @@ fn uniforms(p: &Place, scale: f64, tw: usize, th: usize) -> Option<(Uniforms, MT
         matrix: [a, b, c, d],
         clip,
         style: [
-            p.radius * k,
+            radius * k,
             p.opacity.min(1.0),
             if m.is_some() { 1.0 } else { 0.0 },
             0.0,
@@ -1218,16 +1259,7 @@ pub extern "C" fn tp_place_layer(layer: i32, place: *const Place) -> i32 {
             return Err(ERR_ARGUMENT);
         }
         let p = unsafe { place.read_unaligned() };
-        let numbers = [
-            p.x, p.y, p.scroll_x, p.scroll_y, p.a, p.b, p.c, p.d, p.clip_x, p.clip_y, p.clip_w,
-            p.clip_h, p.radius, p.opacity,
-        ];
-        if !numbers.iter().all(|v| v.is_finite())
-            || p.clip_w < 0.0
-            || p.clip_h < 0.0
-            || p.radius < 0.0
-            || !(0.0..=1.0).contains(&{ p.opacity })
-        {
+        if !p.valid() {
             return Err(ERR_ARGUMENT);
         }
         with_compositor(|c| {
@@ -1579,7 +1611,7 @@ mod tests {
             .collect();
         let (before, after) = with_compositor(|c| {
             c.set_layer(0, &items, b"", &[], 1.0)?;
-            let buffer = |c: &Compositor| c.layers[0].buffer.as_ref().map(|b| Retained::as_ptr(b));
+            let buffer = |c: &Compositor| c.layers[0].buffer.as_ref().map(Retained::as_ptr);
             let before = buffer(c);
             c.place(
                 0,
@@ -2222,5 +2254,280 @@ mod tests {
             }),
             None
         );
+        // A clip of no area, or a layer faded out: nothing either. A clip off
+        // the target's edge is cut at the edge, and one between pixels covers
+        // every pixel it touches.
+        for (w, h) in [(0.0, 3.0), (4.0, 0.0)] {
+            let empty = Place {
+                clip_x: 0.3,
+                clip_w: w,
+                clip_h: h,
+                ..clipped
+            };
+            assert_eq!(scissor(empty), None);
+        }
+        assert_eq!(
+            scissor(Place {
+                opacity: 0.0,
+                ..Place::default()
+            }),
+            None
+        );
+        let edge = Place {
+            x: -5.0,
+            y: 45.0,
+            clip_w: 10.0,
+            clip_h: 10.0,
+            ..Place::default()
+        };
+        assert_eq!(scissor(edge), Some((0, 90, 10, 10)));
+        let corner = Place {
+            x: 95.0,
+            y: -3.0,
+            ..edge
+        };
+        assert_eq!(scissor(corner), Some((190, 0, 10, 14)));
+        let between = Place {
+            clip_x: 0.6,
+            clip_y: 0.2,
+            clip_w: 4.0,
+            clip_h: 1.0,
+            ..Place::default()
+        };
+        let at_one = uniforms(&between, 1.0, 200, 100).map(|(_, r)| (r.x, r.y, r.width, r.height));
+        assert_eq!(at_one, Some((0, 0, 5, 2)));
+    }
+
+    #[test]
+    fn an_unturned_layer_lands_on_whole_pixels() {
+        let place = Place {
+            x: 10.3,
+            y: 5.6,
+            scroll_x: 0.2,
+            scroll_y: 2.7,
+            ..Place::default()
+        };
+        let (u, _) = uniforms(&place, 2.0, 200, 100).unwrap();
+        assert_eq!(&u.view[2..], &[21.0, 11.0]);
+        assert_eq!(&u.scroll[..2], &[0.0, 5.0]);
+        // Turned, it lands where it says: its glyphs are smoothed anyway.
+        let turned = Place {
+            b: 1.0,
+            c: -1.0,
+            ..place
+        };
+        let (u, _) = uniforms(&turned, 2.0, 200, 100).unwrap();
+        assert!((u.view[2] - 20.6).abs() < 1e-4 && (u.view[3] - 11.2).abs() < 1e-4);
+        assert!((u.scroll[0] - 0.4).abs() < 1e-4 && (u.scroll[1] - 5.4).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_layer_clip_scales_and_its_radius_stops_at_a_pill() {
+        let clip = |radius: f32| {
+            let place = Place {
+                clip_x: 1.0,
+                clip_w: 20.0,
+                clip_h: 10.0,
+                radius,
+                ..Place::default()
+            };
+            let (u, _) = uniforms(&place, 2.0, 200, 100).unwrap();
+            (u.clip, u.style[0])
+        };
+        assert_eq!(clip(3.0), ([2.0, 0.0, 40.0, 20.0], 6.0));
+        assert_eq!(clip(50.0).1, 10.0);
+        // No clip, no rounding.
+        let (u, _) = uniforms(
+            &Place {
+                radius: 5.0,
+                ..Place::default()
+            },
+            2.0,
+            200,
+            100,
+        )
+        .unwrap();
+        assert_eq!((u.clip, u.style[0]), ([0.0; 4], 0.0));
+    }
+
+    #[test]
+    fn places_out_of_bounds_are_refused() {
+        let ok = Place::default();
+        assert!(ok.valid());
+        assert!(
+            Place {
+                clip_w: -1.0,
+                clip_h: -5.0,
+                ..ok
+            }
+            .valid()
+        );
+        let bad = [
+            Place { x: f32::NAN, ..ok },
+            Place {
+                scroll_y: f32::INFINITY,
+                ..ok
+            },
+            Place { y: 2e7, ..ok },
+            Place { radius: -2e7, ..ok },
+            Place { a: 2e4, ..ok },
+            Place { d: -2e4, ..ok },
+            Place {
+                clip_w: 5.0,
+                clip_h: -1.0,
+                ..ok
+            },
+            Place { radius: -1.0, ..ok },
+            Place { opacity: 1.5, ..ok },
+            Place {
+                opacity: -0.5,
+                ..ok
+            },
+            Place {
+                opacity: f32::NAN,
+                ..ok
+            },
+        ];
+        for p in bad {
+            assert!(!p.valid(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn place_matches_the_goose_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<Place>(), 64);
+        let offsets = [
+            offset_of!(Place, x),
+            offset_of!(Place, y),
+            offset_of!(Place, scroll_x),
+            offset_of!(Place, scroll_y),
+            offset_of!(Place, a),
+            offset_of!(Place, b),
+            offset_of!(Place, c),
+            offset_of!(Place, d),
+            offset_of!(Place, clip_x),
+            offset_of!(Place, clip_y),
+            offset_of!(Place, clip_w),
+            offset_of!(Place, clip_h),
+            offset_of!(Place, radius),
+            offset_of!(Place, opacity),
+            offset_of!(Place, z),
+            offset_of!(Place, shown),
+        ];
+        assert_eq!(offsets, std::array::from_fn(|k| k * 4));
+    }
+
+    #[test]
+    fn a_dropped_layer_is_gone_and_restacked() {
+        if MTLCreateSystemDefaultDevice().is_none() {
+            return;
+        }
+        let red = [rect(0.0, 0.0, 4.0, 4.0, 0xFFFF_0000)];
+        let blue = [rect(0.0, 0.0, 4.0, 4.0, 0xFF00_00FF)];
+        let (gone, buffer, restacked) = with_compositor(|c| {
+            c.set_layer(0, &red, b"", &[], 1.0)?;
+            c.place(0, Place::default());
+            // Blue under red by its z, then dropped: red alone.
+            c.set_layer(1, &blue, b"", &[], 1.0)?;
+            c.place(
+                1,
+                Place {
+                    z: -1,
+                    ..Place::default()
+                },
+            );
+            c.drop_layer(1);
+            let gone = c.render_pixels(8, 8, 0xFFFF_FFFF)?;
+            let buffer = c.layers[1].buffer.is_some();
+            // Set again and placed at z 0, it is over red by its number: the
+            // drop took its old z out of the order.
+            c.set_layer(1, &blue, b"", &[], 1.0)?;
+            c.place(1, Place::default());
+            Ok((gone, buffer, c.render_pixels(8, 8, 0xFFFF_FFFF)?))
+        })
+        .unwrap();
+        assert_eq!(pixel(&gone, 8, 1, 1), RED);
+        assert!(!buffer);
+        assert_eq!(pixel(&restacked, 8, 1, 1), BLUE);
+    }
+
+    #[test]
+    fn a_layer_is_drawn_at_its_scale() {
+        if MTLCreateSystemDefaultDevice().is_none() {
+            return;
+        }
+        let square = [rect(1.0, 1.0, 4.0, 4.0, 0xFFFF_0000)];
+        let p = with_compositor(|c| {
+            c.set_layer(0, &square, b"", &[], 2.0)?;
+            c.place(
+                0,
+                Place {
+                    clip_w: 4.0,
+                    clip_h: 4.0,
+                    ..Place::default()
+                },
+            );
+            c.set_layer(1, &[], b"", &[], 2.0)?;
+            c.place(1, Place::default());
+            c.render_pixels(16, 16, 0xFFFF_FFFF)
+        })
+        .unwrap();
+        // The square covers device pixels 2 to 10; the clip, in points,
+        // stops it at 8.
+        assert_eq!(pixel(&p, 16, 1, 1), WHITE);
+        assert_eq!(pixel(&p, 16, 2, 2), RED);
+        assert_eq!(pixel(&p, 16, 7, 7), RED);
+        assert_eq!(pixel(&p, 16, 8, 8), WHITE);
+        assert_eq!(pixel(&p, 16, 9, 3), WHITE);
+    }
+
+    #[test]
+    fn a_turned_layer_smooths_edges_as_a_turned_item_does() {
+        // A plain rectangle and a rounded, bordered box, turned 30 degrees (and
+        // shrunk) and moved by their own transform, or by their layer's: the
+        // same pixels.
+        let (s, c) = (30f32.to_radians().sin(), 30f32.to_radians().cos());
+        let items = [
+            rect(0.0, 0.0, 40.0, 20.0, 0xFFFF_0000),
+            boxed(0.0, 0.0, 40.0, 20.0, 0xFFFF_0000, 6.0, 2.0, 0xFF00_00FF, 1),
+        ];
+        for (item, k) in [
+            (items[0], 1.0),
+            (items[1], 1.0),
+            (items[0], 0.3),
+            (items[1], 0.3),
+        ] {
+            let (s, c) = (s * k, c * k);
+            let mut own = item;
+            (own.m_a, own.m_b, own.m_c, own.m_d, own.m_e, own.m_f) = (c, s, -s, c, 24.0, 4.0);
+            let Some(by_item) =
+                drawn_placed(&[own], Place::default(), &[], Place::default(), 64, 48)
+            else {
+                return;
+            };
+            let turned = Place {
+                x: 24.0,
+                y: 4.0,
+                a: c,
+                b: s,
+                c: -s,
+                d: c,
+                ..Place::default()
+            };
+            let by_layer = drawn_placed(&[item], turned, &[], Place::default(), 64, 48).unwrap();
+            let soft = by_item
+                .chunks(4)
+                .filter(|p| (16..240).contains(&p[1]))
+                .count();
+            assert!(soft > 12, "{soft} soft pixels");
+            let worst = by_item
+                .iter()
+                .zip(&by_layer)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(worst <= 2, "{worst}");
+        }
     }
 }
