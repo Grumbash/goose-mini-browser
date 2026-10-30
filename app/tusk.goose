@@ -200,6 +200,9 @@ fn read_replies(tabs: Tab[>..]&, k: i64, notes: u8[>..]&, head: ReplyHead&, text
         } else if head.kind == REPLY_ELEMENTS {
             tabs[k].elems_at = notes.len;
             tabs[k].elems_len = text.len;
+        } else if head.kind == REPLY_LOG {
+            tabs[k].log_at = notes.len;
+            tabs[k].log_len = text.len;
         } else if head.kind == REPLY_URL {
             // Where the page ended up, after its redirects.
             tabs[k].status = head.value;
@@ -412,7 +415,7 @@ fn main() {
         let worker = thread_spawn_contained(tab_worker, k as i32, str(paths[start..end]), profile);
         tabs.push(Tab { worker: worker, ready: false, failed: false, info: info, paint: 0.0, waiting: false, scroll: 0.0,
                         opened: opened, load_ms: 0.0, status: 0, loc_at: start, loc_len: end - start, title_at: 0,
-                        title_len: 0, why_at: 0, why_len: 0, elems_at: 0, elems_len: 0 });
+                        title_len: 0, why_at: 0, why_len: 0, log_at: 0, log_len: 0, elems_at: 0, elems_len: 0 });
         start = end;
     }
 

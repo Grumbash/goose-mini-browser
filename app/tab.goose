@@ -16,6 +16,7 @@ import engine.layout;
 import engine.snapshot;
 import engine.hit;
 import .net;
+import .sheets;
 
 // A message to a tab, as platform/src/tabs.rs numbers them.
 struct TabMsg { kind: i32, a: f32, b: f32, c: f32 }
@@ -42,6 +43,7 @@ let REPLY_FAILED: i32 = 4;   // text: why the page didn't load
 let REPLY_ELEMENTS: i32 = 5; // text: its elements under <body>, a line each (elements_of)
 let REPLY_READ: i32 = 6;     // value: the document's size in bytes, once read
 let REPLY_URL: i32 = 7;      // value: the HTTP status; text: the page's URL after redirects
+let REPLY_LOG: i32 = 8;      // text: what went wrong loading the page, a line each
 
 // How much of a page's own text the interface takes: a page's title or an
 // element's id or class could be any length, and the interface is laid out
@@ -82,12 +84,12 @@ struct Page {
 // it failed; whether a display list waits to be taken when it is shown; how
 // far it is scrolled; when it opened and how long it took to show; its
 // page's HTTP status (0 for a file); and spans of the main thread's notes:
-// where it is (a file's path or a URL), its title, why it failed, its
-// elements.
+// where it is (a file's path or a URL), its title, why it failed, what went
+// wrong loading it (a line each), its elements.
 struct Tab {
     worker: i64, ready: bool, failed: bool, info: FrameInfo, paint: f32, waiting: bool, scroll: f32, opened: i64,
     load_ms: f32, status: i32, loc_at: i64, loc_len: i64, title_at: i64, title_len: i64, why_at: i64, why_len: i64,
-    elems_at: i64, elems_len: i64,
+    log_at: i64, log_len: i64, elems_at: i64, elems_len: i64,
 }
 
 // How fetching a document ended.
@@ -102,9 +104,10 @@ fn ms_since(from: i64) -> f32 { return ((clock_ns() - from) / 1000000.0) as f32;
 thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32) {
     var src: u8[>..] = [];
     var later: TabMsg[>..] = [];     // what the main thread asked while the page came
+    var page: u8[>..] = [];          // the page's URL, after redirects
     var t = clock_ns();
     if is_web(loc[..]) {
-        let got = fetch_document(tab, profile, loc[..], src, later);
+        let got = fetch_document(tab, profile, loc[..], src, page, later);
         guard got != LOAD_QUIT else { return; }
         guard got == LOAD_OK else { serve_nothing(tab); return; }
     } else {
@@ -113,6 +116,7 @@ thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32) {
             serve_nothing(tab);
             return;
         }
+        file_url(loc[..], page);
     }
     var info = FrameInfo { height: 0.0, background: 0xFFFFFFFF, nodes: 0, bytes: src.len as i32,
                            parse: 0.0, style: 0.0, measure: 0.0, layout: 0.0, scale: 1.0, read: ms_since(t) };
@@ -124,6 +128,16 @@ thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32) {
     let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
     parse_html(src[..], d);
     info.parse = ms_since(t);
+    // Its sheets, fetched while nothing shows: the wait counts as reading.
+    t = clock_ns();
+    var base: u8[>..] = [];
+    doc_base(d, page[..], base);
+    var sheet_texts: u8[>..] = [];
+    var sheet_ends: i64[>..] = [];
+    var log: u8[>..] = [];
+    guard gather_sheets(tab, profile, d, page[..], base[..], sheet_texts, sheet_ends, later, log) else { return; }
+    if log.len > 0 { tp_post_reply(tab, REPLY_LOG, 0, log[..]); }
+    info.read += ms_since(t);
     t = clock_ns();
     var rules: Rule[>..] = [];
     var comps: Compound[>..] = [];
@@ -135,7 +149,7 @@ thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32) {
     var var_bytes: u8[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sel_attrs, decls: decls, bytes: sheet_bytes,
                      vars: vars, var_bytes: var_bytes };
-    load_sheets(d, sh);
+    load_sheets_with(d, sh, sheet_texts[..], sheet_ends[..]);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
     info.style = ms_since(t);
@@ -165,10 +179,10 @@ thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32) {
 }
 
 // Loads the document at `url` on profile `profile`'s session into `src`, as
-// HTML: a text response goes in a <pre>. Tells the main thread the page's URL
-// after redirects and its status, or why it failed. What the main thread
-// asks meanwhile goes in `later`, to answer once there is a page.
-fn fetch_document(tab: i32, profile: i32, url: const u8[:], src: u8[>..]&, later: TabMsg[>..]&) -> i32 {
+// HTML: a text response goes in a <pre>. Its URL after redirects goes onto
+// `page` and to the main thread, with its status; or why it failed. What the
+// main thread asks meanwhile goes in `later`, to answer once there is a page.
+fn fetch_document(tab: i32, profile: i32, url: const u8[:], src: u8[>..]&, page: u8[>..]&, later: TabMsg[>..]&) -> i32 {
     let req = tp_net_open(tab, profile, NET_DOCUMENT, url, "", 0);
     guard req > 0 else {
         tp_post_reply(tab, REPLY_FAILED, 0, str("can't load ", url)[..]);
@@ -192,6 +206,7 @@ fn fetch_document(tab: i32, profile: i32, url: const u8[:], src: u8[>..]&, later
         return LOAD_FAILED;
     }
     tp_post_reply(tab, REPLY_URL, head.status, final_url[..]);
+    page.append(final_url);
     let m = mime[..];
     if m.len == 0 || m == "text/html" || m == "application/xhtml+xml" {
         src.append(body);

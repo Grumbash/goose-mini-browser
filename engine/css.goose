@@ -2725,7 +2725,8 @@ let UA_SVG_CSS = """
     """;
 
 // Builds the document's sheets into `sh`: Tusk's own, then each <style> in
-// document order. Linked sheets wait for the network stack (M2).
+// document order. A page whose linked sheets were fetched uses
+// load_sheets_with.
 fn load_sheets(d: Doc, sh: Sheet) {
     var order = parse_sheet(UA_SVG_CSS, sh, ORIGIN_UA, 0);
     order = parse_sheet(UA_CSS, sh, ORIGIN_UA_HTML, order);
@@ -2736,6 +2737,112 @@ fn load_sheets(d: Doc, sh: Sheet) {
         if has && !for_screen(media) { continue; }
         order = parse_sheet(node_text(d, n.first), sh, ORIGIN_AUTHOR, order);
     }
+}
+
+// Builds the document's sheets into `sh`: Tusk's own, then the page's, each
+// parsed on its own, in the cascade's order: those of sheet_sources in
+// document order, each one's @imports before it. The k-th is
+// texts[ends[k - 1]..ends[k]], from 0 for the first.
+fn load_sheets_with(d: Doc, sh: Sheet, texts: const u8[:], ends: const i64[:]) {
+    var order = parse_sheet(UA_SVG_CSS, sh, ORIGIN_UA, 0);
+    order = parse_sheet(UA_CSS, sh, ORIGIN_UA_HTML, order);
+    var from: i64 = 0;
+    for end in ends {
+        order = parse_sheet(texts[from..end], sh, ORIGIN_AUTHOR, order);
+        from = end;
+    }
+}
+
+// Whether element n links a style sheet for the screen: rel has the word
+// stylesheet and not alternate, it has an href, it isn't disabled, and its
+// media includes the screen.
+fn is_sheet_link(d: Doc, n: i32) -> bool {
+    guard d.nodes[n].kind == NODE_ELEMENT && node_name(d, n) == "link" else { return false; }
+    let rel, has_rel = attr_value(d, n, "rel");
+    let href, has_href = attr_value(d, n, "href");
+    let _, disabled = attr_value(d, n, "disabled");
+    guard has_rel && has_href && trim(href).len > 0 && !disabled else { return false; }
+    var sheet = false;
+    var alternate = false;
+    var word: u8[>..] = [];
+    for c, j in rel {
+        let blank = c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0c';
+        if !blank { word.push(if c >= 'A' && c <= 'Z' { c + 32 } else { c }); }
+        if blank || j == rel.len - 1 {
+            if word[..] == "stylesheet" { sheet = true; }
+            if word[..] == "alternate" { alternate = true; }
+            word.resize(0);
+        }
+    }
+    let media, has_media = attr_value(d, n, "media");
+    return sheet && !alternate && (!has_media || for_screen(media));
+}
+
+// The document's sheets in document order onto `out`: each <style> for the
+// screen with text, and each <link> to a sheet (is_sheet_link).
+fn sheet_sources(d: Doc, out: i32[>..]&) {
+    for n, i in d.nodes {
+        guard n.kind == NODE_ELEMENT else { continue; }
+        let k = i as i32;
+        if n.first >= 0 && node_name(d, k) == "style" {
+            let media, has = attr_value(d, k, "media");
+            if !has || for_screen(media) { out.push(k); }
+        } else if is_sheet_link(d, k) {
+            out.push(k);
+        }
+    }
+}
+
+// The sheets sheet `src` imports: each @import before its first rule, for
+// the screen, its URL as written onto `hrefs`, where each ends onto `ends`
+// (CSS Cascade 4 §2.1). @charset and @layer statements may come before them.
+fn sheet_imports(src: const u8[:], hrefs: u8[>..]&, ends: i64[>..]&) {
+    var l = Lexer { src: src, pos: 0 };
+    loop {
+        skip_ws_comments(l);
+        guard l.pos < src.len && src[l.pos] == '@' else { return; }
+        var e = l.pos + 1;
+        while e < src.len && is_ident(src[e]) { e += 1; }
+        var name: u8[>..] = [];
+        name.append(src[l.pos + 1..e]);
+        to_lower(name[..]);
+        var end = e;
+        while end < src.len && src[end] != ';' && src[end] != '{' {
+            if src[end] == '"' || src[end] == '\'' { end = skip_string(src, end); continue; }
+            end += 1;
+        }
+        guard end < src.len && src[end] == ';' else { return; }     // a block: rules have begun
+        if name[..] == "import" {
+            let href, media = import_target(trim(src[e..end]));
+            if href.len > 0 && (media.len == 0 || for_screen(media)) {
+                hrefs.append(href);
+                ends.push(hrefs.len);
+            }
+        } else if name[..] != "charset" && name[..] != "layer" {
+            return;
+        }
+        l.pos = end + 1;
+    }
+}
+
+// An @import's URL and media: `url(x) m`, `url("x") m` or `"x" m`.
+fn import_target(p: const u8[:]) -> const u8[:], const u8[:] {
+    var i: i64 = 0;
+    if p.len > 4 && (p[0] == 'u' || p[0] == 'U') && (p[1] == 'r' || p[1] == 'R') && (p[2] == 'l' || p[2] == 'L')
+       && p[3] == '(' {
+        let close = find(p, ")");
+        guard close > 4 else { return p[0..0], p[0..0]; }
+        var inner = trim(p[4..close]);
+        if inner.len >= 2 && (inner[0] == '"' || inner[0] == '\'') && inner[inner.len - 1] == inner[0] {
+            inner = inner[1..inner.len - 1];
+        }
+        return inner, trim(p[close + 1..]);
+    }
+    guard p.len >= 2 && (p[0] == '"' || p[0] == '\'') else { return p[0..0], p[0..0]; }
+    i = 1;
+    while i < p.len && p[i] != p[0] { if p[i] == '\\' { i += 1; } i += 1; }
+    guard i < p.len else { return p[0..0], p[0..0]; }
+    return p[1..i], trim(p[i + 1..]);
 }
 
 // Whether a media attribute includes the screen: "screen", "all", or a

@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Linked sheets</title>
+<!-- A page whose look comes from linked sheets: page.css imports base.css,
+     which imports page.css back (a cycle, cut); later sheets win. -->
+<link rel="stylesheet" href="page.css">
+<style>p.inline { color: #0A6 }</style>
+<link rel="stylesheet" href="later.css" media="screen">
+<link rel="stylesheet" href="print.css" media="print">
+<link rel="alternate stylesheet" href="print.css">
+<link rel="stylesheet" href="missing.css">
+<h1>Linked sheets</h1>
+<p class="base">Blue on yellow, from base.css, imported by page.css.</p>
+<p class="inline">Green, from the page's own style.</p>
+<p class="later">Red, from later.css, over page.css's purple.</p>

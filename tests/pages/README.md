@@ -23,3 +23,13 @@
   ```bash
   ./app/tusk --screenshot window.png --size 1200x760 tests/pages/window.html
   ```
+
+- `linked/`: a page styled by linked sheets. `page.css` imports `base.css`,
+  which imports `page.css` back (a cycle, cut); its own `<style>` and
+  `later.css` come after; a print sheet, an alternate sheet and a missing
+  sheet are left out, the last with an error in the Console. Blue on yellow,
+  green, then red, when the cascade's order is right.
+
+  ```bash
+  ./app/tusk --screenshot linked.png --dev-tab console tests/pages/linked/index.html
+  ```

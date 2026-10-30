@@ -42,6 +42,50 @@ fn base_of(src: const u8[:]) -> u8[>..] {
     return out;
 }
 
+fn imports_of(src: const u8[:]) -> u8[>..] {
+    var hrefs: u8[>..] = [];
+    var ends: i64[>..] = [];
+    sheet_imports(src, hrefs, ends);
+    var out: u8[>..] = [];
+    var from: i64 = 0;
+    for e in ends {
+        format(out, "[", hrefs[from..e], "]");
+        from = e;
+    }
+    return out;
+}
+
+fn sources_of(src: const u8[:]) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var list: i32[>..] = [];
+    sheet_sources(d, list);
+    var out: u8[>..] = [];
+    for n in list {
+        let href, has = attr_value(d, n, "href");
+        format(out, "[", node_name(d, n), if has { " " } else { "" }, href, "]");
+    }
+    return out;
+}
+
+fn test_sheets() {
+    check("a page's sheets in document order: its <style>s and the <link>s to sheets for the screen",
+          sources_of(str("<link rel=stylesheet href=a.css><style>p{}</style><link rel='Alternate Stylesheet' href=b.css>",
+                         "<link rel=icon href=c.ico><link rel='preload stylesheet' href=d.css><link rel=stylesheet href=''>",
+                         "<link rel=stylesheet href=e.css media=print><link rel=stylesheet href=f.css disabled>",
+                         "<style media=print>q{}</style><link rel=stylesheet href=g.css media='screen and (min-width: 1px)'>")[..]),
+          "[link a.css][style][link d.css][link g.css]");
+    check("a sheet's @imports: before its first rule, after @charset, for the screen",
+          imports_of(str("@charset \"utf-8\";\n/* c */ @import url(a.css); @import \"b.css\" screen; @import url('c;.css');",
+                         "@import url(p.css) print; @IMPORT 'e.css'; p { color: red } @import url(late.css);")[..]),
+          "[a.css][b.css][c;.css][e.css]");
+    check("a sheet with no imports has none", imports_of("p { color: red }"), "");
+    check("an @import after a rule is no import", imports_of("@media screen { p {} } @import url(x.css);"), "");
+}
+
 fn test_html() {
     check("the first <base> with an href is the page's base",
           base_of("<base target=_top><base href='/docs/'><base href='/other/'><p>x"), "/docs/");
@@ -1974,6 +2018,7 @@ fn test_page() {
 }
 
 fn main() {
+    test_sheets();
     // The bundled fonts, as the app registers them; run from the repository.
     var fonts: u8[>..] = [];
     format(fonts, tp_register_fonts("app/fonts"));

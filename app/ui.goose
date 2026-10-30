@@ -98,6 +98,14 @@ fn drop_icon(out: u8[>..]&) {
 
 fn note(T: UiText, at: i64, len: i64) -> const u8[:] { return T.notes[at..at + len]; }
 
+// How many things went wrong loading tab t's page: itself failing, and each
+// line of its log.
+fn errors_of(t: Tab, T: UiText) -> i64 {
+    var n: i64 = if t.failed { 1 } else { 0 };
+    for c in note(T, t.log_at, t.log_len) { if c == '\n' { n += 1; } }
+    return n;
+}
+
 // Where tab t is: its file's path, or its page's URL.
 fn loc_of(t: Tab, T: UiText) -> const u8[:] { return note(T, t.loc_at, t.loc_len); }
 
@@ -297,7 +305,8 @@ fn content(out: u8[>..]&, U: Ui, t: Tab, T: UiText, cw: f32, ch: f32) {
     out.append("</b><span class=\"host\">");
     esc(out, site_of(t, T));
     out.append("</span><span class=\"pgr\">");
-    if t.failed { out.append("<span class=\"sdot er\" aria-label=\"1 error\">1</span>"); }
+    let errors = errors_of(t, T);
+    if errors > 0 { format(out, "<span class=\"sdot er\" aria-label=\"", errors, if errors == 1 { " error" } else { " errors" }, "\">", errors, "</span>"); }
     else if t.ready { out.append("<span class=\"sdot ok\" aria-label=\"Loaded\"></span>"); }
     else { out.append("<span class=\"sdot run\" aria-label=\"Loading\"></span>"); }
     out.append("<span class=\"pga\">");
@@ -324,14 +333,14 @@ fn dev_panel(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText, cw: f32, ch: f
     out.append("; height:");
     px(out, ch);
     out.append("\"><div class=\"dph\"><div class=\"ro\"><div class=\"r1\">");
-    page_line(out, t);
+    page_line(out, t, errors_of(t, T));
     out.append("</div></div></div><div class=\"dpt\"><div class=\"dtabs\">");
     let names: const u8[:][5] = ["Console", "Network", "Elements", "Frames", "Oil"];
     for name, k in names {
         out.append(if k == U.dev_tab { "<span class=on>" } else { "<span>" });
         if k == DEV_OIL { drop_icon(out); }
         out.append(name);
-        if k == DEV_CONSOLE && t.failed { out.append("<em>1</em>"); }
+        if k == DEV_CONSOLE && errors_of(t, T) > 0 { format(out, "<em>", errors_of(t, T), "</em>"); }
         out.append("</span>");
     }
     out.append("</div>");
@@ -343,9 +352,9 @@ fn dev_panel(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText, cw: f32, ch: f
     out.append("</div></aside>");
 }
 
-// The page's line: its status, requests, size, errors and load time. A file
-// is one request; its status is OK once read.
-fn page_line(out: u8[>..]&, t: Tab) {
+// The page's line: its status, requests, size, `errors` and load time. A
+// file is one request; its status is OK once read.
+fn page_line(out: u8[>..]&, t: Tab, errors: i64) {
     if t.failed {
         out.append("<span class=\"st er\">ERR</span><span><b>1</b> req</span><span><b>0.0</b> KB</span>");
         out.append("<span class=\"er\"><b>1</b> err</span>");
@@ -361,7 +370,8 @@ fn page_line(out: u8[>..]&, t: Tab) {
         else { out.append("<span class=\"st ok\">OK</span>"); }
         out.append("<span><b>1</b> req</span><span><b>");
         format_flt(out, t.info.bytes / 1000.0, 1);
-        out.append("</b> KB</span><span><b>0</b> err</span>");
+        out.append("</b> KB</span>");
+        format(out, if errors > 0 { "<span class=\"er\"><b>" } else { "<span><b>" }, errors, "</b> err</span>");
     }
     out.append("<span><b>");
     format(out, t.load_ms as i64);
@@ -383,6 +393,16 @@ fn console(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
         out.append(" nodes parsed, styled and laid out in ");
         format(out, t.load_ms as i64);
         out.append(" ms</span><em>tusk</em></p><p class=\"cl inf\"><span class=\"x\"></span><span class=\"msg\">Scripts don't run yet</span><em>tusk</em></p>");
+    }
+    // What went wrong loading it, a line each.
+    let log = note(T, t.log_at, t.log_len);
+    var from: i64 = 0;
+    for c, j in log {
+        guard c == '\n' else { continue; }
+        out.append("<p class=\"cl er\"><span class=\"x\">✕</span><span class=\"msg\">");
+        esc(out, log[from..j]);
+        out.append("</span><em>css</em></p>");
+        from = j + 1;
     }
     out.append("<p class=\"cl\"><span class=\"x pr\">›</span><i class=\"caret\"></i></p></div>");
 }
