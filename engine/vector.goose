@@ -54,11 +54,13 @@ fn times(m: Affine, n: Affine) -> Affine {
 // What a shape inherits, which inside a <use> is the <use>'s rather than its
 // own parent's: its paint, its stroke's width, caps and joins, its fill rule
 // and the text colour that currentColor is.
-struct Inherited { fill: u32, stroke: u32, width: f32, cap: i32, join: i32, rule: i32, color: u32 }
+struct Inherited { fill: u32, stroke: u32, width: f32, width_pct: i32, cap: i32, join: i32, rule: i32, color: u32,
+                   fill_opacity: f32, stroke_opacity: f32 }
 
 fn inherited(s: Style) -> Inherited {
-    return Inherited { fill: s.fill, stroke: s.stroke, width: s.stroke_width, cap: s.linecap, join: s.linejoin,
-                       rule: s.fill_rule, color: s.color };
+    return Inherited { fill: s.fill, stroke: s.stroke, width: s.stroke_width, width_pct: s.stroke_pct, cap: s.linecap,
+                       join: s.linejoin, rule: s.fill_rule, color: s.color, fill_opacity: s.fill_opacity,
+                       stroke_opacity: s.stroke_opacity };
 }
 
 // What style s's own declarations set, the rest from `up`.
@@ -66,11 +68,13 @@ fn paint_of(s: Style, up: Inherited) -> Inherited {
     var p = up;
     if (s.svg_set & SVG_FILL) != 0 { p.fill = s.fill; }
     if (s.svg_set & SVG_STROKE) != 0 { p.stroke = s.stroke; }
-    if (s.svg_set & SVG_STROKE_WIDTH) != 0 { p.width = s.stroke_width; }
+    if (s.svg_set & SVG_STROKE_WIDTH) != 0 { p.width = s.stroke_width; p.width_pct = s.stroke_pct; }
     if (s.svg_set & SVG_LINECAP) != 0 { p.cap = s.linecap; }
     if (s.svg_set & SVG_LINEJOIN) != 0 { p.join = s.linejoin; }
     if (s.svg_set & SVG_FILL_RULE) != 0 { p.rule = s.fill_rule; }
     if (s.svg_set & SVG_COLOR) != 0 { p.color = s.color; }
+    if (s.svg_set & SVG_FILL_OPACITY) != 0 { p.fill_opacity = s.fill_opacity; }
+    if (s.svg_set & SVG_STROKE_OPACITY) != 0 { p.stroke_opacity = s.stroke_opacity; }
     return p;
 }
 
@@ -183,11 +187,15 @@ fn draw_shape(V: Drawing&, e: i32, name: const u8[:], m: Affine, p: Inherited, a
     let start = V.paths.len;
     add_shape(V.d, e, name, m, vw, vh, V.paths);
     guard V.paths.len > start;
-    let fill = faded(if p.fill == CURRENT_COLOR { p.color } else { p.fill }, alpha);
-    let stroke = faded(if p.stroke == CURRENT_COLOR { p.color } else { p.stroke }, alpha);
-    // A stroke's width on the page: scaled as the shape is, on average.
-    let sw = if (stroke >> 24) != 0 { p.width * sqrt(abs(m.a * m.d - m.b * m.c)) } else { 0.0 };
-    let fills = (fill >> 24) != 0;
+    let fill = faded(if p.fill == CURRENT_COLOR { p.color } else { p.fill }, alpha * p.fill_opacity);
+    let stroke = faded(if p.stroke == CURRENT_COLOR { p.color } else { p.stroke }, alpha * p.stroke_opacity);
+    // A stroke's width in user units, a percentage of the viewport's
+    // diagonal over the square root of 2; on the page, scaled as the shape
+    // is, on average.
+    let width = if p.width_pct != 0 { p.width / 100.0 * sqrt((vw * vw + vh * vh) / 2.0) } else { p.width };
+    let sw = if (stroke >> 24) != 0 { width * sqrt(abs(m.a * m.d - m.b * m.c)) } else { 0.0 };
+    // A line has no inside to fill (SVG 2 §10.6).
+    let fills = (fill >> 24) != 0 && name != "line";
     if !fills && sw <= 0.0 { V.paths.resize(start); return; }
     // What a stroke may reach past the points: half its width, four times
     // that at a sharp miter.
@@ -231,13 +239,18 @@ fn add_shape(d: Doc, e: i32, name: const u8[:], m: Affine, vw: f32, vh: f32, pat
         let w = length_attr(d, e, "width", vw, 0.0);
         let h = length_attr(d, e, "height", vh, 0.0);
         guard w > 0.0 && h > 0.0;
-        // A radius left out is the other one; both are at most half a side.
+        // A radius left out is the other one; both are at most half a side,
+        // and with either 0 the corners are square.
         var rx = length_attr(d, e, "rx", vw, -1.0);
         var ry = length_attr(d, e, "ry", vh, -1.0);
         if rx < 0.0 { rx = ry; }
         if ry < 0.0 { ry = rx; }
         rx = clamp(rx, 0.0, w / 2.0);
         ry = clamp(ry, 0.0, h / 2.0);
+        if rx == 0.0 || ry == 0.0 {
+            rx = 0.0;
+            ry = 0.0;
+        }
         add_point(paths, PATH_MOVE, m, x + rx, y);
         add_point(paths, PATH_LINE, m, x + w - rx, y);
         if rx > 0.0 && ry > 0.0 { add_quarter(paths, m, x + w - rx, y, x + w, y + ry, 1.0, 0.0); }
@@ -337,7 +350,9 @@ fn add_path_data(src: const u8[:], m: Affine, paths: f32[>..<]&) {
     var qy: f32 = 0.0;
     var last: u8 = 0;         // the last command, upper case
     loop {
-        while i < src.len && (is_ws(src[i]) || src[i] == ',') { i += 1; }
+        // A number takes the white space and one comma after it; a command
+        // only white space, so a comma after a command letter is an error.
+        while i < src.len && is_ws(src[i]) { i += 1; }
         guard i < src.len else { return; }
         let c = src[i];
         if is_path_command(c) {
@@ -517,16 +532,18 @@ fn on_ellipse(cx: f32, cy: f32, rx: f32, ry: f32, cp: f32, sp: f32, ux: f32, uy:
     return cx + rx * ux * cp - ry * uy * sp, cy + rx * ux * sp + ry * uy * cp;
 }
 
-// The number at s[i], white space and a comma before it skipped: its value,
-// where it ends, and whether there was one. 1.5.5 is two numbers.
+// The number at s[i], white space before it skipped: its value, where the
+// white space and at most one comma after it end, and whether there was
+// one. 1.5.5 is two numbers; 1. is none, a point needing a digit after it.
 fn scan_number(s: const u8[:], i: i64) -> f32, i64, bool {
     var k = i;
-    while k < s.len && (is_ws(s[k]) || s[k] == ',') { k += 1; }
+    while k < s.len && is_ws(s[k]) { k += 1; }
     let st = k;
     if k < s.len && (s[k] == '+' || s[k] == '-') { k += 1; }
     var digits = false;
     while k < s.len && s[k] >= '0' && s[k] <= '9' { k += 1; digits = true; }
     if k < s.len && s[k] == '.' {
+        guard k + 1 < s.len && s[k + 1] >= '0' && s[k + 1] <= '9' else { return 0.0, i, false; }
         k += 1;
         while k < s.len && s[k] >= '0' && s[k] <= '9' { k += 1; digits = true; }
     }
@@ -540,16 +557,28 @@ fn scan_number(s: const u8[:], i: i64) -> f32, i64, bool {
         }
     }
     let v, ok = parse_flt(s[st..k]);
-    guard ok && v > -10000000.0 && v < 10000000.0 else { return 0.0, i, false; }
-    return v as f32, k, true;
+    guard ok && v > -3.0e38 && v < 3.0e38 else { return 0.0, i, false; }
+    return v as f32, past_separator(s, k), true;
 }
 
-// An arc's flag, 0 or 1, which may run into the number after it.
+// An arc's flag, 0 or 1, which may run into the number after it, as
+// scan_number reads a number.
 fn scan_flag(s: const u8[:], i: i64) -> bool, i64, bool {
     var k = i;
-    while k < s.len && (is_ws(s[k]) || s[k] == ',') { k += 1; }
+    while k < s.len && is_ws(s[k]) { k += 1; }
     guard k < s.len && (s[k] == '0' || s[k] == '1') else { return false, i, false; }
-    return s[k] == '1', k + 1, true;
+    return s[k] == '1', past_separator(s, k + 1), true;
+}
+
+// Past white space with at most one comma in it, from s[i].
+fn past_separator(s: const u8[:], i: i64) -> i64 {
+    var k = i;
+    while k < s.len && is_ws(s[k]) { k += 1; }
+    if k < s.len && s[k] == ',' {
+        k += 1;
+        while k < s.len && is_ws(s[k]) { k += 1; }
+    }
+    return k;
 }
 
 // Attribute `name` of e as a length in user units: a number, px, or a
@@ -566,26 +595,88 @@ fn length_attr(d: Doc, e: i32, name: const u8[:], base: f32, def: f32) -> f32 {
     return def;
 }
 
-// The bounds of the points of the path data from `start` on, control points
-// too.
+// The bounds of the path data from `start` on: its points, and how far its
+// curves reach between them.
 fn path_bounds(paths: const f32[:], start: i64) -> f32, f32, f32, f32 {
     var x0: f32 = 1000000000.0;
     var y0: f32 = 1000000000.0;
     var x1: f32 = -1000000000.0;
     var y1: f32 = -1000000000.0;
+    var px: f32 = 0.0;        // the current point
+    var py: f32 = 0.0;
+    var sx: f32 = 0.0;        // where the subpath started
+    var sy: f32 = 0.0;
     var k = start;
     while k < paths.len {
-        let n: i64 = if paths[k] == PATH_CUBIC { 3 } else if paths[k] == PATH_CLOSE { 0 } else { 1 };
-        for j in n {
-            x0 = min(x0, paths[k + 1 + 2 * j]);
-            y0 = min(y0, paths[k + 2 + 2 * j]);
-            x1 = max(x1, paths[k + 1 + 2 * j]);
-            y1 = max(y1, paths[k + 2 + 2 * j]);
+        let op = paths[k];
+        if op == PATH_CLOSE {
+            px = sx;
+            py = sy;
+            k += 1;
+            continue;
         }
-        k += 1 + 2 * n;
+        // Where it ends, and for a curve where it turns along each axis.
+        let n: i64 = if op == PATH_CUBIC { 5 } else { 1 };
+        let ex = paths[k + n];
+        let ey = paths[k + n + 1];
+        if op == PATH_CUBIC {
+            let ax = paths[k + 1];
+            let ay = paths[k + 2];
+            let bx = paths[k + 3];
+            let by = paths[k + 4];
+            let tx1, tx2 = turns(px, ax, bx, ex);
+            let ty1, ty2 = turns(py, ay, by, ey);
+            for t in [tx1, tx2, ty1, ty2] {
+                guard t >= 0.0 else { continue; }
+                let cx = bezier(px, ax, bx, ex, t);
+                let cy = bezier(py, ay, by, ey, t);
+                x0 = min(x0, cx);
+                y0 = min(y0, cy);
+                x1 = max(x1, cx);
+                y1 = max(y1, cy);
+            }
+        }
+        x0 = min(x0, ex);
+        y0 = min(y0, ey);
+        x1 = max(x1, ex);
+        y1 = max(y1, ey);
+        if op == PATH_MOVE {
+            sx = ex;
+            sy = ey;
+        }
+        px = ex;
+        py = ey;
+        k += if op == PATH_CUBIC { 7 } else { 3 };
     }
     if x1 < x0 { return 0.0, 0.0, 0.0, 0.0; }
     return x0, y0, x1, y1;
+}
+
+// Where a cubic curve from a through b and c to d turns along one axis: up
+// to two parameters between 0 and 1, -1 for none.
+fn turns(a: f32, b: f32, c: f32, d: f32) -> f32, f32 {
+    // Its slope over 3 is (b - a)(1 - t)² + 2(c - b)(1 - t)t + (d - c)t².
+    let p = b - a;
+    let q = c - b;
+    let r = d - c;
+    let qa = p - 2.0 * q + r;
+    let qb = 2.0 * (q - p);
+    if abs(qa) < 0.000001 {
+        guard abs(qb) > 0.000001 else { return -1.0, -1.0; }
+        return between(-p / qb), -1.0;
+    }
+    let disc = qb * qb - 4.0 * qa * p;
+    guard disc >= 0.0 else { return -1.0, -1.0; }
+    let root = sqrt(disc);
+    return between((-qb + root) / (2.0 * qa)), between((-qb - root) / (2.0 * qa));
+}
+
+fn between(t: f32) -> f32 { return if t > 0.0 && t < 1.0 { t } else { -1.0 }; }
+
+// A cubic curve from a through b and c to d, along one axis, at t.
+fn bezier(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+    let u = 1.0 - t;
+    return u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d;
 }
 
 // Moves the points of the path data from `start` on by (dx, dy).
@@ -656,29 +747,39 @@ fn fit_view(d: Doc, e: i32, w: f32, h: f32) -> Affine {
 }
 
 // Element e's own transform, taking its user space into its parent's: its CSS
-// transform about its transform-origin, which counts in its viewport (vw ×
-// vh) or, for transform-box: fill-box, in its own geometry's bounds; else its
-// transform attribute.
+// transform, else its transform attribute, about its transform-origin. The
+// origin counts in its viewport (vw × vh), or for transform-box: fill-box and
+// stroke-box in the bounds of its own geometry, without and with half its
+// stroke's width all round.
 recursive fn local_transform(V: Drawing&, e: i32, vw: f32, vh: f32, depth: i32) -> Affine {
     let s = V.styles[e];
-    guard s.xf_count > 0 else { return transform_attr(V.d, e); }
+    let attr = s.xf_count == 0;
+    let t = if attr { transform_attr(V.d, e) } else { shift(0.0, 0.0) };
+    if attr {
+        // An origin only matters when there is a transform to turn about it.
+        let none = t.a == 1.0 && t.b == 0.0 && t.c == 0.0 && t.d == 1.0 && t.e == 0.0 && t.f == 0.0;
+        let at_zero = s.transform_box == K_VIEW_BOX && s.origin_pct == 0 && s.origin_x == 0.0 && s.origin_y == 0.0;
+        if none || at_zero { return t; }
+    }
     var bx: f32 = 0.0;
     var by: f32 = 0.0;
     var bw = vw;
     var bh = vh;
-    if s.transform_box == K_FILL_BOX {
+    if s.transform_box == K_FILL_BOX || s.transform_box == K_STROKE_BOX {
         let mark = V.paths.len;
         add_geometry(V, e, shift(0.0, 0.0), vw, vh, depth + 1);
         let x0, y0, x1, y1 = path_bounds(V.paths[..], mark);
         V.paths.resize(mark);
-        bx = x0;
-        by = y0;
-        bw = x1 - x0;
-        bh = y1 - y0;
+        let width = if s.stroke_pct != 0 { s.stroke_width / 100.0 * sqrt((vw * vw + vh * vh) / 2.0) } else { s.stroke_width };
+        let half: f32 = if s.transform_box == K_STROKE_BOX && s.stroke != 0 { width / 2.0 } else { 0.0 };
+        bx = x0 - half;
+        by = y0 - half;
+        bw = x1 - x0 + 2.0 * half;
+        bh = y1 - y0 + 2.0 * half;
     }
     let ox = bx + (if (s.origin_pct & 1) != 0 { s.origin_x / 100.0 * bw } else { s.origin_x });
     let oy = by + (if (s.origin_pct & 2) != 0 { s.origin_y / 100.0 * bh } else { s.origin_y });
-    var m = shift(ox, oy);
+    var m = times(shift(ox, oy), t);
     var k: i32 = 0;
     while k < s.xf_count {
         let f = s.xf[k];

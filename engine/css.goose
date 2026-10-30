@@ -91,7 +91,9 @@ let P_STROKE_LINECAP: i32 = 76;
 let P_STROKE_LINEJOIN: i32 = 77;
 let P_FILL_RULE: i32 = 78;
 let P_TRANSFORM_BOX: i32 = 79;
-let NPROPS: i64 = 80;
+let P_FILL_OPACITY: i32 = 80;
+let P_STROKE_OPACITY: i32 = 81;
+let NPROPS: i64 = 82;
 let P_CUSTOM: i32 = -2;   // a custom property, --name, which the cascade keeps apart
 
 // Kinds of value.
@@ -181,6 +183,7 @@ let K_NONZERO: i32 = 67;
 let K_EVENODD: i32 = 68;
 let K_FILL_BOX: i32 = 69;
 let K_VIEW_BOX: i32 = 70;
+let K_STROKE_BOX: i32 = 71;
 
 // Font families, as the platform layer's text functions number them.
 let FAMILY_SANS: i32 = 0;
@@ -193,6 +196,7 @@ let FAMILY_CODE: i32 = 4;       // JetBrains Mono, bundled
 let ORIGIN_UA: i32 = 0;
 let ORIGIN_AUTHOR: i32 = 1;
 let ORIGIN_INLINE: i32 = 2;
+let ORIGIN_UA_HTML: i32 = 3;     // Tusk's sheet for HTML: ranks as ORIGIN_UA, skips SVG's elements
 
 // One compound selector, e.g. `li.note[data-a]:nth-child(2n)`, and how it
 // joins the one to its left: 0 for the first, 1 descendant, 2 child.
@@ -310,6 +314,8 @@ struct Style {
     // SVG: paint (0: none; CURRENT_COLOR: the text's), the stroke's width in
     // user units, how lines end and join, the fill rule, and transform-box.
     fill: u32, stroke: u32, stroke_width: f32, linecap: i32, linejoin: i32, fill_rule: i32, transform_box: i32,
+    stroke_pct: i32,                     // 1: stroke_width is a percentage of the viewport's diagonal
+    fill_opacity: f32, stroke_opacity: f32,
     svg: i32,                            // 1: an <svg> in HTML, 2: inside one
     svg_set: i32,                        // the SVG_ paint properties the element's own declarations set
 }
@@ -323,6 +329,8 @@ let SVG_LINECAP: i32 = 8;
 let SVG_LINEJOIN: i32 = 16;
 let SVG_FILL_RULE: i32 = 32;
 let SVG_COLOR: i32 = 64;
+let SVG_FILL_OPACITY: i32 = 128;
+let SVG_STROKE_OPACITY: i32 = 256;
 
 // One box-shadow. Blurred ones aren't drawn (docs/adr/0010: the interface's
 // shadows are rings and bars, which have none).
@@ -373,7 +381,7 @@ fn root_style() -> Style {
                    xf: [no_xform(), no_xform(), no_xform(), no_xform(), no_xform(), no_xform()], xf_count: 0,
                    origin_x: 50.0, origin_y: 50.0, origin_pct: 3,
                    fill: 0xFF000000, stroke: 0, stroke_width: 1.0, linecap: K_BUTT, linejoin: K_MITER, fill_rule: K_NONZERO,
-                   transform_box: K_VIEW_BOX, svg: 0, svg_set: 0 };
+                   transform_box: K_VIEW_BOX, stroke_pct: 0, fill_opacity: 1.0, stroke_opacity: 1.0, svg: 0, svg_set: 0 };
 }
 
 // ------------------------------------------------------------------ parsing
@@ -1257,7 +1265,7 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
         let n, ok = parse_int(value);
         if ok { d.kind = V_NUMBER; d.num = clamp(n, -1000000000, 1000000000); push_decl(out, d); return; }
     }
-    if prop == P_OPACITY {
+    if prop == P_OPACITY || prop == P_FILL_OPACITY || prop == P_STROKE_OPACITY {
         let pct = value.len > 0 && value[value.len - 1] == '%';
         let n, ok = parse_flt(if pct { value[..value.len - 1] } else { value });
         guard ok else { return; }
@@ -1316,11 +1324,12 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
         return;
     }
     if prop == P_STROKE_WIDTH {
-        // A length, or a number of user units, which are points.
+        // A length, or a number of user units, which are points; a
+        // percentage is of the viewport's diagonal over the square root of 2.
         let n, ok = parse_flt(value);
         if ok && n >= 0.0 { d.kind = V_LENGTH; d.num = n as f32; d.unit = U_PX; push_decl(out, d); return; }
         let ln, u, lok = parse_length(value);
-        guard lok && ln >= 0.0 && u != U_PCT else { return; }
+        guard lok && ln >= 0.0 else { return; }
         d.kind = V_LENGTH;
         d.num = ln;
         d.unit = u;
@@ -1332,12 +1341,14 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
         // miter-clip and arcs join as miter; content-box, border-box and
         // stroke-box are taken as view-box and fill-box.
         if value == "miter-clip" || value == "arcs" { k = K_MITER; }
-        if value == "content-box" || value == "border-box" { k = K_VIEW_BOX; }
-        if value == "stroke-box" { k = K_FILL_BOX; }
+        // An SVG element has no CSS boxes: content-box is its fill-box and
+        // border-box its stroke-box (CSS Transforms 1 §6.1).
+        if value == "content-box" { k = K_FILL_BOX; }
+        if value == "border-box" || value == "stroke-box" { k = K_STROKE_BOX; }
         let ok = if prop == P_STROKE_LINECAP { k == K_BUTT || k == K_ROUND || k == K_SQUARE }
                  else if prop == P_STROKE_LINEJOIN { k == K_MITER || k == K_ROUND || k == K_BEVEL }
                  else if prop == P_FILL_RULE { k == K_NONZERO || k == K_EVENODD }
-                 else { k == K_FILL_BOX || k == K_VIEW_BOX };
+                 else { k == K_FILL_BOX || k == K_STROKE_BOX || k == K_VIEW_BOX };
         guard ok else { return; }
         d.kind = V_KEYWORD;
         d.num = k;
@@ -1439,6 +1450,7 @@ fn property_id(n: const u8[:]) -> i32 {
     if n == "fill" { return P_FILL; } if n == "stroke" { return P_STROKE; } if n == "stroke-width" { return P_STROKE_WIDTH; }
     if n == "stroke-linecap" { return P_STROKE_LINECAP; } if n == "stroke-linejoin" { return P_STROKE_LINEJOIN; }
     if n == "fill-rule" { return P_FILL_RULE; } if n == "transform-box" { return P_TRANSFORM_BOX; }
+    if n == "fill-opacity" { return P_FILL_OPACITY; } if n == "stroke-opacity" { return P_STROKE_OPACITY; }
     if n == "flex-direction" { return P_FLEX_DIRECTION; } if n == "flex-wrap" { return P_FLEX_WRAP; }
     if n == "justify-content" { return P_JUSTIFY_CONTENT; } if n == "align-items" { return P_ALIGN_ITEMS; }
     if n == "align-self" { return P_ALIGN_SELF; } if n == "align-content" { return P_ALIGN_CONTENT; }
@@ -1879,6 +1891,8 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
     var win: Decl[NPROPS];
     fill(win_prio[..], -1);
     let mark = w.customs.len;
+    // Whether it is SVG: 1 for an <svg> in HTML, 2 for what is inside one.
+    let svg: i32 = if parent.svg != 0 { 2 } else if pseudo == 0 && node_name(d, e) == "svg" { 1 } else { 0 };
     // The buckets this element's rules can be in, each once however many
     // classes it has: the universal one, its tag's, its id's and its classes',
     // split as has_class splits them.
@@ -1901,10 +1915,11 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
         let b = buckets[bi];
         for k in w.offsets[b]..w.offsets[b + 1] {
             let r = sh.rules[w.order[k]];
-            guard r.pseudo == pseudo && rule_matches(sh, d, r, e) else { continue; }
+            guard r.pseudo == pseudo && (r.origin != ORIGIN_UA_HTML || svg == 0) && rule_matches(sh, d, r, e) else { continue; }
+            let origin: i64 = if r.origin == ORIGIN_UA_HTML { ORIGIN_UA } else { r.origin };
             for j in r.decl..r.decl + r.decl_count {
                 let dc = sh.decls[j];
-                let prio = (dc.important as i64) << 62 | (r.origin as i64) << 56 | (r.spec as i64) << 32 | r.order;
+                let prio = (dc.important as i64) << 62 | origin << 56 | (r.spec as i64) << 32 | r.order;
                 if dc.prop == P_CUSTOM { keep_custom(sh, w, mark, dc, prio); continue; }
                 if prio >= win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
             }
@@ -1913,14 +1928,13 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
     // SVG's presentation attributes, as author declarations that any rule
     // beats (SVG 2 §6.6): the paint ones on what is in an <svg>, its width and
     // height on the <svg> itself. A number is in user units, points.
-    let svg: i32 = if parent.svg != 0 { 2 } else if pseudo == 0 && node_name(d, e) == "svg" { 1 } else { 0 };
     if svg != 0 && pseudo == 0 {
         let a0 = d.nodes[e].attr;
         for ai in a0..a0 + d.nodes[e].attr_count {
             let a = d.attrs[ai];
             let an = d.bytes[a.name..a.name + a.name_len];
             let presents = an == "fill" || an == "stroke" || an == "stroke-width" || an == "stroke-linecap" || an == "stroke-linejoin"
-                || an == "fill-rule" || an == "opacity" || an == "color" || an == "display"
+                || an == "fill-rule" || an == "fill-opacity" || an == "stroke-opacity" || an == "opacity" || an == "color" || an == "display"
                 || (svg == 1 && (an == "width" || an == "height"));
             guard presents else { continue; }
             var v: u8[>..] = [];
@@ -1959,6 +1973,8 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
     if win_prio[P_STROKE_LINEJOIN] >= 0 && win[P_STROKE_LINEJOIN].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_LINEJOIN; }
     if win_prio[P_FILL_RULE] >= 0 && win[P_FILL_RULE].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_FILL_RULE; }
     if win_prio[P_COLOR] >= 0 && win[P_COLOR].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_COLOR; }
+    if win_prio[P_FILL_OPACITY] >= 0 && win[P_FILL_OPACITY].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_FILL_OPACITY; }
+    if win_prio[P_STROKE_OPACITY] >= 0 && win[P_STROKE_OPACITY].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_STROKE_OPACITY; }
     if w.customs.len > mark { s.vars = own_vars(sh, w.customs[mark..], parent.vars, w.text); }
     // Font size first: em lengths everywhere else depend on it.
     if win_prio[P_FONT_SIZE] >= 0 { apply_decl(s, parent, win[P_FONT_SIZE], sh, w.text); }
@@ -2473,7 +2489,7 @@ fn inherit(p: Style) -> Style {
     s.color = p.color; s.font_size = p.font_size; s.italic = p.italic; s.family = p.family;
     s.weight = p.weight; s.spacing = p.spacing; s.text_case = p.text_case;
     s.fill = p.fill; s.stroke = p.stroke; s.stroke_width = p.stroke_width; s.linecap = p.linecap; s.linejoin = p.linejoin;
-    s.fill_rule = p.fill_rule;
+    s.fill_rule = p.fill_rule; s.stroke_pct = p.stroke_pct; s.fill_opacity = p.fill_opacity; s.stroke_opacity = p.stroke_opacity;
     s.lh_mult = p.lh_mult; s.lh_px = p.lh_px; s.align = p.align; s.ws = p.ws; s.list = p.list; s.deco = p.deco;
     s.indent = p.indent; s.root_size = p.root_size; s.vars = p.vars;
     s.display = K_INLINE;
@@ -2514,7 +2530,12 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
     else if p == P_LETTER_SPACING { s.spacing = px(dc, s, parent); }
     else if p == P_FILL { s.fill = dc.color; }
     else if p == P_STROKE { s.stroke = dc.color; }
-    else if p == P_STROKE_WIDTH { s.stroke_width = px(dc, s, parent); }
+    else if p == P_STROKE_WIDTH {
+        s.stroke_pct = if dc.unit == U_PCT { 1 } else { 0 };
+        s.stroke_width = if dc.unit == U_PCT { dc.num } else { px(dc, s, parent) };
+    }
+    else if p == P_FILL_OPACITY { s.fill_opacity = clamp(dc.num, 0.0, 1.0); }
+    else if p == P_STROKE_OPACITY { s.stroke_opacity = clamp(dc.num, 0.0, 1.0); }
     else if p == P_STROKE_LINECAP { s.linecap = k; }
     else if p == P_STROKE_LINEJOIN { s.linejoin = k; }
     else if p == P_FILL_RULE { s.fill_rule = k; }
@@ -2660,8 +2681,6 @@ let UA_CSS = """
     li { display: list-item }
     head, title, style, script, link, meta, base, noscript, template, iframe, object, embed, video, audio, img,
     math, input, button, select, textarea, map, area, canvas, picture, source, track, param { display: none }
-    svg { overflow: hidden }
-    svg * { transform-origin: 0 0 }
     html { color: #1c1c1c; font-family: sans-serif; font-size: 17px; line-height: 1.6 }
     body { max-width: 720px; margin: 0 auto; padding: 40px 32px 120px }
     h1 { font-size: 2em; font-weight: bold; line-height: 1.2; margin: 0.4em 0 0.6em }
@@ -2696,10 +2715,19 @@ let UA_CSS = """
     center { text-align: center }
     """;
 
+// Tusk's sheet for SVG's elements, which its sheet for HTML doesn't style: a
+// nested viewport clips, and a transform turns about the user space's
+// origin (SVG 2 §5.3, CSS Transforms 1 §5).
+let UA_SVG_CSS = """
+    svg, symbol { overflow: hidden }
+    svg * { transform-origin: 0 0 }
+    """;
+
 // Builds the document's sheets into `sh`: Tusk's own, then each <style> in
 // document order. Linked sheets wait for the network stack (M2).
 fn load_sheets(d: Doc, sh: Sheet) {
-    var order = parse_sheet(UA_CSS, sh, ORIGIN_UA, 0);
+    var order = parse_sheet(UA_SVG_CSS, sh, ORIGIN_UA, 0);
+    order = parse_sheet(UA_CSS, sh, ORIGIN_UA_HTML, order);
     for n, i in d.nodes {
         guard n.kind == NODE_ELEMENT && n.first >= 0 && node_name(d, i as i32) == "style" else { continue; }
         // A sheet for print or speech only isn't for the screen.

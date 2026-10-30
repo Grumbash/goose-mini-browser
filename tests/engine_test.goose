@@ -964,6 +964,46 @@ fn test_svg() {
           str("stroke 4.0 ffff0000 M0,0 L20,20\nfill ff0000ff M0,20 L20,0\nstroke 4.0 ffff0000 M0,20 L20,0\n",
               "fill ff000000 M20,28 L20,32 L10,32 L10,28 Z\n")[..]);
 
+    // A rect with one radius 0 is square; fill-opacity and stroke-opacity,
+    // inherited; a stroke-width percentage of the viewport's diagonal over
+    // the square root of 2; a line has no fill; in SVG an <a> isn't a link's
+    // colour.
+    let paint = """
+        <style>body { margin: 0; padding: 0; max-width: none; color: #0f0 } svg { display: block }</style>
+        <svg width=200 height=100><rect width=20 height=10 rx=5 ry=0 /><g fill-opacity=".5"><rect y=20 width=5 height=5 fill="#f00"
+        stroke="#00f" stroke-opacity="25%"/></g><path d="M0 40 H10" stroke="#000" stroke-width="10%"/><line x1=0 y1=50 x2=10 y2=60 stroke="#000"/>
+        <a href="#x"><rect y=70 width=5 height=5 fill="currentColor"/></a></svg>
+        """;
+    check("svg paint fixes", layout_probe(paint, 400.0, PROBE_PATHS),
+          str("fill ff000000 M0,0 L20,0 L20,10 L0,10 L0,0 Z\nfill 80ff0000 M0,20 L5,20 L5,25 L0,25 L0,20 Z\n",
+              "stroke 1.0 400000ff M0,20 L5,20 L5,25 L0,25 L0,20 Z\nfill ff000000 M0,40 L10,40\nstroke 15.8 ff000000 M0,40 L10,40\n",
+              "stroke 1.0 ff000000 M0,50 L10,60\nfill ff00ff00 M0,70 L5,70 L5,75 L0,75 L0,70 Z\n")[..]);
+    // A transform attribute turns about the transform-origin too; a fill-box
+    // is a curve's, not its control points'; content-box is fill-box and
+    // border-box stroke-box.
+    let origins = """
+        <style>body { margin: 0; padding: 0; max-width: none } svg { display: block }
+        .c { transform-box: fill-box; transform-origin: center } .b { transform-box: border-box; transform-origin: 0 0; transform: scale(2) }</style>
+        <svg width=100 height=100><rect class=c x=10 width=10 height=4 transform="rotate(90)"/>
+        <path d="M30 10 C30 20 40 20 40 10" style="transform-box: fill-box; transform-origin: 0 100%; transform: scale(2)"/>
+        <rect style="transform-box: content-box; transform-origin: center; transform: rotate(90deg)" x=50 width=10 height=4 />
+        <rect class=b x=70 y=10 width=4 height=4 stroke="#000" stroke-width=2 fill=none /></svg>
+        """;
+    check("transform origins and boxes in svg", layout_probe(origins, 400.0, PROBE_PATHS),
+          str("fill ff000000 M17,-3 L17,7 L13,7 L13,-3 L17,-3 Z\nfill ff000000 M30,2.5 C50,2.5\n",
+              "fill ff000000 M57,-3 L57,7 L53,7 L53,-3 L57,-3 Z\nstroke 4.0 ff000000 M71,11 L79,11 L79,19 L71,19 L71,11 Z\n")[..]);
+    // Path numbers as WebKit reads them: a point needs a digit after it, a
+    // comma goes only after a number, once, and a big coordinate is a number.
+    let numbers = """
+        <style>body { margin: 0; padding: 0; max-width: none } svg { display: block }</style>
+        <svg width=100 height=100><path d="M0 0 L10 0 L10 10 L0 10."/><path d="M20 0 L30 0 L30 10,,20 10"/>
+        <path d="M40 0 L50 0 L50 10 Z, L45 5"/><path d="M60 0 L70 0 L70 10, L60 10"/><path d="M,80 0 L90 10 L80 10"/>
+        <path d="M0 20 L1e8 20 L0 30"/></svg>
+        """;
+    check("path numbers", layout_probe(numbers, 400.0, PROBE_PATHS),
+          str("fill ff000000 M0,0 L10,0 L10,10\nfill ff000000 M20,0 L30,0 L30,10\nfill ff000000 M40,0 L50,0 L50,10 Z\n",
+              "fill ff000000 M60,0 L70,0 L70,10 L60,10\nfill ff000000 M0,20 L100000000,20 L0,30\n")[..]);
+
     // A <use> inside what it refers to draws nothing, however many there are;
     // the first element with an id is the one; a <use> of an <svg> takes its
     // width and height; a <use>'s fill-box is what it draws, where.
