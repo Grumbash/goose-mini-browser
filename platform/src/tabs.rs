@@ -34,6 +34,7 @@ pub const MSG_SIZE: i32 = 1; // a: width, b: the view's height, c: backing scale
 pub const MSG_HIT: i32 = 2; // a, b: a point on the page
 pub const MSG_SNAPSHOT: i32 = 3;
 pub const MSG_QUIT: i32 = 4;
+pub const MSG_NET: i32 = 5; // a: a request that ended (net.rs)
 
 /// What a tab's display list came with, laid out as Goose's `struct
 /// FrameInfo`: the page's height, its canvas colour, its size in nodes and
@@ -125,13 +126,31 @@ pub extern "C" fn tp_tab_open(tab: i32) -> i32 {
 }
 
 /// Closes tab `tab`'s mailbox, once its worker has ended; what was still in
-/// it goes too.
+/// it goes too, and its requests stop.
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_tab_drop(tab: i32) -> i32 {
     guarded(|| {
         tabs().remove(&tab).ok_or(ERR_ARGUMENT)?;
+        crate::net::cancel_tab(tab);
         Ok(0)
     })
+}
+
+/// From the network's queue: request `req` of tab `tab` has ended. A tab
+/// already closed hears nothing.
+pub(crate) fn post_net(tab: i32, req: i32) {
+    let mut tabs = tabs();
+    if let Some(t) = tabs.get_mut(&tab) {
+        post(
+            &mut t.inbox,
+            TabMsg {
+                kind: MSG_NET,
+                a: req as f32,
+                ..Default::default()
+            },
+        );
+        t.wake.notify_one();
+    }
 }
 
 /// Posts `msg` to tab `tab`'s worker, and wakes that worker only.

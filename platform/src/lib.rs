@@ -15,6 +15,7 @@
 mod cg;
 pub mod compositor;
 mod memory;
+pub mod net;
 pub mod tabs;
 pub mod text;
 
@@ -125,6 +126,22 @@ impl<T: Copy> GSlice<T> {
             return Some(&[]);
         }
         Some(unsafe { std::slice::from_raw_parts(self.data, n) })
+    }
+
+    /// Copies `src` in, for a type with alignment 1; false, and nothing
+    /// copied, unless the slice is exactly as long.
+    ///
+    /// # Safety
+    /// Goose's slice is valid and writable for this call.
+    pub unsafe fn copy_from(&self, src: &[T]) -> bool {
+        const { assert!(std::mem::align_of::<T>() == 1) };
+        if self.count() != Some(src.len()) {
+            return false;
+        }
+        if !src.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.data, src.len()) };
+        }
+        true
     }
 }
 
