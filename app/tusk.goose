@@ -412,6 +412,8 @@ fn main() {
     var settle = false;      // a frame has been drawn since the bar last weighed the page
     var woken = false;
     var items: DItem[>..<] = [];   // the page's display list as laid out last
+    var bounds: f32[>..<] = [];    // where its items are, for hit tests: made at the first after a layout
+    var bounded = false;
     var pointer_x: f32 = -1.0;     // where the pointer is over the content, or -1 off it
     var pointer_y: f32 = -1.0;
     var e = Event { kind: 0, code: 0, x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
@@ -479,7 +481,10 @@ fn main() {
             guard tp_next_event(0, e) == 0 && e.kind != EV_NONE else { break; }
         }
         if quit { break; }
-        if relayout { page_h = show_page(P, items, width, height - BAR_H, scale, cost); }
+        if relayout {
+            page_h = show_page(P, items, width, height - BAR_H, scale, cost);
+            bounded = false;
+        }
         // The bar sits at the window's bottom edge: it moves with any resize.
         if resized { show_bar(P, path[name_start..], cost, width, height, scale); }
         scroll = clamp_scroll(scroll, page_h, height - BAR_H);
@@ -489,10 +494,20 @@ fn main() {
             tp_render(bg);
             settle = true;
         }
-        // Over a link the pointer is a hand. What is under it changes when it
-        // moves, and when the page moves under it.
-        if (moved || relayout || scroll != before) && pointer_y >= 0.0 && pointer_y < height - BAR_H {
-            let link = link_at(d, node_at(items[..], fonts[..], pointer_x, pointer_y + scroll));
+        // Over a link the pointer is a hand, and over the bar an arrow. What is
+        // under it changes when it moves, and when the page moves under it;
+        // off the window (a scroll's momentum goes on after it leaves) the
+        // cursor isn't ours.
+        let inside = pointer_x >= 0.0 && pointer_x < width && pointer_y >= 0.0 && pointer_y < height;
+        if inside && (moved || relayout || scroll != before) {
+            var link: i32 = -1;
+            if pointer_y < height - BAR_H {
+                if !bounded {
+                    hit_bounds(items[..], fonts[..], bounds);
+                    bounded = true;
+                }
+                link = link_at(d, node_at(items[..], fonts[..], bounds[..], pointer_x, pointer_y + scroll));
+            }
             tp_set_cursor(if link >= 0 { CURSOR_POINTER } else { CURSOR_ARROW });
         }
         if mode == MODE_SCROLL_TEST {

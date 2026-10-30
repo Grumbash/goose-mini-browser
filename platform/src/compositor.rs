@@ -32,6 +32,8 @@ pub const ITEM_RECT: i32 = 1;
 pub const ITEM_TEXT: i32 = 2;
 pub const ITEM_BOX: i32 = 3;
 pub const ITEM_PATH: i32 = 4;
+// Kinds that draw nothing: 0 (dropped), and 5, where a box is under the
+// pointer, which only hit testing reads.
 
 // A box item's border style.
 pub const BORDER_SOLID: i32 = 0;
@@ -924,6 +926,9 @@ pub fn build(
     let mut before = Vec::new(); // per byte of a spaced text, the units done before it
     let mut starts = Vec::new();
     for &item in items {
+        if !(ITEM_RECT..=ITEM_PATH).contains(&{ item.kind }) {
+            continue;
+        }
         let DItem {
             clip_x,
             clip_y,

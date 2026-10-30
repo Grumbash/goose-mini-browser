@@ -752,7 +752,7 @@ fn test_transforms() {
         #spin { width: 60px; height: 60px; margin: 20px; background: #c33; transform: rotate(10deg) }</style>
         <div id=outer><div id=inner><div id=spin></div></div></div>
         """;
-    check("a turned item in an empty clip", layout_probe(empty, 400.0, PROBE_CLIP), "spin dropped\n");
+    check("a turned item in an empty clip", layout_probe(empty, 400.0, PROBE_CLIP), "inner dropped\nspin dropped\n");
 
     // Clips in different spaces each cut in their own: slides that clip, in
     // a track moved 200 left, in a viewport that clips; a clipping box moved
@@ -842,22 +842,74 @@ fn test_transforms() {
 }
 
 fn test_hit() {
-    // The topmost item under each point: text in its line, a link around it,
-    // a box where its transform turned it (and not where it was), nothing
-    // where a clip cut it, and what paints last where two overlap.
+    // The topmost box under each point: text in its line, a link around it,
+    // a box where its transform turned it (and not where it was), the box
+    // under where a clip cut one, and what paints last where two overlap. A
+    // box is there in all of its border box, painted or not, inside its
+    // rounded corners; its shadow isn't. An <a> without an href isn't a link.
     let page = """
         <style>body { margin: 0; padding: 0; max-width: none; font: 10px/1 sans-serif } div { height: 20px }</style>
         <div id=a style="background: #eee">x <a href="/one">one</a></div>
         <div id=t style="transform: translateX(100px) rotate(90deg); background: #ccc; width: 50px"></div>
-        <div style="overflow: hidden; height: 10px; width: 50px"><div id=c style="height: 40px; background: #999"></div></div>
-        <div style="height: 30px"></div>
+        <div style="overflow: hidden; height: 10px; width: 50px"><div id=c style="width: 200px; height: 10px; background: #999"></div></div>
+        <div id=gap style="height: 30px"></div>
         <div style="position: relative"><div id=under style="background: #f00"></div>
         <div id=over style="position: absolute; top: 0; left: 0; width: 30px; background: #00f"></div></div>
+        <a id=pad href="/p" style="display: block; padding: 20px; height: 10px">go</a>
+        <a id=sh href="/s" style="display: block; width: 50px; height: 20px; margin: 30px 0; box-shadow: 0 0 0 20px #000"></a>
+        <div id=ring style="border: 2px solid #000; width: 50px"></div>
+        <div id=round style="width: 40px; height: 40px; border-radius: 50%; background: #0f0"></div>
+        <a id=bare style="display: block">bare</a>
         """;
-    let xs: f32[8] = [1.0, 15.0, 125.0, 10.0, 5.0, 5.0, 5.0, 40.0];
-    let ys: f32[8] = [15.0, 5.0, 50.0, 25.0, 45.0, 55.0, 85.0, 85.0];
+    let xs: f32[16] = [1.0, 15.0, 125.0, 10.0, 5.0, 100.0, 5.0, 5.0, 40.0, 5.0, 60.0, 10.0, 10.0, 2.0, 20.0, 2.0];
+    let ys: f32[16] = [15.0, 5.0, 50.0, 25.0, 45.0, 45.0, 55.0, 85.0, 85.0, 105.0, 190.0, 190.0, 240.0, 256.0, 274.0, 300.0];
     check("what is under the pointer", hits_of(page, xs[..], ys[..]),
-          "a\n\"one\" in a href=/one\nt\nnone\nc\nnone\nover\nunder\n");
+          str("a\n\"one\" in a href=/one\nt\nbody\nc\nbody\ngap\nover\nunder\n",
+              "pad href=/p\nbody\nsh href=/s\nring\nbody\nround\n\"bare\" in bare\n"));
+
+    // Items made by hand, for what pages rarely make: the topmost item that
+    // is there wins, and a dropped one, one of no node, one cut by its square
+    // clip, by a clip its own matrix maps to or by its clip's rounded corner,
+    // or one whose right edge the point is on, isn't there. Text reaches its font's ascent above its
+    // baseline and its descent below (0.8 and 0.2 of its size for a font
+    // layout hasn't measured).
+    var items: DItem[>..<] = [];
+    items.push(rect_item(1, 0.0, 0.0, 100.0, 100.0, 0xFF000000));
+    var none = rect_item(2, 0.0, 0.0, 10.0, 10.0, 0xFF000000);
+    none.kind = ITEM_NONE;
+    items.push(none);
+    items.push(rect_item(-1, 0.0, 0.0, 10.0, 10.0, 0xFF000000));
+    var cut = rect_item(3, 20.0, 0.0, 10.0, 10.0, 0xFF000000);
+    cut.oclip_x = 20.0;
+    cut.oclip_w = 5.0;
+    cut.oclip_h = 10.0;
+    items.push(cut);
+    var mapped = rect_item(4, 40.0, 0.0, 10.0, 10.0, 0xFF000000);
+    mapped.clip_x = 40.0;
+    mapped.clip_w = 10.0;
+    mapped.clip_h = 10.0;
+    mapped.c_a = 1.0;
+    mapped.c_d = 1.0;
+    mapped.c_e = 5.0;
+    items.push(mapped);
+    var round = rect_item(7, 0.0, 60.0, 10.0, 10.0, 0xFF000000);
+    round.clip_y = 60.0;
+    round.clip_w = 10.0;
+    round.clip_h = 10.0;
+    round.clip_tl = 5.0;
+    items.push(round);
+    items.push(text_item(5, 60.0, 50.0, 10.0, 0xFF000000, 7, 10.0, 0, 1));
+    items.push(text_item(6, 80.0, 50.0, 10.0, 0xFF000000, 8, 10.0, 0, 1));
+    var fonts: FontInfo[>..] = [];
+    fonts.push(FontInfo { font: 7, size: 10.0, m: Metrics { ascent: 5.0, descent: 3.0, leading: 0.0, x_height: 0.0,
+                                                           underline_position: 0.0, underline_thickness: 0.0 }, space: 0.0 });
+    let px: f32[13] = [5.0, 22.0, 27.0, 42.0, 47.0, 100.0, 65.0, 65.0, 65.0, 85.0, 85.0, 1.0, 5.0];
+    let py: f32[13] = [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 46.0, 43.0, 52.0, 43.0, 51.0, 61.0, 65.0];
+    var bounds: f32[>..<] = [];
+    hit_bounds(items[..], fonts[..], bounds);
+    var got: u8[>..] = [];
+    for x, k in px { format(got, node_at(items[..], fonts[..], bounds[..], x, py[k]), " "); }
+    check("what is under the pointer, item by item", got, "1 3 1 4 1 -1 5 1 5 6 6 1 7 ");
 }
 
 // What node_at finds at each point (xs[k], ys[k]) of `src` laid out 400 wide:
@@ -900,9 +952,11 @@ fn hits_of(src: const u8[:], xs: const f32[:], ys: const f32[:]) -> u8[>..] {
                      measured: measured, paths: paths, ids: ids, definite: definite };
     measure(L);
     layout_page(L, 400.0, 600.0);
+    var bounds: f32[>..<] = [];
+    hit_bounds(items[..], fonts[..], bounds);
     var out: u8[>..] = [];
     for x, k in xs {
-        let n = node_at(items[..], fonts[..], x, ys[k]);
+        let n = node_at(items[..], fonts[..], bounds[..], x, ys[k]);
         if n < 0 {
             out.append("none\n");
             continue;
@@ -1535,8 +1589,9 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             out.push('\n');
         }
     } else if probe == PROBE_PAINT {
+        // What is drawn: hit items aren't.
         for it in items {
-            guard it.kind != ITEM_TEXT && it.node >= 0 else { continue; }
+            guard it.kind != ITEM_TEXT && it.kind != ITEM_HIT && it.node >= 0 else { continue; }
             let id, has = attr_value(d, it.node, "id");
             guard has else { continue; }
             format(out, id, if it.kind == ITEM_BOX { " box " } else { " rect " });
@@ -1588,7 +1643,7 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
     } else if probe == PROBE_ORDER {
         var last: i32 = -1;
         for it in items {
-            guard it.node >= 0 && it.node != last && it.kind != ITEM_NONE else { continue; }
+            guard it.node >= 0 && it.node != last && it.kind != ITEM_NONE && it.kind != ITEM_HIT else { continue; }
             let id, has = attr_value(d, it.node, "id");
             guard has else { continue; }
             if out.len > 0 { out.push(' '); }
@@ -1597,7 +1652,7 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
         }
     } else if probe == PROBE_CLIP {
         for it in items {
-            guard it.node >= 0 else { continue; }
+            guard it.node >= 0 && it.kind != ITEM_HIT else { continue; }
             let id, has = attr_value(d, it.node, "id");
             guard has else { continue; }
             out.append(id);
@@ -1728,7 +1783,7 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
         format_flt(out, page_h, 1);
     } else if probe == PROBE_XF {
         for it in items {
-            guard it.node >= 0 && it.kind != ITEM_NONE else { continue; }
+            guard it.node >= 0 && it.kind != ITEM_NONE && it.kind != ITEM_HIT else { continue; }
             let id, has = attr_value(d, it.node, "id");
             guard has else { continue; }
             out.append(id);

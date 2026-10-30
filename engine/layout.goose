@@ -23,6 +23,10 @@ let ITEM_RECT: i32 = 1;
 let ITEM_TEXT: i32 = 2;
 let ITEM_BOX: i32 = 3;
 let ITEM_PATH: i32 = 4;          // an SVG shape, filled or stroked (see vector.goose)
+let ITEM_HIT: i32 = 5;           // where a box is under the pointer; it draws nothing
+
+// A rect or box item's font holds its flags.
+let BOX_SHADOW: i32 = 1;         // a shadow, which the pointer passes through
 
 // A box item's border style.
 let BORDER_SOLID: i32 = 0;
@@ -40,7 +44,10 @@ let BORDER_DASHED: i32 = 1;
 // they are the same). A second clip (oclip_w above 0) cuts it square on the
 // page, after its transform. A path item draws a span of the layout's path
 // data, in points from its corner: its text and text_len say where, its font
-// is its PATH_ flags, and its size its stroke's width (0: it is filled).
+// is its PATH_ flags, and its size its stroke's width (0: it is filled). A
+// hit item is a box's border box, its corners rounded, for a box whose own
+// items don't cover it: what is under the pointer is found by boxes, not by
+// what they paint (engine/hit.goose).
 struct DItem {
     kind: i32,
     x: f32, y: f32, w: f32, h: f32,
@@ -843,6 +850,13 @@ fn box_item(n: i32, x: f32, y: f32, w: f32, h: f32, fill: u32, r: Radii, b: Side
 
 struct Radii { tl: f32, tr: f32, br: f32, bl: f32 }
 
+// Item `it` as a shadow: drawn, but the pointer passes through it.
+fn shadow(it: DItem) -> DItem {
+    var s = it;
+    s.font = BOX_SHADOW;
+    return s;
+}
+
 // Widths on each side: top, right, bottom, left.
 struct Sides { t: f32, r: f32, b: f32, l: f32 }
 
@@ -962,7 +976,7 @@ fn box_paint_count(s: Style) -> i64 {
     }
     let bg = (s.bg >> 24) != 0;
     if one_box(s) { return n + 1; }
-    if bg { n += 1; }
+    n += 1;    // its background, or else a hit item
     if s.bt > 0.0 && (border_color(s.bt_color, s) >> 24) != 0 { n += 1; }
     if s.br > 0.0 && (border_color(s.br_color, s) >> 24) != 0 { n += 1; }
     if s.bb > 0.0 && (border_color(s.bb_color, s) >> 24) != 0 { n += 1; }
@@ -973,11 +987,13 @@ fn box_paint_count(s: Style) -> i64 {
 // Writes block n's shadows, background and borders into the items reserved at
 // `at` (box_paint_count of them), now that its border box (x, y, w, h) is
 // known: outset shadows, then the background and borders, then inset shadows,
-// as CSS paints them, all under the content; of several shadows the first is
-// on top. Blurred shadows aren't drawn. An offset shadow shows only outside
-// the box: one item when the box's background hides the rest (or the box is
-// rounded, which it then doesn't always), else strips round it. Inset
-// shadows with an offset are straight bars, their corners left square.
+// as CSS paints them, all under the content. Without a background it has a
+// hit item instead, so that the pointer finds all of it. Of several shadows
+// the first is on top. Blurred shadows aren't drawn. An offset shadow shows
+// only outside the box: one item when the box's background hides the rest
+// (or the box is rounded, which it then doesn't always), else strips round
+// it. Inset shadows with an offset are straight bars, their corners left
+// square.
 fn box_paint(L: Layout, n: i32, s: Style, at: i64, x: f32, y: f32, w: f32, h: f32) {
     var k = at;
     let r = radii_of(s, w, h);
@@ -993,22 +1009,22 @@ fn box_paint(L: Layout, n: i32, s: Style, at: i64, x: f32, y: f32, w: f32, h: f3
         let sr = shadow_radii(r, sd.spread, sw, sh);
         if sd.ox == 0.0 && sd.oy == 0.0 {
             // A ring round the box, so a box without a background shows through.
-            L.items[k] = box_item(n, sx, sy, sw, sh, 0, sr, even(max(sd.spread, 0.0)), sd.color, false);
+            L.items[k] = shadow(box_item(n, sx, sy, sw, sh, 0, sr, even(max(sd.spread, 0.0)), sd.color, false));
             k += 1;
         } else if hides {
-            L.items[k] = box_item(n, sx, sy, sw, sh, sd.color, sr, even(0.0), 0, false);
+            L.items[k] = shadow(box_item(n, sx, sy, sw, sh, sd.color, sr, even(0.0), 0, false));
             k += 1;
         } else {
             let top = min(y, sy + sh);
             let bottom = max(y + h, sy);
             let my0 = max(sy, y);
             let my1 = min(sy + sh, y + h);
-            if sd.oy - sd.spread < 0.0 { L.items[k] = rect_item(n, sx, sy, sw, top - sy, sd.color); k += 1; }
-            if sd.oy + sd.spread > 0.0 { L.items[k] = rect_item(n, sx, bottom, sw, sy + sh - bottom, sd.color); k += 1; }
-            if sd.ox - sd.spread < 0.0 { L.items[k] = rect_item(n, sx, my0, min(x, sx + sw) - sx, my1 - my0, sd.color); k += 1; }
+            if sd.oy - sd.spread < 0.0 { L.items[k] = shadow(rect_item(n, sx, sy, sw, top - sy, sd.color)); k += 1; }
+            if sd.oy + sd.spread > 0.0 { L.items[k] = shadow(rect_item(n, sx, bottom, sw, sy + sh - bottom, sd.color)); k += 1; }
+            if sd.ox - sd.spread < 0.0 { L.items[k] = shadow(rect_item(n, sx, my0, min(x, sx + sw) - sx, my1 - my0, sd.color)); k += 1; }
             if sd.ox + sd.spread > 0.0 {
                 let rx = max(x + w, sx);
-                L.items[k] = rect_item(n, rx, my0, sx + sw - rx, my1 - my0, sd.color);
+                L.items[k] = shadow(rect_item(n, rx, my0, sx + sw - rx, my1 - my0, sd.color));
                 k += 1;
             }
         }
@@ -1019,6 +1035,10 @@ fn box_paint(L: Layout, n: i32, s: Style, at: i64, x: f32, y: f32, w: f32, h: f3
         k += 1;
     } else if (s.bg >> 24) != 0 {
         L.items[k] = if rounded { box_item(n, x, y, w, h, s.bg, r, even(0.0), 0, false) } else { rect_item(n, x, y, w, h, s.bg) };
+        k += 1;    } else {
+        var hit = box_item(n, x, y, w, h, 0, r, even(0.0), 0, false);
+        hit.kind = ITEM_HIT;
+        L.items[k] = hit;
         k += 1;
     }
     // The padding box, where inset shadows go.
@@ -1030,7 +1050,7 @@ fn box_paint(L: Layout, n: i32, s: Style, at: i64, x: f32, y: f32, w: f32, h: f3
         let sd = s.shadows[s.shadow_count - 1 - j];
         guard sd.blur == 0.0 && sd.inset != 0 else { continue; }
         if sd.ox == 0.0 && sd.oy == 0.0 {
-            L.items[k] = box_item(n, px, py, pw, ph, 0, inner_radii(r, s), even(max(sd.spread, 0.0)), sd.color, false);
+            L.items[k] = shadow(box_item(n, px, py, pw, ph, 0, inner_radii(r, s), even(max(sd.spread, 0.0)), sd.color, false));
             k += 1;
             continue;
         }
@@ -1040,10 +1060,10 @@ fn box_paint(L: Layout, n: i32, s: Style, at: i64, x: f32, y: f32, w: f32, h: f3
         let right = sd.spread - sd.ox;
         let t = clamp(top, 0.0, ph);
         let b = clamp(bottom, 0.0, ph - t);
-        if top > 0.0 { L.items[k] = rect_item(n, px, py, pw, t, sd.color); k += 1; }
-        if bottom > 0.0 { L.items[k] = rect_item(n, px, py + ph - b, pw, b, sd.color); k += 1; }
-        if left > 0.0 { L.items[k] = rect_item(n, px, py + t, min(left, pw), ph - t - b, sd.color); k += 1; }
-        if right > 0.0 { L.items[k] = rect_item(n, px + pw - min(right, pw), py + t, min(right, pw), ph - t - b, sd.color); k += 1; }
+        if top > 0.0 { L.items[k] = shadow(rect_item(n, px, py, pw, t, sd.color)); k += 1; }
+        if bottom > 0.0 { L.items[k] = shadow(rect_item(n, px, py + ph - b, pw, b, sd.color)); k += 1; }
+        if left > 0.0 { L.items[k] = shadow(rect_item(n, px, py + t, min(left, pw), ph - t - b, sd.color)); k += 1; }
+        if right > 0.0 { L.items[k] = shadow(rect_item(n, px + pw - min(right, pw), py + t, min(right, pw), ph - t - b, sd.color)); k += 1; }
     }
     if !one_box(s) {
         let top = border_color(s.bt_color, s);
