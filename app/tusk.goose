@@ -31,10 +31,13 @@ struct Event { kind: i32, code: i32, x: f64, y: f64, w: f64, h: f64 }
 
 // Where a layer goes (platform/src/compositor.rs, Place), in points: its
 // content's point (scroll_x, scroll_y) lands on the window's (x, y), and a, b,
-// c, d turn and scale it about there (all 0: none). With clip_w above 0 it
+// c, d turn and scale it about there (all 0: none). With clip_w 0 or more it
 // shows only inside its clip, measured from where it lands, its corners
-// rounded by radius; it is faded by opacity and drawn over the layers of a
-// lower z, and only when shown isn't 0. Placing a layer rebuilds nothing.
+// rounded by radius (at most half its shorter side); a clip with no area shows
+// nothing, and clip_w below 0 is none. Opacity fades each thing in it, so
+// where two overlap the one below shows through. It is drawn over the layers
+// of a lower z, and only when shown isn't 0. Points are at most 1e7 from 0
+// and a, b, c, d at most 1e4. Placing a layer rebuilds nothing.
 struct Place {
     x: f32, y: f32, scroll_x: f32, scroll_y: f32, a: f32, b: f32, c: f32, d: f32,
     clip_x: f32, clip_y: f32, clip_w: f32, clip_h: f32, radius: f32, opacity: f32, z: i32, shown: i32,
@@ -106,9 +109,14 @@ let ERR_ARGUMENT: i32 = -4;      // platform/src/lib.rs
 let ERR_NO_DEVICE: i32 = -5;     // platform/src/lib.rs
 
 // What the main thread knows of a tab: its worker, what came with its last
-// display list (`ready` once one has) and what building it cost here, how
-// far it is scrolled, and its title, a span of the titles' bytes.
-struct Tab { worker: i64, ready: bool, info: FrameInfo, paint: f32, scroll: f32, title_at: i64, title_len: i64 }
+// display list (`ready` once one has) and what building it cost here, whether
+// a display list waits to be taken when it is shown, how far it is scrolled,
+// and its title and why it failed, spans of the notes' bytes (a length below
+// 0: it didn't).
+struct Tab {
+    worker: i64, ready: bool, info: FrameInfo, paint: f32, waiting: bool, scroll: f32,
+    title_at: i64, title_len: i64, why_at: i64, why_len: i64,
+}
 
 fn ms(from: i64, to: i64) -> f64 { return (to - from) / 1000000.0; }
 
@@ -149,9 +157,14 @@ fn take_frame(tabs: Tab[>..]&, k: i64) -> bool {
     return true;
 }
 
-// What the page weighs and what each stage of showing it took.
-fn weight(t: Tab, name: const u8[:], line: u8[>..]&) {
+// What the page weighs and what each stage of showing it took, or why it
+// didn't load.
+fn weight(t: Tab, name: const u8[:], notes: const u8[:], line: u8[>..]&) {
     format(line, name, "  ");
+    if t.why_len >= 0 {
+        line.append(notes[t.why_at..t.why_at + t.why_len]);
+        return;
+    }
     group(line, (t.info.bytes + 500) / 1000);
     line.append(" KB · ");
     group(line, t.info.nodes);
@@ -171,9 +184,9 @@ fn weight(t: Tab, name: const u8[:], line: u8[>..]&) {
 }
 
 // The bar along the bottom of the window, with the page's weight.
-fn show_bar(t: Tab, name: const u8[:], width: f32, height: f32, scale: f32) {
+fn show_bar(t: Tab, name: const u8[:], notes: const u8[:], width: f32, height: f32, scale: f32) {
     var line: u8[>..] = [];
-    weight(t, name, line);
+    weight(t, name, notes, line);
     var items: DItem[>..] = [];
     items.push(rect_item(-1, 0.0, height - BAR_H, width, BAR_H, 0xFF1B1C1E));
     items.push(text_item(-1, 12.0, height - 9.5, 0.0, 0xFFC9CBCF, FAMILY_MONO, 11.0, 0, line.len as i32));
@@ -206,8 +219,12 @@ fn take_reply(k: i64, head: ReplyHead&, text: u8[>..<]&) -> bool {
     guard tp_reply_head(k as i32, head) == 1 else { return false; }
     text.resize(0);
     for i in head.len { text.push(0); }
-    tp_take_reply(k as i32, text[..]);
-    return true;
+    return tp_take_reply(k as i32, head, text[..]) == 0;
+}
+
+// What tab k is called in the window's title: its title, else its file's name.
+fn title_of(t: Tab, notes: const u8[:], name: const u8[:]) -> const u8[:] {
+    return if t.title_len > 0 { notes[t.title_at..t.title_at + t.title_len] } else { name };
 }
 
 // Waits, without a window, for tab 0's display list, reading its replies
@@ -318,7 +335,8 @@ fn main() {
         let info = FrameInfo { height: 0.0, background: 0xFFFFFFFF, nodes: 0, bytes: 0, parse: 0.0, style: 0.0,
                                measure: 0.0, layout: 0.0, scale: 1.0 };
         let worker = thread_spawn_contained(tab_worker, k as i32, str(paths[start..end]));
-        tabs.push(Tab { worker: worker, ready: false, info: info, paint: 0.0, scroll: 0.0, title_at: 0, title_len: 0 });
+        tabs.push(Tab { worker: worker, ready: false, info: info, paint: 0.0, waiting: false, scroll: 0.0,
+                        title_at: 0, title_len: 0, why_at: 0, why_len: -1 });
         start = end;
     }
 
@@ -367,7 +385,7 @@ fn main() {
         let page_h = tabs[0].info.height;
         let y = clamp_scroll(at, page_h, shot_h);
         place_tab(0, true, y, shot_w, shot_h);
-        show_bar(tabs[0], paths[names[0]..path_ends[0]], shot_w, shot_h + BAR_H, scale);
+        show_bar(tabs[0], paths[names[0]..path_ends[0]], "", shot_w, shot_h + BAR_H, scale);
         let rc = tp_screenshot(shot, shot_w, shot_h + BAR_H, scale, tabs[0].info.background);
         guard rc == 0 else {
             if rc == ERR_ARGUMENT {
@@ -401,7 +419,7 @@ fn main() {
     var cur: i64 = 0;                // the tab shown
     var settle = false;              // a frame has been drawn since the bar last weighed the page
     var woken = false;
-    var titles: u8[>..] = [];        // every tab's title, one after another
+    var titles: u8[>..] = [];        // every tab's title and failure, one after another
     var pointer_x: f32 = -1.0;       // where the pointer is over the content, or -1 off it
     var pointer_y: f32 = -1.0;
     var head = ReplyHead { kind: 0, value: 0, len: 0 };
@@ -421,7 +439,7 @@ fn main() {
             guard idle_exit_ms < 0 else { break; }
             settle = false;
             if tabs[cur].ready {
-                show_bar(tabs[cur], paths[names[cur]..path_ends[cur]], width, height, scale);
+                show_bar(tabs[cur], paths[names[cur]..path_ends[cur]], titles[..], width, height, scale);
                 tp_render(tabs[cur].info.background);
             }
             continue;
@@ -430,7 +448,7 @@ fn main() {
         let before = tabs[cur].scroll;
         let was = cur;
         var resized = false;
-        var arrived = false;         // the shown tab's display list
+        var arrived = false;         // the shown tab's display list, or its failure
         var moved = false;
         loop {
             if e.kind == EV_CLOSE { quit = true; }
@@ -447,7 +465,11 @@ fn main() {
                 scale = s;
                 resized = true;
             } else if e.kind == EV_FRAME && e.code >= 0 && e.code < tabs.len {
-                if take_frame(tabs, e.code) && e.code == cur { arrived = true; }
+                // A hidden tab's display list waits in its mailbox, the latest
+                // replacing the one before, until the tab is shown: the main
+                // thread builds what it shows, and the GPU holds no more.
+                if e.code == cur { arrived = take_frame(tabs, cur) || arrived; }
+                else { tabs[e.code].waiting = true; }
             } else if e.kind == EV_REPLY && e.code >= 0 && e.code < tabs.len {
                 let k: i64 = e.code;
                 while take_reply(k, head, text) {
@@ -460,7 +482,16 @@ fn main() {
                         tabs[k].title_len = text.len;
                         if k == cur && text.len > 0 { tp_set_title(text); }
                     }
-                    else if head.kind == REPLY_FAILED { write_stderr(str("tusk: ", text, "\n")); }
+                    else if head.kind == REPLY_FAILED {
+                        write_stderr(str("tusk: ", text, "\n"));
+                        tabs[k].why_at = titles.len;
+                        titles.append(text);
+                        tabs[k].why_len = text.len;
+                        if k == cur {
+                            arrived = true;
+                            tp_set_title(paths[names[k]..path_ends[k]]);
+                        }
+                    }
                 }
             } else if e.kind == EV_SCROLL {
                 let dy = e.y as f32;
@@ -500,19 +531,28 @@ fn main() {
         let view_h = height - BAR_H;
         let switched = cur != was;
         if switched {
-            // Another tab: its layer shows, the one before hides, and the
-            // window takes its title.
-            place_tab(was, false, tabs[was].scroll, width, view_h);
-            if tabs[cur].title_len > 0 { tp_set_title(titles[tabs[cur].title_at..tabs[cur].title_at + tabs[cur].title_len]); }
+            // Another tab: its waiting display list goes into its layer, the
+            // one before hides, and the window takes its title.
+            if tabs[was].ready { place_tab(was, false, tabs[was].scroll, width, view_h); }
+            if tabs[cur].waiting {
+                tabs[cur].waiting = false;
+                take_frame(tabs, cur);
+            }
+            tp_set_title(title_of(tabs[cur], titles[..], paths[names[cur]..path_ends[cur]]));
         }
         tabs[cur].scroll = clamp_scroll(tabs[cur].scroll, tabs[cur].info.height, view_h);
         // The bar sits at the window's bottom edge: it moves with any resize.
-        if tabs[cur].ready && (resized || arrived || switched) {
-            show_bar(tabs[cur], paths[names[cur]..path_ends[cur]], width, height, scale);
+        // A tab still loading, or one that failed, shows its bar on a blank
+        // window once it is switched to. The window draws nothing before its
+        // first page, or why it failed: each frame drawn takes a drawable,
+        // and a second one costs its size in memory (5.5 MB at 960 × 720).
+        let showing = tabs[cur].ready || tabs[cur].why_len >= 0 || switched;
+        if showing && (resized || arrived || switched) {
+            show_bar(tabs[cur], paths[names[cur]..path_ends[cur]], titles[..], width, height, scale);
         }
         // A frame only when what is on screen changed.
-        if tabs[cur].ready && (resized || arrived || switched || tabs[cur].scroll != before) {
-            place_tab(cur, true, tabs[cur].scroll, width, view_h);
+        if showing && (resized || arrived || switched || tabs[cur].scroll != before) {
+            if tabs[cur].ready { place_tab(cur, true, tabs[cur].scroll, width, view_h); }
             tp_render(tabs[cur].info.background);
             settle = true;
         }
@@ -526,13 +566,13 @@ fn main() {
             else { tp_set_cursor(CURSOR_ARROW); }
         }
         if mode == MODE_SCROLL_TEST && tabs[cur].ready {
-            scroll_test(tabs[cur], width, height);
+            scroll_test(tabs, cur, width, height);
             quit = true;
         }
     }
     let worker_ok = worker < 0 || thread_wait(worker);
     var line: u8[>..] = [];
-    weight(tabs[cur], paths[names[cur]..path_ends[cur]], line);
+    weight(tabs[cur], paths[names[cur]..path_ends[cur]], titles[..], line);
     print(line);
     print("frames presented: ", tp_frames());
     tp_close();
@@ -556,11 +596,11 @@ fn end_tabs(tabs: Tab[>..]&) {
 
 // Scrolls down the page and back for 10 s at a brisk flick's speed, a frame
 // per display refresh, and prints what the frames cost (docs/adr/0003).
-fn scroll_test(t: Tab, width: f32, height: f32) {
+fn scroll_test(tabs: Tab[>..]&, cur: i64, width: f32, height: f32) {
     var stats = FrameStats { frames: 0, dropped: 0, refresh_hz: 0.0, max_interval_ms: 0.0, mean_interval_ms: 0.0,
                              max_cpu_ms: 0.0, max_gpu_ms: 0.0 };
     tp_frame_stats(stats, true);
-    let travel = max(t.info.height - (height - BAR_H), 1.0);
+    let travel = max(tabs[cur].info.height - (height - BAR_H), 1.0);
     let speed: f32 = 2000.0;       // points per second
     let start = clock_ns();
     var e = Event { kind: 0, code: 0, x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
@@ -569,14 +609,17 @@ fn scroll_test(t: Tab, width: f32, height: f32) {
         while tp_next_event(0, e) == 0 && e.kind != EV_NONE {
             if e.kind == EV_CLOSE { return; }
             if e.kind == EV_KEY && ((e.x as i64) & MOD_COMMAND) != 0 && e.code == KEY_Q { return; }
+            // A display list's wake comes once: taking it lets the next one wake.
+            if e.kind == EV_FRAME && e.code == cur { take_frame(tabs, cur); }
+            if e.kind == EV_FRAME && e.code != cur && e.code >= 0 && e.code < tabs.len { tabs[e.code].waiting = true; }
         }
         let s = ms(start, clock_ns()) / 1000.0;
         if s >= 10.0 { break; }
         let d = speed * s;
         let laps = floor(d / (2.0 * travel));
         let p = d - laps * 2.0 * travel;
-        place_tab(0, true, (if p < travel { p } else { 2.0 * travel - p }) as f32, width, height - BAR_H);
-        tp_render(t.info.background);
+        place_tab(cur, true, (if p < travel { p } else { 2.0 * travel - p }) as f32, width, height - BAR_H);
+        tp_render(tabs[cur].info.background);
     }
     tp_frame_stats(stats, false);
     print("scroll test: ", stats.frames, " frames in 10 s at ", stats.refresh_hz, " Hz; dropped ", stats.dropped,

@@ -5,13 +5,15 @@
 //! side spins: a worker sleeps until its inbox has something, and the main
 //! thread until AppKit hands it an event, or here without a window.
 //!
-//! What only the latest of matters is kept once: a new size or hit test
-//! replaces one still in the inbox, a new display list one not yet shown, and
-//! a new hit's reply one not yet read. A drag that resizes the window sends
-//! a tab one size at a time, however fast it goes.
+//! What only the latest of matters is kept once: a new size replaces one
+//! still in the inbox, a new hit test one still there (going behind what came
+//! since), a new display list one not yet shown, and a new hit's reply one
+//! not yet read. A drag that resizes the window sends a tab one size at a
+//! time, however fast it goes. Quit drops whatever else waits. Each worker
+//! sleeps on its own condition, so a post wakes that worker only.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Condvar, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::compositor::{DItem, MAX_LAYERS, with_compositor};
@@ -84,14 +86,21 @@ struct Tab {
     inbox: VecDeque<TabMsg>,
     frame: Option<Frame>,
     replies: VecDeque<Reply>,
+    /// Signalled when the inbox gets a message: the tab's worker waits on it.
+    wake: Arc<Condvar>,
 }
 
 static TABS: LazyLock<Mutex<HashMap<i32, Tab>>> = LazyLock::new(Default::default);
-/// Signalled when an inbox gets a message: the workers wait on it.
-static TO_TABS: Condvar = Condvar::new();
 /// Signalled when a frame or a reply is posted: the main thread waits on it
 /// when it has no window.
 static TO_MAIN: Condvar = Condvar::new();
+
+/// When a wait of `timeout_ms` ends: never, below 0 or past what an Instant
+/// can hold.
+fn deadline(timeout_ms: i64) -> Option<Instant> {
+    let ms = u64::try_from(timeout_ms).ok()?;
+    Instant::now().checked_add(Duration::from_millis(ms))
+}
 
 fn tabs() -> MutexGuard<'static, HashMap<i32, Tab>> {
     // A worker that panicked can't have left a tab half written: every
@@ -99,11 +108,16 @@ fn tabs() -> MutexGuard<'static, HashMap<i32, Tab>> {
     TABS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Opens tab `tab`'s mailbox, before its worker starts.
+/// Opens tab `tab`'s mailbox, before its worker starts. One already open is
+/// refused: its worker would read the new one's messages.
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_tab_open(tab: i32) -> i32 {
     guarded(|| {
-        tabs().insert(tab, Tab::default());
+        let mut tabs = tabs();
+        if tabs.contains_key(&tab) {
+            return Err(ERR_ARGUMENT);
+        }
+        tabs.insert(tab, Tab::default());
         Ok(0)
     })
 }
@@ -118,8 +132,7 @@ pub extern "C" fn tp_tab_drop(tab: i32) -> i32 {
     })
 }
 
-/// Posts `msg` to tab `tab`'s worker. A size or a hit test replaces one of
-/// its kind still waiting.
+/// Posts `msg` to tab `tab`'s worker, and wakes that worker only.
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_tab_post(tab: i32, msg: *const TabMsg) -> i32 {
     guarded(|| {
@@ -130,19 +143,28 @@ pub extern "C" fn tp_tab_post(tab: i32, msg: *const TabMsg) -> i32 {
         let mut tabs = tabs();
         let t = tabs.get_mut(&tab).ok_or(ERR_ARGUMENT)?;
         post(&mut t.inbox, m);
-        TO_TABS.notify_all();
+        t.wake.notify_one();
         Ok(0)
     })
 }
 
-/// Queues `m`, replacing a size or a hit test of its kind still waiting.
+/// Queues `m`. A size replaces one still waiting, where it waits: what came
+/// after it is laid out for. A hit test replaces one still waiting and goes
+/// last, so it is answered on the layout of every size before it. Quit drops
+/// the rest.
 fn post(inbox: &mut VecDeque<TabMsg>, m: TabMsg) {
-    if m.kind == MSG_SIZE || m.kind == MSG_HIT {
-        let kind = m.kind;
-        if let Some(waiting) = inbox.iter_mut().find(|w| w.kind == kind) {
-            *waiting = m;
-            return;
-        }
+    let kind = m.kind;
+    if kind == MSG_SIZE
+        && let Some(waiting) = inbox.iter_mut().find(|w| w.kind == MSG_SIZE)
+    {
+        *waiting = m;
+        return;
+    }
+    if kind == MSG_HIT {
+        inbox.retain(|w| w.kind != MSG_HIT);
+    }
+    if kind == MSG_QUIT {
+        inbox.clear();
     }
     inbox.push_back(m);
 }
@@ -156,8 +178,7 @@ pub extern "C" fn tp_tab_next(tab: i32, timeout_ms: i64, out: *mut TabMsg) -> i3
         if out.is_null() {
             return Err(ERR_ARGUMENT);
         }
-        let until =
-            (timeout_ms >= 0).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
+        let until = deadline(timeout_ms);
         let mut tabs = tabs();
         loop {
             let t = tabs.get_mut(&tab).ok_or(ERR_ARGUMENT)?;
@@ -165,15 +186,15 @@ pub extern "C" fn tp_tab_next(tab: i32, timeout_ms: i64, out: *mut TabMsg) -> i3
                 unsafe { out.write_unaligned(m) };
                 return Ok(1);
             }
+            let wake = t.wake.clone();
             tabs = match until {
-                None => TO_TABS.wait(tabs).unwrap_or_else(|e| e.into_inner()),
+                None => wake.wait(tabs).unwrap_or_else(|e| e.into_inner()),
                 Some(until) => {
                     let left = until.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         return Ok(0);
                     }
-                    TO_TABS
-                        .wait_timeout(tabs, left)
+                    wake.wait_timeout(tabs, left)
                         .unwrap_or_else(|e| e.into_inner())
                         .0
                 }
@@ -296,10 +317,14 @@ pub extern "C" fn tp_reply_head(tab: i32, out: *mut ReplyHead) -> i32 {
 }
 
 /// On the main thread: takes tab `tab`'s first waiting reply, copying its
-/// text into `text`, which tp_reply_head said how long to make.
+/// text into `text`, which tp_reply_head said how long to make, and writes
+/// its head to `out`: a hit's reply may have been replaced since.
 #[unsafe(no_mangle)]
-pub extern "C" fn tp_take_reply(tab: i32, text: GSlice<u8>) -> i32 {
+pub extern "C" fn tp_take_reply(tab: i32, out: *mut ReplyHead, text: GSlice<u8>) -> i32 {
     guarded(|| {
+        if out.is_null() {
+            return Err(ERR_ARGUMENT);
+        }
         let n = text.count().ok_or(ERR_ARGUMENT)?;
         let mut tabs = tabs();
         let t = tabs.get_mut(&tab).ok_or(ERR_ARGUMENT)?;
@@ -310,6 +335,12 @@ pub extern "C" fn tp_take_reply(tab: i32, text: GSlice<u8>) -> i32 {
         for (i, &b) in r.text.iter().enumerate() {
             unsafe { text.set(i, b) };
         }
+        let head = ReplyHead {
+            kind: r.kind,
+            value: r.value,
+            len: n as i64,
+        };
+        unsafe { out.write_unaligned(head) };
         t.replies.pop_front();
         Ok(0)
     })
@@ -321,8 +352,7 @@ pub extern "C" fn tp_take_reply(tab: i32, text: GSlice<u8>) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_wait_tab(tab: i32, timeout_ms: i64) -> i32 {
     guarded(|| {
-        let until =
-            (timeout_ms >= 0).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
+        let until = deadline(timeout_ms);
         let mut tabs = tabs();
         loop {
             let t = tabs.get(&tab).ok_or(ERR_ARGUMENT)?;
@@ -360,8 +390,15 @@ mod tests {
         assert_eq!(std::mem::size_of::<ReplyHead>(), 16);
     }
 
+    fn no<T>() -> GSlice<T> {
+        GSlice {
+            data: std::ptr::null_mut(),
+            len: 0,
+        }
+    }
+
     #[test]
-    fn only_the_latest_size_and_hit_wait() {
+    fn only_the_latest_size_and_hit_wait_and_quit_drops_the_rest() {
         let msg = |kind, a| TabMsg {
             kind,
             a,
@@ -374,16 +411,75 @@ mod tests {
         post(&mut inbox, msg(MSG_SNAPSHOT, 0.0));
         post(&mut inbox, msg(MSG_HIT, 2.0));
         post(&mut inbox, msg(MSG_SNAPSHOT, 0.0));
-        let got: Vec<(i32, f32)> = inbox.iter().map(|m| (m.kind, m.a)).collect();
+        let got = |inbox: &VecDeque<TabMsg>| -> Vec<(i32, f32)> {
+            inbox.iter().map(|m| (m.kind, m.a)).collect()
+        };
+        // The size where the first was; the hit after what came since.
         assert_eq!(
-            got,
+            got(&inbox),
             [
                 (MSG_SIZE, 200.0),
-                (MSG_HIT, 2.0),
                 (MSG_SNAPSHOT, 0.0),
+                (MSG_HIT, 2.0),
                 (MSG_SNAPSHOT, 0.0)
             ]
         );
+        post(&mut inbox, msg(MSG_QUIT, 0.0));
+        post(&mut inbox, msg(MSG_QUIT, 1.0));
+        assert_eq!(got(&inbox), [(MSG_QUIT, 1.0)]);
+    }
+
+    #[test]
+    fn a_post_wakes_a_worker_already_waiting_and_a_frame_the_main_thread() {
+        // Each side waits first, with a long timeout, and must be woken well
+        // before it runs out.
+        let tab = 9003;
+        assert_eq!(tp_tab_open(tab), 0);
+        let worker = std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut m = TabMsg::default();
+            assert_eq!(tp_tab_next(tab, 5000, &mut m), 1);
+            let woke = start.elapsed();
+            std::thread::sleep(Duration::from_millis(50));
+            let info = FrameInfo {
+                scale: 2.0,
+                ..Default::default()
+            };
+            assert_eq!(tp_post_frame(tab, no(), no(), no(), &info), 0);
+            woke
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let size = TabMsg {
+            kind: MSG_SIZE,
+            a: 640.0,
+            b: 480.0,
+            c: 2.0,
+        };
+        assert_eq!(tp_tab_post(tab, &size), 0);
+        let start = Instant::now();
+        assert_eq!(tp_wait_tab(tab, 5000), 1);
+        let main_woke = start.elapsed();
+        let worker_woke = worker.join().unwrap();
+        assert!(worker_woke < Duration::from_millis(1000), "{worker_woke:?}");
+        assert!(main_woke < Duration::from_millis(1000), "{main_woke:?}");
+        assert_eq!(tp_tab_drop(tab), 0);
+    }
+
+    #[test]
+    fn a_mailbox_opens_once_and_a_wait_past_any_clock_doesnt_overflow() {
+        let tab = 9004;
+        assert_eq!(tp_tab_open(tab), 0);
+        assert_eq!(tp_tab_open(tab), ERR_ARGUMENT);
+        let quit = TabMsg {
+            kind: MSG_QUIT,
+            ..Default::default()
+        };
+        assert_eq!(tp_tab_post(tab, &quit), 0);
+        let mut m = TabMsg::default();
+        assert_eq!(tp_tab_next(tab, i64::MAX, &mut m), 1);
+        assert_eq!(tp_tab_drop(tab), 0);
+        assert_eq!(tp_tab_open(tab), 0);
+        assert_eq!(tp_tab_drop(tab), 0);
     }
 
     #[test]
@@ -442,7 +538,7 @@ mod tests {
             data: got.as_mut_ptr(),
             len: 5,
         };
-        assert_eq!(tp_take_reply(tab, into), 0);
+        assert_eq!(tp_take_reply(tab, &mut head, into), 0);
         assert_eq!(&got, b"title");
         assert_eq!(tp_reply_head(tab, &mut head), 0);
         assert_eq!(tp_tab_drop(tab), 0);
@@ -450,21 +546,69 @@ mod tests {
     }
 
     #[test]
-    fn a_hit_reply_replaces_the_one_not_read() {
+    fn only_a_hit_reply_replaces_and_only_one_not_read() {
         let tab = 9002;
         assert_eq!(tp_tab_open(tab), 0);
-        let empty = GSlice::<u8> {
-            data: std::ptr::null_mut(),
-            len: 0,
+        let mut title = *b"Focaccia";
+        let text = GSlice {
+            data: title.as_mut_ptr(),
+            len: 8,
         };
-        assert_eq!(tp_post_reply(tab, REPLY_HIT, 0, empty), 0);
-        assert_eq!(tp_post_reply(tab, REPLY_HIT, 1, empty), 0);
+        assert_eq!(tp_post_reply(tab, REPLY_HIT, 0, no()), 0);
+        assert_eq!(tp_post_reply(tab, REPLY_TITLE, 0, text), 0);
+        assert_eq!(tp_post_reply(tab, REPLY_HIT, 1, no()), 0);
+        assert_eq!(tp_post_reply(tab, REPLY_SNAPSHOT, 0, no()), 0);
         let mut head = ReplyHead::default();
+        let mut kinds = Vec::new();
+        while tp_reply_head(tab, &mut head) == 1 {
+            let len = head.len as usize;
+            let mut buf = vec![0u8; len];
+            let into = GSlice {
+                data: if len == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    buf.as_mut_ptr()
+                },
+                len: len as i64,
+            };
+            // Taken into the wrong length, it stays.
+            if len > 0 {
+                let short = GSlice {
+                    data: buf.as_mut_ptr(),
+                    len: len as i64 - 1,
+                };
+                assert_eq!(tp_take_reply(tab, &mut head, short), ERR_ARGUMENT);
+            }
+            assert_eq!(tp_take_reply(tab, &mut head, into), 0);
+            let (kind, value) = (head.kind, head.value);
+            kinds.push((kind, value));
+        }
+        assert_eq!(
+            kinds,
+            [(REPLY_HIT, 1), (REPLY_TITLE, 0), (REPLY_SNAPSHOT, 0)]
+        );
+        // Two titles both wait, and a hit doesn't replace one.
+        assert_eq!(tp_post_reply(tab, REPLY_TITLE, 0, no()), 0);
+        assert_eq!(tp_post_reply(tab, REPLY_TITLE, 1, no()), 0);
+        assert_eq!(tp_post_reply(tab, REPLY_HIT, 1, no()), 0);
+        let mut waiting = Vec::new();
+        while tp_reply_head(tab, &mut head) == 1 {
+            assert_eq!(tp_take_reply(tab, &mut head, no()), 0);
+            let (kind, value) = (head.kind, head.value);
+            waiting.push((kind, value));
+        }
+        assert_eq!(
+            waiting,
+            [(REPLY_TITLE, 0), (REPLY_TITLE, 1), (REPLY_HIT, 1)]
+        );
+        // Replaced between its head and its taking, a hit's reply is taken
+        // with the head it has then.
+        assert_eq!(tp_post_reply(tab, REPLY_HIT, 2, no()), 0);
         assert_eq!(tp_reply_head(tab, &mut head), 1);
+        assert_eq!(tp_post_reply(tab, REPLY_HIT, 3, no()), 0);
+        assert_eq!(tp_take_reply(tab, &mut head, no()), 0);
         let value = head.value;
-        assert_eq!(value, 1);
-        assert_eq!(tp_take_reply(tab, empty), 0);
-        assert_eq!(tp_reply_head(tab, &mut head), 0);
+        assert_eq!(value, 3);
         assert_eq!(tp_tab_drop(tab), 0);
     }
 }

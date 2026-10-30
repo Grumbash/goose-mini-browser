@@ -346,7 +346,8 @@ fn take(p: &mut Platform, until: &NSDate) -> bool {
         // Our own wake events and key presses stop here: AppKit would beep
         // at keys no responder handles.
         let kind = ev.r#type();
-        if kind != NSEventType::ApplicationDefined && kind != NSEventType::KeyDown {
+        let ours = kind == NSEventType::ApplicationDefined && ev.subtype().0 == OURS;
+        if !ours && kind != NSEventType::KeyDown {
             p.app.sendEvent(&ev);
         }
         check_window(p);
@@ -412,6 +413,9 @@ fn translate(p: &mut Platform, ev: &NSEvent) -> Option<GpEvent> {
     let kind = ev.r#type();
     if kind == NSEventType::ApplicationDefined {
         // post_to_main's: the kind in data2, the code in data1.
+        if ev.subtype().0 != OURS {
+            return None;
+        }
         return Some(GpEvent {
             kind: ev.data2() as i32,
             code: ev.data1() as i32,
@@ -616,6 +620,10 @@ pub extern "C" fn tp_wake(token: i32) -> i32 {
 
 /// Posts an event of `kind` with `code` to the main thread's queue, from any
 /// thread, for tp_next_event to hand to Goose.
+/// The subtype Tusk's own application-defined events carry: others, from a
+/// framework or another app's helper, are AppKit's to handle.
+const OURS: i16 = 0x7475; // "tu"
+
 pub(crate) fn post_to_main(kind: i32, code: i32) {
     dispatch2::DispatchQueue::main().exec_async(move || {
         let Some(mtm) = MainThreadMarker::new() else { return };
@@ -628,7 +636,7 @@ pub(crate) fn post_to_main(kind: i32, code: i32) {
                 0.0,
                 0,
                 None,
-                0,
+                OURS,
                 code as isize,
                 kind as isize,
             )

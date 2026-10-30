@@ -50,7 +50,7 @@ extern "tusk_platform" {
     fn tp_post_reply(tab: i32, kind: i32, value: i32, text: const u8[:]) -> i32;
     fn tp_take_frame(tab: i32, layer: i32, info: FrameInfo&) -> i32;
     fn tp_reply_head(tab: i32, out: ReplyHead&) -> i32;
-    fn tp_take_reply(tab: i32, text: u8[:]) -> i32;
+    fn tp_take_reply(tab: i32, out: ReplyHead&, text: u8[:]) -> i32;
     fn tp_wait_tab(tab: i32, timeout_ms: i64) -> i32;
 }
 
@@ -130,7 +130,10 @@ fn serve(tab: i32, P: Page, info: FrameInfo&) {
     var paths: f32[>..<] = [];
     var m = TabMsg { kind: 0, a: 0.0, b: 0.0, c: 0.0 };
     loop {
-        guard tp_tab_next(tab, -1, m) == 1 else { continue; }
+        // A mailbox that fails (closed under it) ends the worker.
+        let got = tp_tab_next(tab, -1, m);
+        guard got >= 0 else { return; }
+        guard got == 1 else { continue; }
         if m.kind == MSG_QUIT { return; }
         if m.kind == MSG_SIZE {
             let t = clock_ns();
@@ -158,7 +161,9 @@ fn serve(tab: i32, P: Page, info: FrameInfo&) {
 fn serve_nothing(tab: i32) {
     var m = TabMsg { kind: 0, a: 0.0, b: 0.0, c: 0.0 };
     loop {
-        guard tp_tab_next(tab, -1, m) == 1 else { continue; }
+        let got = tp_tab_next(tab, -1, m);
+        guard got >= 0 else { return; }
+        guard got == 1 else { continue; }
         if m.kind == MSG_QUIT { return; }
         if m.kind == MSG_HIT { tp_post_reply(tab, REPLY_HIT, CURSOR_ARROW, ""); }
         if m.kind == MSG_SNAPSHOT { tp_post_reply(tab, REPLY_SNAPSHOT, 0, ""); }
