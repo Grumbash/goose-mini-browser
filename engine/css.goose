@@ -984,7 +984,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
     if name == "margin" || name == "padding" {
         let base = if name == "margin" { P_MT } else { P_PT };
         let parts = values(value);
-        guard parts.len >= 1 && parts.len <= 4;
+        guard parts.len >= 1 && parts.len <= 4 else { return; }
         // top right bottom left, with CSS's rules for one to three values.
         let n = parts.len;
         let t = parts[0];
@@ -1031,7 +1031,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
         // elliptical second half, after a slash, is left out.
         let slash = find(value, "/");
         let parts = values(if name == "border-radius" && slash >= 0 { value[..slash] } else { value });
-        guard parts.len >= 1 && parts.len <= 4;
+        guard parts.len >= 1 && parts.len <= 4 else { return; }
         for side in 4 {
             let v = parts[side_index(parts.len, side)];
             if name == "border-width" { add_value(side_prop(side, P_BT_WIDTH, P_BR_WIDTH, P_BB_WIDTH, P_BL_WIDTH), v, important, out); }
@@ -1053,7 +1053,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
     if name == "gap" || name == "grid-gap" {
         // row, then column; one value is both.
         let parts = words(value);
-        guard parts.len >= 1 && parts.len <= 2;
+        guard parts.len >= 1 && parts.len <= 2 else { return; }
         add_value(P_ROW_GAP, parts[0], important, out);
         add_value(P_COLUMN_GAP, parts[parts.len - 1], important, out);
         return;
@@ -1190,11 +1190,11 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
             return;
         }
         let n, u, ok = parse_length(value);
-        guard !ok || n >= 0.0;
+        guard !ok || n >= 0.0 else { return; }
     }
     if prop >= P_BT_STYLE && prop <= P_BL_STYLE {
         let st = border_style(value);
-        guard st >= 0;
+        guard st >= 0 else { return; }
         d.kind = V_KEYWORD;
         d.num = st;
         push_decl(out, d);
@@ -1215,7 +1215,7 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
     if prop == P_OPACITY {
         let pct = value.len > 0 && value[value.len - 1] == '%';
         let n, ok = parse_flt(if pct { value[..value.len - 1] } else { value });
-        guard ok;
+        guard ok else { return; }
         d.kind = V_NUMBER;
         d.num = (if pct { n / 100.0 } else { n }) as f32;
         push_decl(out, d);
@@ -1223,7 +1223,7 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
     }
     if prop == P_COLOR || prop == P_BG || prop == P_BT_COLOR || prop == P_BB_COLOR || prop == P_BL_COLOR || prop == P_BR_COLOR {
         let c, ok = parse_color(value);
-        guard ok;
+        guard ok else { return; }
         d.kind = V_COLOR;
         d.color = c;
         push_decl(out, d);
@@ -1239,7 +1239,7 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
         let n, ok = parse_int(value);
         if ok { d.kind = V_KEYWORD; d.num = (if n >= 600 { K_BOLD } else { K_NORMAL }) as f32; push_decl(out, d); return; }
         let k = keyword(value);
-        guard k == K_BOLD || k == K_NORMAL || value == "bolder" || value == "lighter";
+        guard k == K_BOLD || k == K_NORMAL || value == "bolder" || value == "lighter" else { return; }
         d.kind = V_KEYWORD;
         d.num = (if k == K_BOLD || value == "bolder" { K_BOLD } else { K_NORMAL }) as f32;
         push_decl(out, d);

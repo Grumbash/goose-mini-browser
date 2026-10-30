@@ -1563,7 +1563,7 @@ recursive fn add_widths(L: Layout, n: i32, p: Widths&) {
     let node = L.d.nodes[n];
     if node.kind == NODE_TEXT {
         let r = L.run_of[n];
-        guard r >= 0;
+        guard r >= 0 else { return; }
         let run = L.runs[r];
         let ws = L.styles[n].ws;
         let wraps = ws == K_NORMAL || ws == K_PRE_WRAP;

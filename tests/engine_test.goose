@@ -418,6 +418,24 @@ fn test_box() {
 
     check("rounded boxes, dashes, rings and bars, opacity", layout_probe(paint, 100.0, PROBE_PAINT),
           "r box 0,0,100,20 ffff0000 r 4,4,4,4 b 0 00000000 solid\np box 0,20,40,20 ff00ff00 r 10,10,10,10 b 0 00000000 solid\nu box 0,40,100,24 00000000 r 0,0,0,0 b 2 ff0000ff dashed\ns box -1,83,102,22 00000000 r 0,0,0,0 b 1 ff000000 solid\ns rect 0,84,3,20 ff0000ff\no rect 0,104,100,20 80ff0000\nt box 0,124,100,10 ff000000 r 6,6,0,0 b 0 00000000 solid\n");
+
+    // An invalid value is dropped, whatever else it would parse as: a
+    // negative border width, a keyword that isn't a border style, opacity or
+    // colour, a colour that is a length, a weight that is a keyword.
+    let invalid = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        div { width: 10px; height: 10px; border: 3px solid #000; background: #f00 }
+        #w { border-top-width: -2px } #s { border-top-style: block } #o { opacity: none }</style>
+        <div id=w></div><div id=s></div><div id=o></div>
+        """;
+    check("invalid border widths, styles and opacity", layout_probe(invalid, 100.0, PROBE_PAINT),
+          str("w rect 0,0,16,16 ffff0000\nw rect 0,0,16,3 ff000000\nw rect 13,3,3,10 ff000000\nw rect 0,13,16,3 ff000000\nw rect 0,3,3,10 ff000000\n",
+              "s rect 0,16,16,16 ffff0000\ns rect 0,16,16,3 ff000000\ns rect 13,19,3,10 ff000000\ns rect 0,29,16,3 ff000000\ns rect 0,19,3,10 ff000000\n",
+              "o rect 0,32,16,16 ffff0000\no rect 0,32,16,3 ff000000\no rect 13,35,3,10 ff000000\no rect 0,45,16,3 ff000000\no rect 0,35,3,10 ff000000\n")[..]);
+    let words = """<p style="color: #f00"><span style="color: none">a</span><span style="color: 0">b</span><b style="font-weight: auto">c</b></p>""";
+    check("a keyword as a colour", style_at(words, "span", 0, false), "display=2 size=17.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check("a length as a colour", style_at(words, "span", 1, false), "display=2 size=17.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check("a keyword as a weight", style_of(words, "b"), "display=2 size=17.0 bold=1 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
 }
 
 fn test_positioning() {
