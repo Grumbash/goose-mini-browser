@@ -1174,10 +1174,15 @@ fn last_element_child(d: Doc, p: i32) -> i32 {
     return last;
 }
 
-// Scratch the cascade shares across all elements, so that styling makes no
-// arrays per element: each call pushes above what is there and takes it back
+// What the cascade shares across all elements. The rule index: every rule
+// filed under one key of its last compound, in `order`, bucket b's at
+// offsets[b] to offsets[b + 1]. And scratch, so that styling makes no arrays
+// per element: each call pushes above what is there and takes it back
 // before it returns.
-struct Work { customs: Decl[>..<]&, prio: i64[>..<]&, text: u8[>..<]& }
+struct Work { offsets: i32[>..]&, order: i32[>..]&, customs: Decl[>..<]&, prio: i64[>..<]&, text: u8[>..<]& }
+
+let BUCKETS: i64 = 1024;
+let UNIVERSAL: i32 = 1024;      // the bucket of rules with no id, class or tag to file them under
 
 // Computes the style of every element into `styles`, indexed like d.nodes,
 // and makes the ::before and ::after that rules give content to.
@@ -1188,11 +1193,55 @@ fn compute_styles(d: Doc, sh: Sheet, styles: Style[>..]&) {
     // don't pay for looking.
     var pseudo_rules: i32[>..] = [];
     for r, i in sh.rules { if r.pseudo != 0 { pseudo_rules.push(i as i32); } }
+    var offsets: i32[>..] = [];
+    var order: i32[>..] = [];
+    index_rules(sh, offsets, order);
     var customs: Decl[>..<] = [];
     var prio: i64[>..<] = [];
     var text: u8[>..<] = [];
-    let w = Work { customs: customs, prio: prio, text: text };
+    let w = Work { offsets: offsets, order: order, customs: customs, prio: prio, text: text };
     compute_subtree(d, sh, styles, 0, root_style(), pseudo_rules[..], w);
+}
+
+// Files every rule under one key of its last compound, so that an element
+// tries only the rules it could match: those under its id, its classes, its
+// tag, and the universal ones.
+fn index_rules(sh: Sheet, offsets: i32[>..]&, order: i32[>..]&) {
+    var counts: i32[1025];
+    fill(counts[..], 0);
+    for r in sh.rules { counts[rule_bucket(sh, r)] += 1; }
+    offsets.push(0);
+    for b in BUCKETS + 1 { offsets.push(offsets[b] + counts[b]); }
+    var next: i32[1025];
+    for b in BUCKETS + 1 { next[b] = offsets[b]; }
+    for r in sh.rules { order.push(0); }
+    for r, i in sh.rules {
+        let b = rule_bucket(sh, r);
+        order[next[b]] = i as i32;
+        next[b] += 1;
+    }
+}
+
+// The bucket a rule is filed under: its last compound's id, else its first
+// class, else its tag, else UNIVERSAL.
+fn rule_bucket(sh: Sheet, r: Rule) -> i32 {
+    let c = sh.comps[r.comp + r.comp_count - 1];
+    if c.id_len > 0 { return bucket_of('#', span_of(sh, c.id, c.id_len)); }
+    if c.cls_count > 0 {
+        let s = sh.classes[c.cls];
+        return bucket_of('.', span_of(sh, s.start, s.len));
+    }
+    if c.tag_len > 0 { return bucket_of('<', span_of(sh, c.tag, c.tag_len)); }
+    return UNIVERSAL;
+}
+
+// A key's bucket: FNV-1a over its kind ('#' id, '.' class, '<' tag) and its
+// bytes, so that the tag p and the class p land apart.
+fn bucket_of(kind: u8, key: const u8[:]) -> i32 {
+    var h: u64 = 2166136261;
+    h = ((h ^ kind) * 16777619) & 0xFFFFFFFF;
+    for c in key { h = ((h ^ c) * 16777619) & 0xFFFFFFFF; }
+    return (h & 1023) as i32;               // BUCKETS is 1024
 }
 
 recursive fn compute_subtree(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, parent: Style, pseudo_rules: const i32[:], w: Work) {
@@ -1248,13 +1297,27 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
     var win: Decl[NPROPS];
     fill(win_prio[..], -1);
     let mark = w.customs.len;
-    for r in sh.rules {
-        guard r.pseudo == pseudo && rule_matches(sh, d, r, e) else { continue; }
-        for j in r.decl..r.decl + r.decl_count {
-            let dc = sh.decls[j];
-            let prio = (dc.important as i64) << 62 | (r.origin as i64) << 56 | (r.spec as i64) << 32 | r.order;
-            if dc.prop == P_CUSTOM { keep_custom(sh, w, mark, dc, prio); continue; }
-            if prio >= win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
+    // The buckets this element's rules can be in. A rule whose bucket comes
+    // up twice (two keys that hash alike) is tried twice, which changes nothing.
+    var buckets: i32[64];
+    buckets[0] = UNIVERSAL;
+    buckets[1] = bucket_of('<', node_name(d, e));
+    var nb = 2;
+    let id, has_id = attr_value(d, e, "id");
+    if has_id && id.len > 0 { buckets[nb] = bucket_of('#', id); nb += 1; }
+    let cls, has_cls = attr_value(d, e, "class");
+    if has_cls { each_word(cls) { if nb < 64 { buckets[nb] = bucket_of('.', it); nb += 1; } }; }
+    for bi in nb {
+        let b = buckets[bi];
+        for k in w.offsets[b]..w.offsets[b + 1] {
+            let r = sh.rules[w.order[k]];
+            guard r.pseudo == pseudo && rule_matches(sh, d, r, e) else { continue; }
+            for j in r.decl..r.decl + r.decl_count {
+                let dc = sh.decls[j];
+                let prio = (dc.important as i64) << 62 | (r.origin as i64) << 56 | (r.spec as i64) << 32 | r.order;
+                if dc.prop == P_CUSTOM { keep_custom(sh, w, mark, dc, prio); continue; }
+                if prio >= win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
+            }
         }
     }
     // The style attribute beats every sheet, at its own importance.
