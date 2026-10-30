@@ -95,6 +95,15 @@ struct Cost { bytes: i64, parse: f64, style: f64, measure: f64, layout: f64, pai
 
 fn ms(from: i64, to: i64) -> f64 { return (to - from) / 1000000.0; }
 
+// Hands a layer to the compositor. One it refuses would leave the window or
+// the screenshot without it, so Tusk stops and says why.
+fn set_layer(layer: i32, items: const DItem[:], text: const u8[:], scale: f32) {
+    let rc = tp_set_layer(layer, items, text, scale);
+    guard rc != 0 else { return; }
+    write_stderr(str("tusk: the compositor refused layer ", layer, " (error ", rc, ")\n"));
+    exit(1);
+}
+
 fn measure_page(P: Page) {
     var boxes: Rect[>..] = [];
     var items: DItem[>..] = [];
@@ -113,7 +122,7 @@ fn show_page(P: Page, width: f32, scale: f32, cost: Cost&) -> f32 {
     let t0 = clock_ns();
     let height = layout_page(L, width);
     let t1 = clock_ns();
-    tp_set_layer(LAYER_PAGE, items, P.text, scale);
+    set_layer(LAYER_PAGE, items, P.text, scale);
     cost.layout = ms(t0, t1);
     cost.paint = ms(t1, clock_ns());
     return height;
@@ -149,7 +158,7 @@ fn show_bar(P: Page, name: const u8[:], cost: Cost, width: f32, height: f32, sca
                        font: 0, size: 0.0, text: 0, text_len: 0, node: -1 });
     items.push(DItem { kind: ITEM_TEXT, x: 12.0, y: height - 9.5, w: 0.0, h: 0.0, color: 0xFFC9CBCF,
                        font: FAMILY_MONO, size: 11.0, text: 0, text_len: line.len as i32, node: -1 });
-    tp_set_layer(LAYER_BAR, items, line, scale);
+    set_layer(LAYER_BAR, items, line, scale);
 }
 
 // n with its thousands separated by commas.
