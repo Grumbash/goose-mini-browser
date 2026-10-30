@@ -460,6 +460,16 @@ fn layout_page(L: const Layout&, width: f32, height: f32) -> f32 {
         node_matrices(L, 0, identity(), mats);
     }
     if clips { clip_items(L, mats); }
+    // The page scrolls as far as what it draws reaches, as a browser's
+    // viewport scrolls its overflow: an <html> or <body> 100% high (a page
+    // that sizes itself to the window, as Wikipedia's does) holds less than
+    // its content. What a clip cuts reaches only as far as the clip.
+    for it in L.items {
+        var bottom = it.y + it.h;
+        if it.clip_w > 0.0 { bottom = min(bottom, it.clip_y + it.clip_h); }
+        if it.oclip_w > 0.0 { bottom = min(bottom, it.oclip_y + it.oclip_h); }
+        page_h = max(page_h, bottom);
+    }
     if transformed {
         transform_items(L, mats);
         transform_boxes(L, mats);

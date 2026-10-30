@@ -1139,6 +1139,11 @@ fn test_heights() {
     check("percentage heights", layout_probe(pcts, 400.0, PROBE_GEOMETRY),
           "a x 0.0 y 0.0 w 400.0 h 100.0\nb x 0.0 y 200.0 w 400.0 h 0.0\nc x 0.0 y 200.0 w 400.0 h 150.0\nd x 10.0 y 360.0 w 380.0 h 100.0\ne x 0.0 y 0.0 w 10.0 h 30.0\nf x 0.0 y 470.0 w 400.0 h 40.0\n");
     // So does an <svg>'s, its width following through its viewBox.
+    // A page sized to the window, as Wikipedia's is (html, body { height:
+    // 100% }), scrolls to the end of what it draws; what a clip cuts counts
+    // only as far as the clip.
+    check("a page scrolls to the end of its overflow", layout_probe("""<style>html, body { height: 100%; margin: 0; padding: 0; max-width: none }</style><div style="height: 900px; background: #000"></div><div style="height: 300px; overflow: hidden"><div style="height: 5000px; background: #000"></div></div>""", 400.0, PROBE_PAGE),
+          "1200.0");
     check("an svg's percentage height", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none }</style><div style="height: 100px"><svg id=s viewBox="0 0 2 1" style="display: block; height: 50%"></svg></div>""", 400.0, PROBE_GEOMETRY),
           "s x 0.0 y 0.0 w 100.0 h 50.0\n");
 }
