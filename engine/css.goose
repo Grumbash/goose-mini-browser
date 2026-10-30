@@ -40,7 +40,26 @@ let P_BT_COLOR: i32 = 25;
 let P_BB_COLOR: i32 = 26;
 let P_TEXT_INDENT: i32 = 27;
 let P_CONTENT: i32 = 28;
-let NPROPS: i64 = 29;
+let P_HEIGHT: i32 = 29;
+let P_MIN_WIDTH: i32 = 30;
+let P_MIN_HEIGHT: i32 = 31;
+let P_MAX_HEIGHT: i32 = 32;
+let P_BOX_SIZING: i32 = 33;
+let P_BL_WIDTH: i32 = 34;
+let P_BR_WIDTH: i32 = 35;
+let P_BL_COLOR: i32 = 36;
+let P_BR_COLOR: i32 = 37;
+let P_BT_STYLE: i32 = 38;
+let P_BR_STYLE: i32 = 39;
+let P_BB_STYLE: i32 = 40;
+let P_BL_STYLE: i32 = 41;
+let P_RAD_TL: i32 = 42;
+let P_RAD_TR: i32 = 43;
+let P_RAD_BR: i32 = 44;
+let P_RAD_BL: i32 = 45;
+let P_BOX_SHADOW: i32 = 46;
+let P_OPACITY: i32 = 47;
+let NPROPS: i64 = 48;
 let P_CUSTOM: i32 = -2;   // a custom property, --name, which the cascade keeps apart
 
 // Kinds of value.
@@ -90,6 +109,10 @@ let K_MONO: i32 = 27;
 let K_LOWER_ROMAN: i32 = 28;
 let K_UPPER_ROMAN: i32 = 29;
 let K_TRANSPARENT: i32 = 30;
+let K_SOLID: i32 = 31;          // border styles: double, groove and the like draw solid,
+let K_DASHED: i32 = 32;         // and dotted draws dashed
+let K_BORDER_BOX: i32 = 33;
+let K_CONTENT_BOX: i32 = 34;
 
 // Font families, as the platform layer's text functions number them.
 let FAMILY_SANS: i32 = 0;
@@ -184,7 +207,23 @@ struct Style {
     root_size: f32,                      // the root element's font size, which rem counts in
     vars: i32,                           // the head of the element's custom properties in Sheet.vars; -1 for none
     content: i32, content_len: i32,      // ::before and ::after: the content, a span into Sheet.bytes; -1 length for none
+    height: f32, height_pct: f32,        // -1 when not set (auto)
+    min_width: f32, min_width_pct: f32,  // 0 and -1 when not set
+    min_height: f32, min_height_pct: f32,
+    max_height: f32, max_height_pct: f32,   // -1 when not set (none)
+    border_box: i32,                     // box-sizing: 1 for border-box, where width and height include padding and border
+    bl: f32, br: f32, bl_color: u32, br_color: u32,
+    bt_style: i32, br_style: i32, bb_style: i32, bl_style: i32,   // K_NONE, K_SOLID or K_DASHED
+    rad_tl: f32, rad_tr: f32, rad_br: f32, rad_bl: f32,           // corner radii, top left first, clockwise
+    rad_pct: i32,                        // bit k set: corner k's radius is a percentage of the box
+    shadows: Shadow[2], shadow_count: i32,
+    opacity: f32,                        // the element's own
+    alpha: f32,                          // what its paint is multiplied by: its opacity times its parent's alpha
 }
+
+// One box-shadow. Blurred ones aren't drawn (docs/adr/0010: the interface's
+// shadows are rings and bars, which have none).
+struct Shadow { ox: f32, oy: f32, blur: f32, spread: f32, color: u32, inset: i32 }
 
 // currentColor until layout paints with the text's colour. Its alpha is 0 and
 // no colour name or #rrggbb parses to it.
@@ -194,13 +233,21 @@ fn line_height(s: Style) -> f32 {
     return if s.lh_mult >= 0.0 { s.lh_mult * s.font_size } else { s.lh_px };
 }
 
+fn no_shadow() -> Shadow { return Shadow { ox: 0.0, oy: 0.0, blur: 0.0, spread: 0.0, color: 0, inset: 0 }; }
+
 fn root_style() -> Style {
     return Style { display: K_BLOCK, color: 0xFF000000, bg: 0, font_size: 16.0, bold: 0, italic: 0, family: FAMILY_SANS,
                    lh_mult: 1.2, lh_px: 0.0, align: K_LEFT, ws: K_NORMAL, list: K_DISC, deco: K_NONE, valign: K_BASELINE,
                    mt: 0.0, mr: 0.0, mb: 0.0, ml: 0.0, auto_ml: 0, auto_mr: 0, pt: 0.0, pr: 0.0, pb: 0.0, pl: 0.0,
                    width: -1.0, width_pct: -1.0, max_width: -1.0, max_width_pct: -1.0,
                    bt: 0.0, bb: 0.0, bt_color: CURRENT_COLOR, bb_color: CURRENT_COLOR, indent: 0.0, root_size: 16.0,
-                   vars: -1, content: 0, content_len: -1 };
+                   vars: -1, content: 0, content_len: -1,
+                   height: -1.0, height_pct: -1.0, min_width: 0.0, min_width_pct: -1.0, min_height: 0.0, min_height_pct: -1.0,
+                   max_height: -1.0, max_height_pct: -1.0, border_box: 0,
+                   bl: 0.0, br: 0.0, bl_color: CURRENT_COLOR, br_color: CURRENT_COLOR,
+                   bt_style: K_NONE, br_style: K_NONE, bb_style: K_NONE, bl_style: K_NONE,
+                   rad_tl: 0.0, rad_tr: 0.0, rad_br: 0.0, rad_bl: 0.0, rad_pct: 0,
+                   shadows: [no_shadow(), no_shadow()], shadow_count: 0, opacity: 1.0, alpha: 1.0 };
 }
 
 // ------------------------------------------------------------------ parsing
@@ -682,9 +729,15 @@ fn add_pending(name: const u8[:], value: const u8[:], important: i32, out: Decl[
 fn longhands(name: const u8[:], out: i32[>..]&) {
     if name == "margin" { out.append([P_MT, P_MR, P_MB, P_ML]); }
     else if name == "padding" { out.append([P_PT, P_PR, P_PB, P_PL]); }
-    else if name == "border" { out.append([P_BT_WIDTH, P_BT_COLOR, P_BB_WIDTH, P_BB_COLOR]); }
-    else if name == "border-top" { out.append([P_BT_WIDTH, P_BT_COLOR]); }
-    else if name == "border-bottom" { out.append([P_BB_WIDTH, P_BB_COLOR]); }
+    else if name == "border" || name == "border-width" || name == "border-style" || name == "border-color" {
+        out.append([P_BT_WIDTH, P_BR_WIDTH, P_BB_WIDTH, P_BL_WIDTH, P_BT_STYLE, P_BR_STYLE, P_BB_STYLE, P_BL_STYLE,
+                    P_BT_COLOR, P_BR_COLOR, P_BB_COLOR, P_BL_COLOR]);
+    }
+    else if name == "border-top" { out.append([P_BT_WIDTH, P_BT_STYLE, P_BT_COLOR]); }
+    else if name == "border-right" { out.append([P_BR_WIDTH, P_BR_STYLE, P_BR_COLOR]); }
+    else if name == "border-bottom" { out.append([P_BB_WIDTH, P_BB_STYLE, P_BB_COLOR]); }
+    else if name == "border-left" { out.append([P_BL_WIDTH, P_BL_STYLE, P_BL_COLOR]); }
+    else if name == "border-radius" { out.append([P_RAD_TL, P_RAD_TR, P_RAD_BR, P_RAD_BL]); }
     else if name == "background" { out.push(P_BG); }
     else if name == "list-style" { out.push(P_LIST); }
     else if name == "text-decoration" || name == "text-decoration-line" { out.push(P_DECO); }
@@ -819,35 +872,55 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
         add_value(base + 3, lft, important, out);
         return;
     }
-    if name == "border-top" || name == "border-bottom" || name == "border" {
-        // width, style and colour in any order; a style of none removes the line.
-        var width: f32 = 0.0;
+    if name == "border" || name == "border-top" || name == "border-right" || name == "border-bottom" || name == "border-left" {
+        // Width, style and colour in any order. What it leaves out goes back
+        // to its initial value: medium, none, currentColor. With no style
+        // there is no border, as in CSS.
+        var width = decl(0, V_LENGTH, 3.0, U_PX, 0, important);
+        var style = K_NONE;
         var color: u32 = CURRENT_COLOR;
-        var none = false;
         each_word(value) {
             let w = it;
-            let k = keyword(w);
-            if w == "none" || w == "hidden" { none = true; }
-            else if w == "thin" { width = 1.0; }
-            else if w == "medium" { width = 3.0; }
-            else if w == "thick" { width = 5.0; }
+            let st = border_style(w);
+            if st >= 0 { style = st; }
+            else if w == "thin" { width.num = 1.0; width.unit = U_PX; }
+            else if w == "medium" { width.num = 3.0; width.unit = U_PX; }
+            else if w == "thick" { width.num = 5.0; width.unit = U_PX; }
             else if w.len > 0 && (w[0] >= '0' && w[0] <= '9' || w[0] == '.') {
                 let n, u, ok = parse_length(w);
-                if ok && u == U_PX { width = n; }
-            } else if k < 0 {
+                if ok && u != U_PCT { width.num = n; width.unit = u; }
+            } else {
                 let col, cok = parse_color(w);
                 if cok { color = col; }
             }
         };
-        if none { width = 0.0; }
-        if name == "border-top" || name == "border" {
-            push_decl(out, decl(P_BT_WIDTH, V_LENGTH, width, U_PX, 0, important));
-            push_decl(out, decl(P_BT_COLOR, V_COLOR, 0.0, 0, color, important));
+        for side in 4 {
+            if !border_side(name, side) { continue; }
+            push_decl(out, side_decl(width, side, P_BT_WIDTH, P_BR_WIDTH, P_BB_WIDTH, P_BL_WIDTH));
+            push_decl(out, side_decl(decl(0, V_KEYWORD, style, 0, 0, important), side, P_BT_STYLE, P_BR_STYLE, P_BB_STYLE, P_BL_STYLE));
+            push_decl(out, side_decl(decl(0, V_COLOR, 0.0, 0, color, important), side, P_BT_COLOR, P_BR_COLOR, P_BB_COLOR, P_BL_COLOR));
         }
-        if name == "border-bottom" || name == "border" {
-            push_decl(out, decl(P_BB_WIDTH, V_LENGTH, width, U_PX, 0, important));
-            push_decl(out, decl(P_BB_COLOR, V_COLOR, 0.0, 0, color, important));
+        return;
+    }
+    if name == "border-width" || name == "border-style" || name == "border-color" || name == "border-radius" {
+        // One to four values: top right bottom left, as for margin. A radius
+        // goes top left, top right, bottom right, bottom left, and its
+        // elliptical second half, after a slash, is left out.
+        let slash = find(value, "/");
+        let parts = words(if name == "border-radius" && slash >= 0 { value[..slash] } else { value });
+        guard parts.len >= 1 && parts.len <= 4;
+        for side in 4 {
+            let v = parts[side_index(parts.len, side)];
+            if name == "border-width" { add_value(side_prop(side, P_BT_WIDTH, P_BR_WIDTH, P_BB_WIDTH, P_BL_WIDTH), v, important, out); }
+            else if name == "border-style" { add_value(side_prop(side, P_BT_STYLE, P_BR_STYLE, P_BB_STYLE, P_BL_STYLE), v, important, out); }
+            else if name == "border-color" { add_value(side_prop(side, P_BT_COLOR, P_BR_COLOR, P_BB_COLOR, P_BL_COLOR), v, important, out); }
+            else { add_value(side_prop(side, P_RAD_TL, P_RAD_TR, P_RAD_BR, P_RAD_BL), v, important, out); }
         }
+        return;
+    }
+    if name == "box-shadow" {
+        if value == "none" { push_decl(out, decl(P_BOX_SHADOW, V_KEYWORD, K_NONE, 0, 0, important)); }
+        else { push_decl(out, text_decl(P_BOX_SHADOW, V_STRING, important, value, "", bytes)); }
         return;
     }
     if name == "background" {
@@ -879,10 +952,63 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
 
 fn push_decl(out: Decl[>..]&, d: Decl) { out.push(d); }
 
+// Which of one to four values goes to side k (top, right, bottom, left): one
+// for all, two for vertical then horizontal, three for top, horizontal and
+// bottom.
+fn side_index(n: i64, k: i64) -> i64 {
+    if n == 1 { return 0; }
+    if n == 2 { return if k == 0 || k == 2 { 0 } else { 1 }; }
+    if n == 3 { return if k == 0 { 0 } else if k == 2 { 2 } else { 1 }; }
+    return k;
+}
+
+// Of four properties for the top, right, bottom and left, side k's.
+fn side_prop(k: i64, top: i32, right: i32, bottom: i32, left: i32) -> i32 {
+    return if k == 0 { top } else if k == 1 { right } else if k == 2 { bottom } else { left };
+}
+
+fn side_decl(dc: Decl, k: i64, top: i32, right: i32, bottom: i32, left: i32) -> Decl {
+    var one = dc;
+    one.prop = side_prop(k, top, right, bottom, left);
+    return one;
+}
+
+// Whether border shorthand `name` sets side k.
+fn border_side(name: const u8[:], k: i64) -> bool {
+    return name == "border" || (k == 0 && name == "border-top") || (k == 1 && name == "border-right")
+        || (k == 2 && name == "border-bottom") || (k == 3 && name == "border-left");
+}
+
+// A border style as Tusk draws it, K_SOLID, K_DASHED or K_NONE; -1 when `w`
+// isn't one.
+fn border_style(w: const u8[:]) -> i32 {
+    if w == "none" || w == "hidden" { return K_NONE; }
+    if w == "dashed" || w == "dotted" { return K_DASHED; }
+    if w == "solid" || w == "double" || w == "groove" || w == "ridge" || w == "inset" || w == "outset" { return K_SOLID; }
+    return -1;
+}
+
 fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
     var d = decl(prop, 0, 0.0, 0, 0, important);
     if value == "inherit" { d.kind = V_INHERIT; push_decl(out, d); return; }
-    if prop == P_COLOR || prop == P_BG || prop == P_BT_COLOR || prop == P_BB_COLOR {
+    if prop >= P_BT_STYLE && prop <= P_BL_STYLE {
+        let st = border_style(value);
+        guard st >= 0;
+        d.kind = V_KEYWORD;
+        d.num = st;
+        push_decl(out, d);
+        return;
+    }
+    if prop == P_OPACITY {
+        let pct = value.len > 0 && value[value.len - 1] == '%';
+        let n, ok = parse_flt(if pct { value[..value.len - 1] } else { value });
+        guard ok;
+        d.kind = V_NUMBER;
+        d.num = (if pct { n / 100.0 } else { n }) as f32;
+        push_decl(out, d);
+        return;
+    }
+    if prop == P_COLOR || prop == P_BG || prop == P_BT_COLOR || prop == P_BB_COLOR || prop == P_BL_COLOR || prop == P_BR_COLOR {
         let c, ok = parse_color(value);
         guard ok;
         d.kind = V_COLOR;
@@ -951,6 +1077,16 @@ fn property_id(n: const u8[:]) -> i32 {
     if n == "border-top-width" { return P_BT_WIDTH; } if n == "border-bottom-width" { return P_BB_WIDTH; }
     if n == "border-top-color" { return P_BT_COLOR; } if n == "border-bottom-color" { return P_BB_COLOR; }
     if n == "text-indent" { return P_TEXT_INDENT; } if n == "content" { return P_CONTENT; }
+    if n == "height" { return P_HEIGHT; } if n == "min-width" { return P_MIN_WIDTH; }
+    if n == "min-height" { return P_MIN_HEIGHT; } if n == "max-height" { return P_MAX_HEIGHT; }
+    if n == "box-sizing" { return P_BOX_SIZING; } if n == "opacity" { return P_OPACITY; }
+    if n == "border-left-width" { return P_BL_WIDTH; } if n == "border-right-width" { return P_BR_WIDTH; }
+    if n == "border-left-color" { return P_BL_COLOR; } if n == "border-right-color" { return P_BR_COLOR; }
+    if n == "border-top-style" { return P_BT_STYLE; } if n == "border-right-style" { return P_BR_STYLE; }
+    if n == "border-bottom-style" { return P_BB_STYLE; } if n == "border-left-style" { return P_BL_STYLE; }
+    if n == "border-top-left-radius" { return P_RAD_TL; } if n == "border-top-right-radius" { return P_RAD_TR; }
+    if n == "border-bottom-right-radius" { return P_RAD_BR; } if n == "border-bottom-left-radius" { return P_RAD_BL; }
+    if n == "box-shadow" { return P_BOX_SHADOW; }
     return -1;
 }
 
@@ -968,6 +1104,7 @@ fn keyword(v: const u8[:]) -> i32 {
     if v == "underline" { return K_UNDERLINE; } if v == "line-through" { return K_LINE_THROUGH; }
     if v == "super" { return K_SUPER; } if v == "sub" { return K_SUB; } if v == "baseline" { return K_BASELINE; }
     if v == "auto" { return K_AUTO; } if v == "transparent" { return K_TRANSPARENT; }
+    if v == "border-box" { return K_BORDER_BOX; } if v == "content-box" { return K_CONTENT_BOX; }
     // Display values we lay out as one of the three we know.
     if v == "inline-block" || v == "inline-flex" || v == "inline-grid" || v == "inline-table" || v == "table-cell" { return K_INLINE; }
     if v == "flex" || v == "grid" || v == "table" || v == "table-row" || v == "table-row-group" || v == "table-header-group"
@@ -1404,6 +1541,12 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
         let up = d.nodes[e].parent;
         if up >= 0 && d.nodes[up].kind == NODE_DOCUMENT { s.root_size = s.font_size; }
     }
+    // A border whose style is none has no width (CSS 2.2 §8.5.3).
+    if s.bt_style == K_NONE { s.bt = 0.0; }
+    if s.br_style == K_NONE { s.br = 0.0; }
+    if s.bb_style == K_NONE { s.bb = 0.0; }
+    if s.bl_style == K_NONE { s.bl = 0.0; }
+    s.alpha = parent.alpha * s.opacity;
     w.customs.resize(mark);
     w.prio.resize(mark);
     return s;
@@ -1602,7 +1745,7 @@ fn top_comma(s: const u8[:]) -> i64 {
 // this longhand applied. When a variable has no value and its var() no
 // fallback, the property stays as it was: inherited, or initial.
 fn apply_decl(s: Style&, parent: Style, dc: Decl, sh: Sheet, scratch: u8[>..<]&) {
-    if dc.kind != V_VAR { apply(s, parent, dc); return; }
+    if dc.kind != V_VAR { apply_value(s, parent, dc, sh); return; }
     let mark = scratch.len;
     var none: OwnVar[>..<] = [];
     let ok, reach = substitute(sh, span_of(sh, dc.text, dc.text_len), sh.decls[0..0], none, 0, s.vars, mark + VAR_MAX, scratch);
@@ -1615,9 +1758,64 @@ fn apply_decl(s: Style&, parent: Style, dc: Decl, sh: Sheet, scratch: u8[>..<]&)
         value.append(scratch[mark..]);
         var parsed: Decl[>..] = [];
         add_declaration(name[..], value[..], dc.important, parsed, sh.bytes);
-        for one in parsed { if one.prop == dc.prop { apply(s, parent, one); } }
+        for one in parsed { if one.prop == dc.prop { apply_value(s, parent, one, sh); } }
     }
     scratch.resize(mark);
+}
+
+// apply, and box-shadow, whose list is text in the sheet's bytes.
+fn apply_value(s: Style&, parent: Style, dc: Decl, sh: Sheet) {
+    if dc.prop == P_BOX_SHADOW && dc.kind == V_STRING { parse_shadows(span_of(sh, dc.text, dc.text_len), s); return; }
+    apply(s, parent, dc);
+}
+
+// box-shadow: up to two shadows, separated by commas, each `x y [blur
+// [spread]]` with `inset` and a colour anywhere among them; the text's colour
+// when there's none. Lengths in em count in the element's font size.
+fn parse_shadows(text: const u8[:], s: Style&) {
+    s.shadow_count = 0;
+    var rest = text;
+    while rest.len > 0 && s.shadow_count < 2 {
+        let comma = top_comma(rest);
+        let one = trim(if comma >= 0 { rest[..comma] } else { rest });
+        rest = if comma >= 0 { rest[comma + 1..] } else { rest[rest.len..] };
+        var sd = no_shadow();
+        sd.color = s.color;
+        var lengths: f32[4];
+        var count = 0;
+        var ok = true;
+        var i: i64 = 0;
+        while i < one.len {
+            while i < one.len && is_ws(one[i]) { i += 1; }
+            let st = i;
+            var depth = 0;
+            while i < one.len && (depth > 0 || !is_ws(one[i])) {
+                if one[i] == '(' { depth += 1; } else if one[i] == ')' { depth -= 1; }
+                i += 1;
+            }
+            let w = one[st..i];
+            if w.len == 0 { continue; }
+            if w == "inset" { sd.inset = 1; continue; }
+            let n, u, lok = parse_length(w);
+            if lok && u != U_PCT {
+                if count < 4 {
+                    lengths[count] = if u == U_EM { n * s.font_size } else if u == U_REM { n * s.root_size } else { n };
+                    count += 1;
+                }
+                continue;
+            }
+            let c, cok = parse_color(w);
+            if cok { sd.color = if c == CURRENT_COLOR { s.color } else { c }; continue; }
+            ok = false;
+        }
+        guard ok && count >= 2 else { continue; }
+        sd.ox = lengths[0];
+        sd.oy = lengths[1];
+        if count >= 3 { sd.blur = max(lengths[2], 0.0); }
+        if count >= 4 { sd.spread = lengths[3]; }
+        s.shadows[s.shadow_count] = sd;
+        s.shadow_count += 1;
+    }
 }
 
 // What an element starts from: the inherited properties of its parent, the
@@ -1698,6 +1896,37 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
         s.content = dc.text;
         s.content_len = if dc.kind == V_STRING { dc.text_len } else { -1 };
     }
+    else if p == P_HEIGHT || p == P_MIN_WIDTH || p == P_MIN_HEIGHT || p == P_MAX_HEIGHT {
+        // auto and none are -1; a minimum that isn't set is 0.
+        var v: f32 = if p == P_MIN_WIDTH || p == P_MIN_HEIGHT { 0.0 } else { -1.0 };
+        var pct: f32 = -1.0;
+        if dc.kind == V_LENGTH { if dc.unit == U_PCT { pct = dc.num; v = -1.0; } else { v = max(px(dc, s, parent), 0.0); } }
+        if p == P_HEIGHT { s.height = v; s.height_pct = pct; }
+        else if p == P_MIN_WIDTH { s.min_width = max(v, 0.0); s.min_width_pct = pct; }
+        else if p == P_MIN_HEIGHT { s.min_height = max(v, 0.0); s.min_height_pct = pct; }
+        else { s.max_height = v; s.max_height_pct = pct; }
+    }
+    else if p == P_BOX_SIZING { s.border_box = if k == K_BORDER_BOX { 1 } else { 0 }; }
+    else if p == P_BL_WIDTH { s.bl = if dc.kind == V_LENGTH { max(px(dc, s, parent), 0.0) } else { 0.0 }; }
+    else if p == P_BR_WIDTH { s.br = if dc.kind == V_LENGTH { max(px(dc, s, parent), 0.0) } else { 0.0 }; }
+    else if p == P_BL_COLOR { s.bl_color = if dc.color == CURRENT_COLOR { s.color } else { dc.color }; }
+    else if p == P_BR_COLOR { s.br_color = if dc.color == CURRENT_COLOR { s.color } else { dc.color }; }
+    else if p == P_BT_STYLE { s.bt_style = k; }
+    else if p == P_BR_STYLE { s.br_style = k; }
+    else if p == P_BB_STYLE { s.bb_style = k; }
+    else if p == P_BL_STYLE { s.bl_style = k; }
+    else if p >= P_RAD_TL && p <= P_RAD_BL {
+        let corner = p - P_RAD_TL;
+        let bit: i32 = 1 << corner;
+        var v: f32 = 0.0;
+        if dc.kind == V_LENGTH {
+            if dc.unit == U_PCT { v = max(dc.num, 0.0); s.rad_pct = s.rad_pct | bit; }
+            else { v = max(px(dc, s, parent), 0.0); s.rad_pct = s.rad_pct & ~bit; }
+        }
+        if corner == 0 { s.rad_tl = v; } else if corner == 1 { s.rad_tr = v; } else if corner == 2 { s.rad_br = v; } else { s.rad_bl = v; }
+    }
+    else if p == P_BOX_SHADOW { s.shadow_count = 0; }       // none; the shadows themselves come through apply_decl
+    else if p == P_OPACITY { s.opacity = clamp(dc.num, 0.0, 1.0); }
 }
 
 // ------------------------------------------------------------------ Tusk's own style sheet
