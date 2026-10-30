@@ -1950,13 +1950,15 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
 
     var s = inherit(parent);
     s.svg = svg;
-    if win_prio[P_FILL] >= 0 { s.svg_set = s.svg_set | SVG_FILL; }
-    if win_prio[P_STROKE] >= 0 { s.svg_set = s.svg_set | SVG_STROKE; }
-    if win_prio[P_STROKE_WIDTH] >= 0 { s.svg_set = s.svg_set | SVG_STROKE_WIDTH; }
-    if win_prio[P_STROKE_LINECAP] >= 0 { s.svg_set = s.svg_set | SVG_LINECAP; }
-    if win_prio[P_STROKE_LINEJOIN] >= 0 { s.svg_set = s.svg_set | SVG_LINEJOIN; }
-    if win_prio[P_FILL_RULE] >= 0 { s.svg_set = s.svg_set | SVG_FILL_RULE; }
-    if win_prio[P_COLOR] >= 0 { s.svg_set = s.svg_set | SVG_COLOR; }
+    // What the element's own declarations set, unless they say inherit: in
+    // a <use>, inherit is from the <use>.
+    if win_prio[P_FILL] >= 0 && win[P_FILL].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_FILL; }
+    if win_prio[P_STROKE] >= 0 && win[P_STROKE].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_STROKE; }
+    if win_prio[P_STROKE_WIDTH] >= 0 && win[P_STROKE_WIDTH].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_STROKE_WIDTH; }
+    if win_prio[P_STROKE_LINECAP] >= 0 && win[P_STROKE_LINECAP].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_LINECAP; }
+    if win_prio[P_STROKE_LINEJOIN] >= 0 && win[P_STROKE_LINEJOIN].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_LINEJOIN; }
+    if win_prio[P_FILL_RULE] >= 0 && win[P_FILL_RULE].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_FILL_RULE; }
+    if win_prio[P_COLOR] >= 0 && win[P_COLOR].kind != V_INHERIT { s.svg_set = s.svg_set | SVG_COLOR; }
     if w.customs.len > mark { s.vars = own_vars(sh, w.customs[mark..], parent.vars, w.text); }
     // Font size first: em lengths everywhere else depend on it.
     if win_prio[P_FONT_SIZE] >= 0 { apply_decl(s, parent, win[P_FONT_SIZE], sh, w.text); }

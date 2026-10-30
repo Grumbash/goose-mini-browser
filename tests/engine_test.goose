@@ -938,6 +938,44 @@ fn test_svg() {
           str("stroke 4.0 ffff0000 M0,0 L20,20\nfill ff0000ff M0,20 L20,0\nstroke 4.0 ffff0000 M0,20 L20,0\n",
               "fill ff000000 M20,28 L20,32 L10,32 L10,28 Z\n")[..]);
 
+    // A <use> inside what it refers to draws nothing, however many there are;
+    // the first element with an id is the one; a <use> of an <svg> takes its
+    // width and height; a <use>'s fill-box is what it draws, where.
+    let cycles = """
+        <style>body { margin: 0; padding: 0; max-width: none } svg { display: block }</style>
+        <svg width=100 height=20><g id=a><rect width=10 height=10 fill="#f00"/><use href="#a" x=5 y=5 /></g>
+        <g id=b><rect x=20 width=10 height=10 fill="#00f"/><use href="#b" x=1 /><use href="#b" y=1 /><use href="#b" x=1 y=1 /></g>
+        <g id=c><rect x=40 width=5 height=5 fill="#0ff"/><use href="#d" /></g><g id=d><use href="#c" x=10 /></g></svg>
+        <svg style="display: none"><symbol id=s><rect width=1 height=1 fill="#f00"/></symbol><symbol id=s><rect width=2 height=2/></symbol>
+        <svg id=t viewBox="0 0 10 10" width=20 height=20><rect width=10 height=10 fill="#0f0"/></svg><rect id=r width=10 height=4 /></svg>
+        <svg width=100 height=100><use href="#s"/><use href="#t" x=10 />
+        <use href="#r" x=40 y=40 style="transform-box: fill-box; transform-origin: center; transform: rotate(90deg)"/></svg>
+        """;
+    check("use cycles, ids and sizes", layout_probe(cycles, 400.0, PROBE_PATHS),
+          str("fill ffff0000 M0,0 L10,0 L10,10 L0,10 L0,0 Z\nfill ff0000ff M20,0 L30,0 L30,10 L20,10 L20,0 Z\n",
+              "fill ff00ffff M40,0 L45,0 L45,5 L40,5 L40,0 Z\nfill ff00ffff M50,0 L55,0 L55,5 L50,5 L50,0 Z\n",
+              "fill ffff0000 M0,20 L1,20 L1,21 L0,21 L0,20 Z\nfill ff00ff00 M10,20 L30,20 L30,40 L10,40 L10,20 Z\n",
+              "fill ff000000 M47,57 L47,67 L43,67 L43,57 L47,57 Z\n")[..]);
+
+    // Inside a <use>, inherit is from the <use>.
+    let inherits = """
+        <style>body { margin: 0; padding: 0; max-width: none } svg { display: block } .sprite path { fill: inherit }</style>
+        <svg class=sprite style="display: none"><symbol id=p><path d="M0 0 H5 V5 Z"/></symbol></svg>
+        <svg width=10 height=10 style="fill: #f00"><use href="#p"/></svg>
+        """;
+    check("inherit inside a use", layout_probe(inherits, 400.0, PROBE_PATHS), "fill ffff0000 M0,0 L5,0 L5,5 Z\n");
+
+    // <use>s that multiply one another stop at SVG_ELEMENTS_MAX elements.
+    var many: u8[>..] = [];
+    many.append("""<svg width=10 height=10><g id=g0><rect width=1 height=1 /></g>""");
+    for k in 1..7 {
+        format(many, "<g id=g", k, ">");
+        for j in 10 { format(many, "<use href=\"#g", k - 1, "\" />"); }
+        many.append("</g>");
+    }
+    many.append("</svg>");
+    check("uses that multiply stop", layout_probe(many[..], 400.0, PROBE_PATH_COUNT), "31035");
+
     // An <svg> is an image to agents, named by its aria-label; its text isn't
     // its paragraph's, and one that is aria-hidden isn't there.
     let pic = """<p>Before <svg aria-label="Reload" width=10 height=10><title>ignored</title><text>no</text></svg> after <svg aria-hidden="true" width=10 height=10><title>hidden</title></svg></p>""";
@@ -1145,6 +1183,7 @@ let PROBE_SPACING: i32 = 16; // how much wider #s's text is than #a's
 let PROBE_CARETS: i32 = 18; // how much further each caret of #s's text is than #a's
 let PROBE_PATHS: i32 = 19;  // each path item: fill or stroke, its colour, and its path on the page, ends of curves only
 let PROBE_CURVES: i32 = 20; // each path item's path on the page, every point
+let PROBE_PATH_COUNT: i32 = 21; // how many path items there are
 let PROBE_PAGE: i32 = 17;   // the page's height
 let PROBE_XF: i32 = 15;     // each item of an element with an id: its matrix, or "none"; with a clip, how it is mapped
 let PROBE_ORDER: i32 = 9;   // the elements with an id, in the order their items paint
@@ -1194,9 +1233,10 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
     var atoms: i32[>..<] = [];
     var measured: Measured[>..] = [];
     var paths: f32[>..<] = [];
+    var ids: i32[>..] = [];
     let L = Layout { d: d, styles: styles, text: text, carets: carets, runs: runs, run_of: run_of,
                      fonts: fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
-                     measured: measured, paths: paths };
+                     measured: measured, paths: paths, ids: ids };
     measure(L);
     let page_h = layout_page(L, width, 600.0);
 
@@ -1370,6 +1410,10 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             }
             out.push('\n');
         }
+    } else if probe == PROBE_PATH_COUNT {
+        var count = 0;
+        for it in items { if it.kind == ITEM_PATH { count += 1; } }
+        format(out, count);
     } else if probe == PROBE_PATHS {
         for it in items {
             guard it.kind == ITEM_PATH else { continue; }

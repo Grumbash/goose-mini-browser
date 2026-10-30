@@ -29,6 +29,11 @@ let PATH_JOIN_BEVEL: i32 = 16;
 // The deepest groups and uses go inside one another.
 let SVG_DEPTH_MAX: i32 = 32;
 
+// The most elements one <svg> draws, each drawing of a <use> counted again:
+// more than any real drawing has, few enough that <use>s which multiply one
+// another can't make it draw billions.
+let SVG_ELEMENTS_MAX: i32 = 100000;
+
 // A path to paint: its span of the path data, in points from (x, y); what
 // it may cover from there, w × h, its stroke included; its colour, opacity
 // applied; its stroke's width in points, 0 to fill it; and its PATH_ flags.
@@ -69,101 +74,139 @@ fn paint_of(s: Style, up: Inherited) -> Inherited {
     return p;
 }
 
+// What drawing one <svg>'s content works with: its document, the styles and
+// the table of ids (index_ids); the <use>s being drawn, innermost last; how
+// many more elements it may draw; and the path data and paths it adds to.
+struct Drawing { d: Doc, styles: Style[>..]&, ids: i32[>..]&, uses: i32[>..<]&, left: i32,
+                 paths: f32[>..<]&, out: Painted[>..<]& }
+
 // The content of <svg> n, whose content box is w × h at (x, y) on the page,
 // as paths into `out`, their data into `paths`.
-fn draw_svg(d: Doc, styles: const Style[:], n: i32, x: f32, y: f32, w: f32, h: f32, paths: f32[>..<]&, out: Painted[>..<]&) {
+fn draw_svg(d: Doc, styles: Style[>..]&, ids: i32[>..]&, n: i32, x: f32, y: f32, w: f32, h: f32,
+            paths: f32[>..<]&, out: Painted[>..<]&) {
     guard w > 0.0 && h > 0.0;
+    var uses: i32[>..<] = [];
+    var V = Drawing { d: d, styles: styles, ids: ids, uses: uses, left: SVG_ELEMENTS_MAX, paths: paths, out: out };
     let vw, vh = view_size(d, n, w, h);
-    draw_children(d, styles, n, times(shift(x, y), fit_view(d, n, w, h)), inherited(styles[n]), 1.0, vw, vh, 0, paths, out);
+    draw_children(V, n, times(shift(x, y), fit_view(d, n, w, h)), inherited(styles[n]), 1.0, vw, vh, 0);
 }
 
-recursive fn draw_children(d: Doc, styles: const Style[:], n: i32, m: Affine, up: Inherited, alpha: f32, vw: f32, vh: f32,
-                           depth: i32, paths: f32[>..<]&, out: Painted[>..<]&) {
-    var c = d.nodes[n].first;
+recursive fn draw_children(V: Drawing&, n: i32, m: Affine, up: Inherited, alpha: f32, vw: f32, vh: f32, depth: i32) {
+    var c = V.d.nodes[n].first;
     while c >= 0 {
-        if d.nodes[c].kind == NODE_ELEMENT { draw_node(d, styles, c, m, up, alpha, vw, vh, depth, paths, out); }
-        c = d.nodes[c].next;
+        if V.d.nodes[c].kind == NODE_ELEMENT { draw_node(V, c, m, up, alpha, vw, vh, depth); }
+        c = V.d.nodes[c].next;
     }
 }
 
 // Element e, its user space taken to the page by m: a group's children, a
 // nested <svg>'s in its viewport, what a <use> refers to, or a shape.
 // vw × vh is the viewport that percentages count in.
-recursive fn draw_node(d: Doc, styles: const Style[:], e: i32, m: Affine, up: Inherited, alpha: f32, vw: f32, vh: f32,
-                       depth: i32, paths: f32[>..<]&, out: Painted[>..<]&) {
-    let s = styles[e];
-    guard s.display != K_NONE && depth < SVG_DEPTH_MAX;
+recursive fn draw_node(V: Drawing&, e: i32, m: Affine, up: Inherited, alpha: f32, vw: f32, vh: f32, depth: i32) {
+    let s = V.styles[e];
+    guard s.display != K_NONE && depth < SVG_DEPTH_MAX && V.left > 0;
+    V.left -= 1;
     let a = alpha * s.opacity;
     guard a > 0.0;
     let p = paint_of(s, up);
-    let own = times(m, local_transform(d, styles, e, vw, vh, depth, paths));
-    let name = node_name(d, e);
+    let own = times(m, local_transform(V, e, vw, vh, depth));
+    let name = node_name(V.d, e);
     if name == "g" || name == "a" || name == "switch" {
-        draw_children(d, styles, e, own, p, a, vw, vh, depth + 1, paths, out);
+        draw_children(V, e, own, p, a, vw, vh, depth + 1);
     } else if name == "svg" {
         // A viewport of its own: x, y, width and height, then its viewBox.
-        let nx = length_attr(d, e, "x", vw, 0.0);
-        let ny = length_attr(d, e, "y", vh, 0.0);
-        let nw = length_attr(d, e, "width", vw, vw);
-        let nh = length_attr(d, e, "height", vh, vh);
-        guard nw > 0.0 && nh > 0.0;
-        let iw, ih = view_size(d, e, nw, nh);
-        draw_children(d, styles, e, times(own, times(shift(nx, ny), fit_view(d, e, nw, nh))), p, a, iw, ih, depth + 1, paths, out);
+        let at, iw, ih, ok = viewport(V.d, e, own, vw, vh, vw, vh);
+        guard ok;
+        draw_children(V, e, at, p, a, iw, ih, depth + 1);
     } else if name == "use" {
-        let href1, has1 = attr_value(d, e, "href");
-        let href2, has2 = attr_value(d, e, "xlink:href");
-        let href = if has1 { href1 } else { href2 };
-        guard (has1 || has2) && href.len > 1 && href[0] == '#';
-        let t = element_by_id(d, href[1..]);
-        guard t > 0 && t != e;
-        let at = times(own, shift(length_attr(d, e, "x", vw, 0.0), length_attr(d, e, "y", vh, 0.0)));
-        let tname = node_name(d, t);
+        let t = use_target(V, e);
+        guard t > 0;
+        let at = times(own, shift(length_attr(V.d, e, "x", vw, 0.0), length_attr(V.d, e, "y", vh, 0.0)));
+        let tname = node_name(V.d, t);
+        V.uses.push(e);
         if tname == "symbol" || tname == "svg" {
-            // The symbol's viewBox fits the <use>'s width and height, all of
-            // the viewport unless they say otherwise.
-            let uw = length_attr(d, e, "width", vw, vw);
-            let uh = length_attr(d, e, "height", vh, vh);
-            guard uw > 0.0 && uh > 0.0;
-            let iw, ih = view_size(d, t, uw, uh);
-            draw_children(d, styles, t, times(at, fit_view(d, t, uw, uh)), paint_of(styles[t], p), a, iw, ih, depth + 1, paths, out);
+            // Its viewBox fits the <use>'s width and height, or its own, or
+            // all of the viewport.
+            let inner, iw, ih, ok = viewport(V.d, t, at, length_attr(V.d, e, "width", vw, -1.0),
+                                             length_attr(V.d, e, "height", vh, -1.0), vw, vh);
+            if ok { draw_children(V, t, inner, paint_of(V.styles[t], p), a, iw, ih, depth + 1); }
         } else {
-            draw_node(d, styles, t, at, p, a, vw, vh, depth + 1, paths, out);
+            draw_node(V, t, at, p, a, vw, vh, depth + 1);
         }
+        V.uses.pop();
     } else {
-        draw_shape(d, e, name, own, p, a, vw, vh, paths, out);
+        draw_shape(V, e, name, own, p, a, vw, vh);
     }
 }
 
+// What takes the content of viewport element e, a nested <svg> or a
+// <symbol> that a <use> draws, onto the page, its parent's user space
+// taken there by m: its x and y, then its width and height (w and h when
+// they aren't below 0, else its own, else the parent viewport's, pw × ph)
+// fitted by its viewBox. Also the size of its user space, and whether it
+// has any.
+fn viewport(d: Doc, e: i32, m: Affine, w: f32, h: f32, pw: f32, ph: f32) -> Affine, f32, f32, bool {
+    let nx = length_attr(d, e, "x", pw, 0.0);
+    let ny = length_attr(d, e, "y", ph, 0.0);
+    let nw = if w >= 0.0 { w } else { length_attr(d, e, "width", pw, pw) };
+    let nh = if h >= 0.0 { h } else { length_attr(d, e, "height", ph, ph) };
+    guard nw > 0.0 && nh > 0.0 else { return m, 0.0, 0.0, false; }
+    let iw, ih = view_size(d, e, nw, nh);
+    return times(m, times(shift(nx, ny), fit_view(d, e, nw, nh))), iw, ih, true;
+}
+
+// What <use> e draws: the element its href names, unless that holds e or a
+// <use> being drawn, so that it would draw itself (SVG 2 §5.6.1); else -1.
+fn use_target(V: Drawing&, e: i32) -> i32 {
+    let href1, has1 = attr_value(V.d, e, "href");
+    let href2, has2 = attr_value(V.d, e, "xlink:href");
+    let href = if has1 { href1 } else { href2 };
+    guard (has1 || has2) && href.len > 1 && href[0] == '#' else { return -1; }
+    let t = element_by_id(V.d, V.ids[..], href[1..]);
+    guard t > 0 && !holds(V.d, t, e) else { return -1; }
+    for u in V.uses { if holds(V.d, t, u) { return -1; } }
+    return t;
+}
+
+// Whether element t is node n or one of its ancestors.
+fn holds(d: Doc, t: i32, n: i32) -> bool {
+    var k = n;
+    while k >= 0 {
+        if k == t { return true; }
+        k = d.nodes[k].parent;
+    }
+    return false;
+}
+
 // Shape e, with its points taken to the page by m: filled, then stroked.
-fn draw_shape(d: Doc, e: i32, name: const u8[:], m: Affine, p: Inherited, alpha: f32, vw: f32, vh: f32,
-              paths: f32[>..<]&, out: Painted[>..<]&) {
-    let start = paths.len;
-    add_shape(d, e, name, m, vw, vh, paths);
-    guard paths.len > start;
+fn draw_shape(V: Drawing&, e: i32, name: const u8[:], m: Affine, p: Inherited, alpha: f32, vw: f32, vh: f32) {
+    let start = V.paths.len;
+    add_shape(V.d, e, name, m, vw, vh, V.paths);
+    guard V.paths.len > start;
     let fill = faded(if p.fill == CURRENT_COLOR { p.color } else { p.fill }, alpha);
     let stroke = faded(if p.stroke == CURRENT_COLOR { p.color } else { p.stroke }, alpha);
     // A stroke's width on the page: scaled as the shape is, on average.
     let sw = if (stroke >> 24) != 0 { p.width * sqrt(abs(m.a * m.d - m.b * m.c)) } else { 0.0 };
     let fills = (fill >> 24) != 0;
-    if !fills && sw <= 0.0 { paths.resize(start); return; }
+    if !fills && sw <= 0.0 { V.paths.resize(start); return; }
     // What a stroke may reach past the points: half its width, four times
     // that at a sharp miter.
     let reach = if sw > 0.0 { sw * (if p.join == K_MITER { 2.0 } else { 1.0 }) } else { 0.0 };
-    let x0, y0, x1, y1 = path_bounds(paths[..], start);
+    let x0, y0, x1, y1 = path_bounds(V.paths[..], start);
     let ox = x0 - reach;
     let oy = y0 - reach;
-    move_path(paths[..], start, -ox, -oy);
-    let span = (paths.len - start) as i32;
+    move_path(V.paths[..], start, -ox, -oy);
+    let span = (V.paths.len - start) as i32;
     if fills {
-        out.push(Painted { start: start as i32, len: span, x: ox, y: oy, w: x1 - x0 + 2.0 * reach, h: y1 - y0 + 2.0 * reach,
-                           color: fill, stroke: 0.0, flags: if p.rule == K_EVENODD { PATH_EVENODD } else { 0 } });
+        V.out.push(Painted { start: start as i32, len: span, x: ox, y: oy, w: x1 - x0 + 2.0 * reach, h: y1 - y0 + 2.0 * reach,
+                             color: fill, stroke: 0.0, flags: if p.rule == K_EVENODD { PATH_EVENODD } else { 0 } });
     }
     if sw > 0.0 {
         var flags: i32 = 0;
         if p.cap == K_ROUND { flags = flags | PATH_CAP_ROUND; } else if p.cap == K_SQUARE { flags = flags | PATH_CAP_SQUARE; }
         if p.join == K_ROUND { flags = flags | PATH_JOIN_ROUND; } else if p.join == K_BEVEL { flags = flags | PATH_JOIN_BEVEL; }
-        out.push(Painted { start: start as i32, len: span, x: ox, y: oy, w: x1 - x0 + 2.0 * reach, h: y1 - y0 + 2.0 * reach,
-                           color: stroke, stroke: sw, flags: flags });
+        V.out.push(Painted { start: start as i32, len: span, x: ox, y: oy, w: x1 - x0 + 2.0 * reach, h: y1 - y0 + 2.0 * reach,
+                             color: stroke, stroke: sw, flags: flags });
     }
 }
 
@@ -616,18 +659,18 @@ fn fit_view(d: Doc, e: i32, w: f32, h: f32) -> Affine {
 // transform about its transform-origin, which counts in its viewport (vw ×
 // vh) or, for transform-box: fill-box, in its own geometry's bounds; else its
 // transform attribute.
-recursive fn local_transform(d: Doc, styles: const Style[:], e: i32, vw: f32, vh: f32, depth: i32, paths: f32[>..<]&) -> Affine {
-    let s = styles[e];
-    guard s.xf_count > 0 else { return transform_attr(d, e); }
+recursive fn local_transform(V: Drawing&, e: i32, vw: f32, vh: f32, depth: i32) -> Affine {
+    let s = V.styles[e];
+    guard s.xf_count > 0 else { return transform_attr(V.d, e); }
     var bx: f32 = 0.0;
     var by: f32 = 0.0;
     var bw = vw;
     var bh = vh;
     if s.transform_box == K_FILL_BOX {
-        let mark = paths.len;
-        add_geometry(d, styles, e, shift(0.0, 0.0), vw, vh, depth + 1, paths);
-        let x0, y0, x1, y1 = path_bounds(paths[..], mark);
-        paths.resize(mark);
+        let mark = V.paths.len;
+        add_geometry(V, e, shift(0.0, 0.0), vw, vh, depth + 1);
+        let x0, y0, x1, y1 = path_bounds(V.paths[..], mark);
+        V.paths.resize(mark);
         bx = x0;
         by = y0;
         bw = x1 - x0;
@@ -656,19 +699,42 @@ recursive fn local_transform(d: Doc, styles: const Style[:], e: i32, vw: f32, vh
 
 // Element e's shapes and its children's, through m and their own
 // transforms, as path data with no paint: what fill-box measures.
-recursive fn add_geometry(d: Doc, styles: const Style[:], e: i32, m: Affine, vw: f32, vh: f32, depth: i32, paths: f32[>..<]&) {
-    guard depth < SVG_DEPTH_MAX && styles[e].display != K_NONE;
-    let name = node_name(d, e);
+recursive fn add_geometry(V: Drawing&, e: i32, m: Affine, vw: f32, vh: f32, depth: i32) {
+    guard depth < SVG_DEPTH_MAX && V.styles[e].display != K_NONE && V.left > 0;
+    V.left -= 1;
+    let name = node_name(V.d, e);
     if name == "g" || name == "a" || name == "switch" {
-        var c = d.nodes[e].first;
-        while c >= 0 {
-            if d.nodes[c].kind == NODE_ELEMENT {
-                add_geometry(d, styles, c, times(m, local_transform(d, styles, c, vw, vh, depth + 1, paths)), vw, vh, depth + 1, paths);
-            }
-            c = d.nodes[c].next;
+        add_children_geometry(V, e, m, vw, vh, depth + 1);
+    } else if name == "svg" {
+        let at, iw, ih, ok = viewport(V.d, e, m, vw, vh, vw, vh);
+        if ok { add_children_geometry(V, e, at, iw, ih, depth + 1); }
+    } else if name == "use" {
+        // What it draws, where it draws it.
+        let t = use_target(V, e);
+        guard t > 0;
+        let at = times(m, shift(length_attr(V.d, e, "x", vw, 0.0), length_attr(V.d, e, "y", vh, 0.0)));
+        let tname = node_name(V.d, t);
+        V.uses.push(e);
+        if tname == "symbol" || tname == "svg" {
+            let inner, iw, ih, ok = viewport(V.d, t, at, length_attr(V.d, e, "width", vw, -1.0),
+                                             length_attr(V.d, e, "height", vh, -1.0), vw, vh);
+            if ok { add_children_geometry(V, t, inner, iw, ih, depth + 1); }
+        } else {
+            add_geometry(V, t, times(at, local_transform(V, t, vw, vh, depth + 1)), vw, vh, depth + 1);
         }
+        V.uses.pop();
     } else {
-        add_shape(d, e, name, m, vw, vh, paths);
+        add_shape(V.d, e, name, m, vw, vh, V.paths);
+    }
+}
+
+recursive fn add_children_geometry(V: Drawing&, e: i32, m: Affine, vw: f32, vh: f32, depth: i32) {
+    var c = V.d.nodes[e].first;
+    while c >= 0 {
+        if V.d.nodes[c].kind == NODE_ELEMENT {
+            add_geometry(V, c, times(m, local_transform(V, c, vw, vh, depth)), vw, vh, depth);
+        }
+        c = V.d.nodes[c].next;
     }
 }
 
@@ -714,12 +780,47 @@ fn transform_attr(d: Doc, e: i32) -> Affine {
     }
 }
 
-// The element whose id is `id`, or -1.
-fn element_by_id(d: Doc, id: const u8[:]) -> i32 {
+// ------------------------------------------------------------------ ids
+
+// A table of the elements with an id, by id, into `ids`: open addressing in
+// a power of two of slots, at least twice as many as ids, each an element
+// or -1. Elements go in in document order, so the first with an id is
+// found first, as getElementById finds it.
+fn index_ids(d: Doc, ids: i32[>..]&) {
+    var count: i64 = 0;
     for n, i in d.nodes {
         guard n.kind == NODE_ELEMENT else { continue; }
         let v, has = attr_value(d, i as i32, "id");
-        if has && v == id { return i as i32; }
+        if has && v.len > 0 { count += 1; }
+    }
+    var size: i64 = 1;
+    while size < count * 2 { size *= 2; }
+    for k in size { ids.push(-1); }
+    for n, i in d.nodes {
+        guard n.kind == NODE_ELEMENT else { continue; }
+        let v, has = attr_value(d, i as i32, "id");
+        guard has && v.len > 0 else { continue; }
+        var h = id_hash(v) & (size - 1);
+        while ids[h] >= 0 { h = (h + 1) & (size - 1); }
+        ids[h] = i as i32;
+    }
+}
+
+// The first element whose id is `id`, through index_ids's table, or -1.
+fn element_by_id(d: Doc, ids: const i32[:], id: const u8[:]) -> i32 {
+    guard ids.len > 0 && id.len > 0 else { return -1; }
+    var h = id_hash(id) & (ids.len - 1);
+    while ids[h] >= 0 {
+        let v, has = attr_value(d, ids[h], "id");
+        if v == id { return ids[h]; }
+        h = (h + 1) & (ids.len - 1);
     }
     return -1;
+}
+
+// FNV-1a.
+fn id_hash(s: const u8[:]) -> i64 {
+    var h: i64 = 2166136261;
+    for c in s { h = ((h ^ c) * 16777619) & 0xFFFFFFFF; }
+    return h;
 }

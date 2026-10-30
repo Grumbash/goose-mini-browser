@@ -98,6 +98,7 @@ struct Layout {
     atoms: i32[>..<]&,       // the inline-blocks on the lines being laid out, see place_atomic
     measured: Measured[>..]&, // per node, what measure_sized last found
     paths: f32[>..<]&,       // the path data of SVG's path items, see vector.goose; shrinks as items do
+    ids: i32[>..]&,          // the elements with an id, by id, for SVG's <use>; empty until an <svg> is drawn
 }
 
 // What measure_sized found for a node: its border-box height and first
@@ -523,7 +524,8 @@ fn svg_size(L: Layout, n: i32, avail: f32) -> f32, f32 {
 // paint them, in order, their data in L.paths.
 fn svg_items(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) {
     var painted: Painted[>..<] = [];
-    draw_svg(L.d, L.styles[..], n, x, y, w, h, L.paths, painted);
+    if L.ids.len == 0 { index_ids(L.d, L.ids); }
+    draw_svg(L.d, L.styles, L.ids, n, x, y, w, h, L.paths, painted);
     for p in painted {
         var it = rect_item(n, p.x, p.y, p.w, p.h, p.color);
         it.kind = ITEM_PATH;
