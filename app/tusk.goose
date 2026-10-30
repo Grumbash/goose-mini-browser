@@ -123,7 +123,7 @@ fn show_page(P: Page, width: f32, scale: f32, cost: Cost&) -> f32 {
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
                      fonts: P.fonts, boxes: boxes, items: items };
     let t0 = clock_ns();
-    let height = layout_page(L, width);
+    let height = layout_page(L, width, WINDOW_H - BAR_H);
     let t1 = clock_ns();
     set_layer(LAYER_PAGE, items, P.text, scale);
     cost.layout = ms(t0, t1);
@@ -429,7 +429,7 @@ fn print_snapshot(P: Page, cost: Cost, html_bytes: i64) {
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
                      fonts: P.fonts, boxes: boxes, items: items };
     let t0 = clock_ns();
-    let h = layout_page(L, WINDOW_W);
+    let h = layout_page(L, WINDOW_W, WINDOW_H);
     let t1 = clock_ns();
     var out: u8[>..] = [];
     let entries = snapshot(L, WINDOW_W, h, out);

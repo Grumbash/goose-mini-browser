@@ -42,7 +42,9 @@ const LAYERS: usize = 2; // 0: the page, scrolled; 1: the overlay, fixed
 /// a text item's y on its baseline and its text a span of the text buffer. A
 /// box is a rectangle with rounded corners (radii from the top left,
 /// clockwise) filled with `color`, and borders inside its edge in one colour
-/// and style: `border` points wide at the top, the others as they say.
+/// and style: `border` points wide at the top, the others as they say. An
+/// item with a clip (`clip_w` above 0) shows only inside that rectangle, its
+/// corners rounded by `clip_r`.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct DItem {
@@ -67,13 +69,20 @@ pub struct DItem {
     pub border_right: f32,
     pub border_bottom: f32,
     pub border_left: f32,
+    pub clip_x: f32,
+    pub clip_y: f32,
+    pub clip_w: f32,
+    pub clip_h: f32,
+    pub clip_r: f32,
 }
 
 /// One quad, in device pixels: solid when `uv[2]` is 0, otherwise the atlas
 /// mask at `uv` (in texels) times `color`, which is premultiplied. A box
 /// (`border[2]` 1) is drawn by distance from its rounded edge: `radii` from
 /// the top left, clockwise, and borders `widths` wide (top, right, bottom,
-/// left) in `border_color`, dashed when `border[1]` is 1, over its fill.
+/// left) in `border_color`, dashed when `border[1]` is 1, over its fill. Any
+/// quad with a `clip` (its width above 0) shows only inside it, its corners
+/// rounded by `border[3]`.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Instance {
@@ -84,6 +93,7 @@ pub struct Instance {
     pub border: [f32; 4],
     pub border_color: [f32; 4],
     pub widths: [f32; 4],
+    pub clip: [f32; 4],
 }
 
 #[repr(C)]
@@ -96,12 +106,12 @@ const SHADERS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-struct Instance { float4 rect; float4 uv; float4 color; float4 radii; float4 border; float4 border_color; float4 widths; };
+struct Instance { float4 rect; float4 uv; float4 color; float4 radii; float4 border; float4 border_color; float4 widths; float4 clip; };
 struct Uniforms { float2 viewport; float2 scroll; };
 struct Out {
     float4 position [[position]];
     float2 uv; float4 color; float textured;
-    float2 local; float2 size; float4 radii; float4 border; float4 border_color; float4 widths;
+    float2 local; float2 size; float4 radii; float4 border; float4 border_color; float4 widths; float4 clip;
 };
 
 vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
@@ -121,6 +131,7 @@ vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
     o.border = q.border;
     o.border_color = q.border_color;
     o.widths = q.widths;
+    o.clip = float4(q.clip.xy - u.scroll, q.clip.zw);
     return o;
 }
 
@@ -136,12 +147,17 @@ float rounded_rect(float2 p, float2 size, float4 r) {
 }
 
 fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[texture(0)]]) {
+    // Inside the clip, if there is one, blended over its edge's pixel.
+    float cover = 1.0;
+    if (in.clip.z > 0.0) {
+        cover = clamp(0.5 - rounded_rect(in.position.xy - in.clip.xy, in.clip.zw, float4(in.border.w)), 0.0, 1.0);
+    }
     if (in.textured > 0.5) {
         constexpr sampler s(coord::pixel, filter::nearest, address::clamp_to_edge);
-        return in.color * atlas.sample(s, in.uv).r;
+        return in.color * (atlas.sample(s, in.uv).r * cover);
     }
     if (in.border.z < 0.5) {
-        return in.color;
+        return in.color * cover;
     }
     // A box: covered inside its rounded edge, its borders between that edge
     // and the padding edge (each side's width in, corners less the wider
@@ -150,7 +166,7 @@ fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[text
     float outer = clamp(0.5 - d, 0.0, 1.0);
     float4 w = in.widths;
     if (max(max(w.x, w.y), max(w.z, w.w)) <= 0.0) {
-        return in.color * outer;
+        return in.color * (outer * cover);
     }
     float2 inner_size = in.size - float2(w.w + w.y, w.x + w.z);
     float4 inner_radii = max(in.radii - float4(max(w.x, w.w), max(w.x, w.y), max(w.z, w.y), max(w.z, w.w)), 0.0);
@@ -171,7 +187,7 @@ fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[text
     }
     // The fill runs under the borders: it shows through a translucent one
     // and between dashes.
-    return in.border_color * (ring * dash) + in.color * (inner + ring * (1.0 - in.border_color.a * dash));
+    return (in.border_color * (ring * dash) + in.color * (inner + ring * (1.0 - in.border_color.a * dash))) * cover;
 }
 "#;
 
@@ -531,10 +547,24 @@ fn snapped(x: f32, y: f32, w: f32, h: f32, scale: f64) -> [f32; 4] {
 /// Turns display items into instances at `scale` device pixels per point. Rect
 /// and box edges snap to whole pixels; each glyph goes to the whole pixel left
 /// of its pen position, with the rest taken by one of the atlas's subpixel
-/// phases.
+/// phases. Clips snap like rects.
 pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut Vec<Instance>) {
     let mut glyphs = Vec::new();
     for &item in items {
+        let DItem {
+            clip_x,
+            clip_y,
+            clip_w,
+            clip_h,
+            clip_r,
+            ..
+        } = item;
+        let clip = if clip_w > 0.0 && clip_h > 0.0 {
+            snapped(clip_x, clip_y, clip_w, clip_h, scale)
+        } else {
+            [0.0; 4]
+        };
+        let clip_r = clip_r * scale as f32;
         let DItem {
             kind,
             x,
@@ -556,6 +586,8 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
             out.push(Instance {
                 rect: snapped(x, y, w, h, scale),
                 color,
+                border: [0.0, 0.0, 0.0, clip_r],
+                clip,
                 ..Default::default()
             });
         } else if kind == ITEM_BOX {
@@ -588,7 +620,7 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
                 uv: [0.0; 4],
                 color,
                 radii: [rad_tl * s, rad_tr * s, rad_br * s, rad_bl * s],
-                border: [0.0, dashed, 1.0, 0.0],
+                border: [0.0, dashed, 1.0, clip_r],
                 border_color: premultiplied(border_color),
                 widths: [
                     width(border),
@@ -596,6 +628,7 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
                     width(border_bottom),
                     width(border_left),
                 ],
+                clip,
             });
         } else if kind == ITEM_TEXT {
             let (Ok(start), Ok(len)) = (usize::try_from(start), usize::try_from(text_len)) else {
@@ -634,6 +667,8 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
                     ],
                     uv: [e.x as f32, e.y as f32, e.w as f32, e.h as f32],
                     color,
+                    border: [0.0, 0.0, 0.0, clip_r],
+                    clip,
                     ..Default::default()
                 });
             }
@@ -848,11 +883,11 @@ mod tests {
 
     #[test]
     fn items_match_the_goose_layout() {
-        assert_eq!(std::mem::size_of::<DItem>(), 84);
+        assert_eq!(std::mem::size_of::<DItem>(), 104);
         assert_eq!(std::mem::align_of::<DItem>(), 1);
         assert_eq!(std::mem::size_of::<GpFrameStats>(), 28);
-        // The shader reads instances as seven float4s.
-        assert_eq!(std::mem::size_of::<Instance>(), 112);
+        // The shader reads instances as eight float4s.
+        assert_eq!(std::mem::size_of::<Instance>(), 128);
     }
 
     /// The BGRA pixels of `items` drawn offscreen on white, `w` × `h` at one
@@ -971,6 +1006,31 @@ mod tests {
         assert_eq!(at(0, 19), [255, 0, 0, 255]); // the left border, square below
         let both = at(20, 5); // red under half blue
         assert!(both[0] > 100 && both[2] > 100 && both[1] < 30, "{both:?}");
+    }
+
+    #[test]
+    fn clips_cut_what_is_outside_them_and_round_their_corners() {
+        // A red square 16 across, cut to its left half; a blue one, cut to a
+        // circle.
+        let mut half = rect(0.0, 0.0, 16.0, 16.0, 0xFFFF_0000);
+        (half.clip_x, half.clip_y, half.clip_w, half.clip_h) = (0.0, 0.0, 8.0, 16.0);
+        let mut round = rect(16.0, 0.0, 16.0, 16.0, 0xFF00_00FF);
+        (
+            round.clip_x,
+            round.clip_y,
+            round.clip_w,
+            round.clip_h,
+            round.clip_r,
+        ) = (16.0, 0.0, 16.0, 16.0, 8.0);
+        let Some(p) = drawn(&[half, round], 32, 16) else {
+            eprintln!("no Metal device here: clips aren't checked");
+            return;
+        };
+        let at = |x: usize, y: usize| &p[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
+        assert_eq!(at(4, 8), [0, 0, 255, 255]); // inside the clip: red (BGRA)
+        assert_eq!(at(12, 8), [255, 255, 255, 255]); // past it: the background
+        assert_eq!(at(24, 8), [255, 0, 0, 255]); // the circle's middle: blue
+        assert_eq!(at(16, 0), [255, 255, 255, 255]); // its corner, rounded away
     }
 
     #[test]
