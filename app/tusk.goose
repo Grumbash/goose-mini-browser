@@ -109,9 +109,11 @@ fn set_layer(layer: i32, items: const DItem[:], text: const u8[:], scale: f32) {
 
 fn measure_page(P: Page) {
     var boxes: Rect[>..] = [];
-    var items: DItem[>..] = [];
+    var items: DItem[>..<] = [];
+    var flex: FlexItem[>..<] = [];
+    var atoms: i32[>..<] = [];
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
-                     fonts: P.fonts, boxes: boxes, items: items };
+                     fonts: P.fonts, boxes: boxes, items: items, flex: flex, atoms: atoms };
     measure(L);
 }
 
@@ -119,9 +121,11 @@ fn measure_page(P: Page) {
 // compositor. Returns the page's height.
 fn show_page(P: Page, width: f32, scale: f32, cost: Cost&) -> f32 {
     var boxes: Rect[>..] = [];
-    var items: DItem[>..] = [];
+    var items: DItem[>..<] = [];
+    var flex: FlexItem[>..<] = [];
+    var atoms: i32[>..<] = [];
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
-                     fonts: P.fonts, boxes: boxes, items: items };
+                     fonts: P.fonts, boxes: boxes, items: items, flex: flex, atoms: atoms };
     let t0 = clock_ns();
     let height = layout_page(L, width, WINDOW_H - BAR_H);
     let t1 = clock_ns();
@@ -425,9 +429,11 @@ fn main() {
 // `tusk snapshot`: the page as a tree on stdout, and what it cost on stderr.
 fn print_snapshot(P: Page, cost: Cost, html_bytes: i64) {
     var boxes: Rect[>..] = [];
-    var items: DItem[>..] = [];
+    var items: DItem[>..<] = [];
+    var flex: FlexItem[>..<] = [];
+    var atoms: i32[>..<] = [];
     let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
-                     fonts: P.fonts, boxes: boxes, items: items };
+                     fonts: P.fonts, boxes: boxes, items: items, flex: flex, atoms: atoms };
     let t0 = clock_ns();
     let h = layout_page(L, WINDOW_W, WINDOW_H - BAR_H);
     let t1 = clock_ns();

@@ -52,7 +52,7 @@ weighed again 5 s after the last frame.
 Space, Page Up/Down, the arrows, Home and End scroll; ⌘Q quits.
 
 Not yet: images and video, the network (local files only), JavaScript, links
-that can be clicked, selection, floats, tables as grids, flex, inline
+that can be clicked, selection, floats, grid, tables as grids, inline
 backgrounds, right-to-left text and colour emoji.
 
 ## Why this exists
