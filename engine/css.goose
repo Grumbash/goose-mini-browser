@@ -240,11 +240,11 @@ fn root_style() -> Style {
                    lh_mult: 1.2, lh_px: 0.0, align: K_LEFT, ws: K_NORMAL, list: K_DISC, deco: K_NONE, valign: K_BASELINE,
                    mt: 0.0, mr: 0.0, mb: 0.0, ml: 0.0, auto_ml: 0, auto_mr: 0, pt: 0.0, pr: 0.0, pb: 0.0, pl: 0.0,
                    width: -1.0, width_pct: -1.0, max_width: -1.0, max_width_pct: -1.0,
-                   bt: 0.0, bb: 0.0, bt_color: CURRENT_COLOR, bb_color: CURRENT_COLOR, indent: 0.0, root_size: 16.0,
+                   bt: 3.0, bb: 3.0, bt_color: CURRENT_COLOR, bb_color: CURRENT_COLOR, indent: 0.0, root_size: 16.0,
                    vars: -1, content: 0, content_len: -1,
                    height: -1.0, height_pct: -1.0, min_width: 0.0, min_width_pct: -1.0, min_height: 0.0, min_height_pct: -1.0,
                    max_height: -1.0, max_height_pct: -1.0, border_box: 0,
-                   bl: 0.0, br: 0.0, bl_color: CURRENT_COLOR, br_color: CURRENT_COLOR,
+                   bl: 3.0, br: 3.0, bl_color: CURRENT_COLOR, br_color: CURRENT_COLOR,
                    bt_style: K_NONE, br_style: K_NONE, bb_style: K_NONE, bl_style: K_NONE,
                    rad_tl: 0.0, rad_tr: 0.0, rad_br: 0.0, rad_bl: 0.0, rad_pct: 0,
                    shadows: [no_shadow(), no_shadow()], shadow_count: 0, opacity: 1.0, alpha: 1.0 };
@@ -729,10 +729,13 @@ fn add_pending(name: const u8[:], value: const u8[:], important: i32, out: Decl[
 fn longhands(name: const u8[:], out: i32[>..]&) {
     if name == "margin" { out.append([P_MT, P_MR, P_MB, P_ML]); }
     else if name == "padding" { out.append([P_PT, P_PR, P_PB, P_PL]); }
-    else if name == "border" || name == "border-width" || name == "border-style" || name == "border-color" {
+    else if name == "border" {
         out.append([P_BT_WIDTH, P_BR_WIDTH, P_BB_WIDTH, P_BL_WIDTH, P_BT_STYLE, P_BR_STYLE, P_BB_STYLE, P_BL_STYLE,
                     P_BT_COLOR, P_BR_COLOR, P_BB_COLOR, P_BL_COLOR]);
     }
+    else if name == "border-width" { out.append([P_BT_WIDTH, P_BR_WIDTH, P_BB_WIDTH, P_BL_WIDTH]); }
+    else if name == "border-style" { out.append([P_BT_STYLE, P_BR_STYLE, P_BB_STYLE, P_BL_STYLE]); }
+    else if name == "border-color" { out.append([P_BT_COLOR, P_BR_COLOR, P_BB_COLOR, P_BL_COLOR]); }
     else if name == "border-top" { out.append([P_BT_WIDTH, P_BT_STYLE, P_BT_COLOR]); }
     else if name == "border-right" { out.append([P_BR_WIDTH, P_BR_STYLE, P_BR_COLOR]); }
     else if name == "border-bottom" { out.append([P_BB_WIDTH, P_BB_STYLE, P_BB_COLOR]); }
@@ -858,7 +861,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
     if name == "content" { add_content(value, important, out, bytes); return; }
     if name == "margin" || name == "padding" {
         let base = if name == "margin" { P_MT } else { P_PT };
-        let parts = words(value);
+        let parts = values(value);
         guard parts.len >= 1 && parts.len <= 4;
         // top right bottom left, with CSS's rules for one to three values.
         let n = parts.len;
@@ -875,25 +878,23 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
     if name == "border" || name == "border-top" || name == "border-right" || name == "border-bottom" || name == "border-left" {
         // Width, style and colour in any order. What it leaves out goes back
         // to its initial value: medium, none, currentColor. With no style
-        // there is no border, as in CSS.
+        // there is no border, as in CSS. Anything else, a negative width
+        // among them, makes the whole declaration invalid.
         var width = decl(0, V_LENGTH, 3.0, U_PX, 0, important);
         var style = K_NONE;
         var color: u32 = CURRENT_COLOR;
-        each_word(value) {
-            let w = it;
+        for w in values(value) {
             let st = border_style(w);
+            let n, u, is_length = parse_length(w);
+            let col, is_color = parse_color(w);
             if st >= 0 { style = st; }
             else if w == "thin" { width.num = 1.0; width.unit = U_PX; }
             else if w == "medium" { width.num = 3.0; width.unit = U_PX; }
             else if w == "thick" { width.num = 5.0; width.unit = U_PX; }
-            else if w.len > 0 && (w[0] >= '0' && w[0] <= '9' || w[0] == '.') {
-                let n, u, ok = parse_length(w);
-                if ok && u != U_PCT { width.num = n; width.unit = u; }
-            } else {
-                let col, cok = parse_color(w);
-                if cok { color = col; }
-            }
-        };
+            else if is_length && u != U_PCT && n >= 0.0 { width.num = n; width.unit = u; }
+            else if is_color { color = col; }
+            else { return; }
+        }
         for side in 4 {
             if !border_side(name, side) { continue; }
             push_decl(out, side_decl(width, side, P_BT_WIDTH, P_BR_WIDTH, P_BB_WIDTH, P_BL_WIDTH));
@@ -907,7 +908,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
         // goes top left, top right, bottom right, bottom left, and its
         // elliptical second half, after a slash, is left out.
         let slash = find(value, "/");
-        let parts = words(if name == "border-radius" && slash >= 0 { value[..slash] } else { value });
+        let parts = values(if name == "border-radius" && slash >= 0 { value[..slash] } else { value });
         guard parts.len >= 1 && parts.len <= 4;
         for side in 4 {
             let v = parts[side_index(parts.len, side)];
@@ -924,10 +925,10 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
         return;
     }
     if name == "background" {
-        each_word(value) {
-            let col, ok = parse_color(it);
+        for w in values(value) {
+            let col, ok = parse_color(w);
             if ok { push_decl(out, decl(P_BG, V_COLOR, 0.0, 0, col, important)); }
-        };
+        }
         return;
     }
     if name == "list-style" {
@@ -988,9 +989,41 @@ fn border_style(w: const u8[:]) -> i32 {
     return -1;
 }
 
+// The values in a declaration's text, split at spaces outside brackets and
+// quotes, so that rgb(0, 0, 255) is one.
+fn values(s: const u8[:]) -> const u8[:][>..] {
+    var out: const u8[:][>..] = [];
+    var i: i64 = 0;
+    while i < s.len {
+        while i < s.len && is_ws(s[i]) { i += 1; }
+        let start = i;
+        var depth = 0;
+        while i < s.len && (depth > 0 || !is_ws(s[i])) {
+            let c = s[i];
+            if c == '"' || c == '\'' { i = skip_string(s, i); continue; }
+            if c == '(' { depth += 1; } else if c == ')' { depth -= 1; }
+            i += 1;
+        }
+        if i > start { out.push(s[start..i]); }
+    }
+    return out;
+}
+
 fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
     var d = decl(prop, 0, 0.0, 0, 0, important);
     if value == "inherit" { d.kind = V_INHERIT; push_decl(out, d); return; }
+    if prop == P_BT_WIDTH || prop == P_BR_WIDTH || prop == P_BB_WIDTH || prop == P_BL_WIDTH {
+        // A keyword, or a length that isn't negative.
+        if value == "thin" || value == "medium" || value == "thick" {
+            d.kind = V_LENGTH;
+            d.num = if value == "thin" { 1.0 } else if value == "medium" { 3.0 } else { 5.0 };
+            d.unit = U_PX;
+            push_decl(out, d);
+            return;
+        }
+        let n, u, ok = parse_length(value);
+        guard !ok || n >= 0.0;
+    }
     if prop >= P_BT_STYLE && prop <= P_BL_STYLE {
         let st = border_style(value);
         guard st >= 0;
@@ -1818,6 +1851,40 @@ fn parse_shadows(text: const u8[:], s: Style&) {
     }
 }
 
+// inherit, for a property that doesn't inherit by itself: the parent's
+// value. One that does inherit already has it.
+fn inherit_value(s: Style&, parent: Style, p: i32) {
+    if p == P_BG { s.bg = parent.bg; }
+    else if p == P_DISPLAY { s.display = parent.display; }
+    else if p == P_VALIGN { s.valign = parent.valign; }
+    else if p == P_MT { s.mt = parent.mt; } else if p == P_MB { s.mb = parent.mb; }
+    else if p == P_ML { s.ml = parent.ml; s.auto_ml = parent.auto_ml; }
+    else if p == P_MR { s.mr = parent.mr; s.auto_mr = parent.auto_mr; }
+    else if p == P_PT { s.pt = parent.pt; } else if p == P_PR { s.pr = parent.pr; }
+    else if p == P_PB { s.pb = parent.pb; } else if p == P_PL { s.pl = parent.pl; }
+    else if p == P_WIDTH { s.width = parent.width; s.width_pct = parent.width_pct; }
+    else if p == P_MAX_WIDTH { s.max_width = parent.max_width; s.max_width_pct = parent.max_width_pct; }
+    else if p == P_HEIGHT { s.height = parent.height; s.height_pct = parent.height_pct; }
+    else if p == P_MIN_WIDTH { s.min_width = parent.min_width; s.min_width_pct = parent.min_width_pct; }
+    else if p == P_MIN_HEIGHT { s.min_height = parent.min_height; s.min_height_pct = parent.min_height_pct; }
+    else if p == P_MAX_HEIGHT { s.max_height = parent.max_height; s.max_height_pct = parent.max_height_pct; }
+    else if p == P_BOX_SIZING { s.border_box = parent.border_box; }
+    else if p == P_BT_WIDTH { s.bt = parent.bt; } else if p == P_BR_WIDTH { s.br = parent.br; }
+    else if p == P_BB_WIDTH { s.bb = parent.bb; } else if p == P_BL_WIDTH { s.bl = parent.bl; }
+    else if p == P_BT_COLOR { s.bt_color = parent.bt_color; } else if p == P_BR_COLOR { s.br_color = parent.br_color; }
+    else if p == P_BB_COLOR { s.bb_color = parent.bb_color; } else if p == P_BL_COLOR { s.bl_color = parent.bl_color; }
+    else if p == P_BT_STYLE { s.bt_style = parent.bt_style; } else if p == P_BR_STYLE { s.br_style = parent.br_style; }
+    else if p == P_BB_STYLE { s.bb_style = parent.bb_style; } else if p == P_BL_STYLE { s.bl_style = parent.bl_style; }
+    else if p >= P_RAD_TL && p <= P_RAD_BL {
+        let bit: i32 = 1 << (p - P_RAD_TL);
+        if p == P_RAD_TL { s.rad_tl = parent.rad_tl; } else if p == P_RAD_TR { s.rad_tr = parent.rad_tr; }
+        else if p == P_RAD_BR { s.rad_br = parent.rad_br; } else { s.rad_bl = parent.rad_bl; }
+        s.rad_pct = (s.rad_pct & ~bit) | (parent.rad_pct & bit);
+    }
+    else if p == P_BOX_SHADOW { s.shadows = parent.shadows; s.shadow_count = parent.shadow_count; }
+    else if p == P_OPACITY { s.opacity = parent.opacity; }
+}
+
 // What an element starts from: the inherited properties of its parent, the
 // initial values of the rest.
 fn inherit(p: Style) -> Style {
@@ -1838,11 +1905,7 @@ fn px(dc: Decl, s: Style, parent: Style) -> f32 {
 
 fn apply(s: Style&, parent: Style, dc: Decl) {
     let p = dc.prop;
-    if dc.kind == V_INHERIT {
-        if p == P_BG { s.bg = parent.bg; }
-        else if p == P_DISPLAY { s.display = parent.display; }
-        return;
-    }
+    if dc.kind == V_INHERIT { inherit_value(s, parent, p); return; }
     let k = dc.num as i32;
     if p == P_DISPLAY { if dc.kind == V_KEYWORD && (k == K_NONE || k == K_BLOCK || k == K_INLINE || k == K_LIST_ITEM) { s.display = k; } }
     else if p == P_COLOR { s.color = if dc.color == CURRENT_COLOR { parent.color } else { dc.color }; }
@@ -1887,8 +1950,8 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
         if dc.kind == V_LENGTH { if dc.unit == U_PCT { pct = dc.num; } else { v = px(dc, s, parent); } }
         if p == P_WIDTH { s.width = v; s.width_pct = pct; } else { s.max_width = v; s.max_width_pct = pct; }
     }
-    else if p == P_BT_WIDTH { s.bt = if dc.kind == V_LENGTH { px(dc, s, parent) } else { 0.0 }; }
-    else if p == P_BB_WIDTH { s.bb = if dc.kind == V_LENGTH { px(dc, s, parent) } else { 0.0 }; }
+    else if p == P_BT_WIDTH { s.bt = if dc.kind == V_LENGTH { max(px(dc, s, parent), 0.0) } else { 0.0 }; }
+    else if p == P_BB_WIDTH { s.bb = if dc.kind == V_LENGTH { max(px(dc, s, parent), 0.0) } else { 0.0 }; }
     else if p == P_BT_COLOR { s.bt_color = if dc.color == CURRENT_COLOR { s.color } else { dc.color }; }
     else if p == P_BB_COLOR { s.bb_color = if dc.color == CURRENT_COLOR { s.color } else { dc.color }; }
     else if p == P_TEXT_INDENT { if dc.kind == V_LENGTH { s.indent = px(dc, s, parent); } }

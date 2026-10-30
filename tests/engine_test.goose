@@ -380,6 +380,42 @@ fn test_box() {
         #t { height: 10px; background: #000; border-radius: 6px 6px 0 0 }</style>
         <div id=r></div><div id=p></div><div id=u></div><div id=n></div><div id=s></div><div id=o></div><div id=t></div>
         """;
+    // From a review: var() in border-color keeps border's width and style; a
+    // style alone is medium, 3 wide; a colour function with spaces; widths by
+    // keyword; a negative width is 0.
+    let borders = """
+        <style>body { margin: 0; padding: 0; max-width: none } :root { --c: #ff0000 } div { height: 4px }
+        #v { border: 2px solid; border-color: var(--c) } #m { border-style: solid; border-color: #000 }
+        #g { border: 1px solid rgb(0, 128, 0) } #k { border-style: solid; border-width: thick 0 0; border-color: #00f }
+        #n { border-top: -5px solid #000 }</style>
+        <div id=v></div><div id=m></div><div id=g></div><div id=k></div><div id=n></div>
+        """;
+    check("borders through var(), medium, rgb(), keywords and negatives", layout_probe(borders, 100.0, PROBE_PAINT),
+          str("v rect 0,0,100,2 ffff0000\nv rect 98,2,2,4 ffff0000\nv rect 0,6,100,2 ffff0000\nv rect 0,2,2,4 ffff0000\n",
+              "m rect 0,8,100,3 ff000000\nm rect 97,11,3,4 ff000000\nm rect 0,15,100,3 ff000000\nm rect 0,11,3,4 ff000000\n",
+              "g rect 0,18,100,1 ff008000\ng rect 99,19,1,4 ff008000\ng rect 0,23,100,1 ff008000\ng rect 0,19,1,4 ff008000\n",
+              "k rect 0,24,100,5 ff0000ff\n")[..]);
+    let sizing = """<style>body { margin: 0; padding: 0; max-width: none } #p { box-sizing: border-box } #p div { box-sizing: inherit; width: 100px; padding: 0 10px; height: 1px } #q { max-width: 10px; padding: 0 20px; box-sizing: border-box; height: 1px }</style><div id=p><div id=c></div></div><div id=q></div>""";
+    check("box-sizing: inherit, and a max-width under the padding", layout_probe(sizing, 400.0, PROBE_GEOMETRY),
+          "p x 0.0 y 0.0 w 400.0 h 1.0\nc x 0.0 y 0.0 w 100.0 h 1.0\nq x 0.0 y 1.0 w 40.0 h 1.0\n");
+
+    // Shadows: the first listed on top; an offset one round a box with no
+    // background only outside it; a ring keeps a square corner square. A tab's
+    // borders differ by side, and one rounded box draws them.
+    let shadows = """
+        <style>body { margin: 0; padding: 0; max-width: none } div { height: 20px; width: 40px; margin-bottom: 20px }
+        #two { box-shadow: 0 0 0 6px #fff, 0 0 0 12px #00f } #o { border: 2px solid #000; box-shadow: 12px 12px 0 #f00 }
+        #sq { border-radius: 16px 16px 0 0; box-shadow: 0 0 0 8px #0f0; background: #000 }
+        #tab { border: 4px solid #00f; border-bottom: none; border-radius: 8px 8px 0 0; background: #f00 }</style>
+        <div id=two></div><div id=o></div><div id=sq></div><div id=tab></div>
+        """;
+    check("shadows in order and outside, sharp corners, borders by side", layout_probe(shadows, 100.0, PROBE_PAINT),
+          str("two box -12,-12,64,44 00000000 r 0,0,0,0 b 12 ff0000ff solid\ntwo box -6,-6,52,32 00000000 r 0,0,0,0 b 6 ffffffff solid\n",
+              "o rect 12,64,44,12 ffff0000\no rect 44,52,12,12 ffff0000\n",
+              "o rect 0,40,44,2 ff000000\no rect 42,42,2,20 ff000000\no rect 0,62,44,2 ff000000\no rect 0,42,2,20 ff000000\n",
+              "sq box -8,76,56,36 00000000 r 24,24,0,0 b 8 ff00ff00 solid\nsq box 0,84,40,20 ff000000 r 16,16,0,0 b 0 00000000 solid\n",
+              "tab box 0,124,48,24 ffff0000 r 8,8,0,0 b 4,4,0,4 ff0000ff solid\n")[..]);
+
     check("rounded boxes, dashes, rings and bars, opacity", layout_probe(paint, 100.0, PROBE_PAINT),
           "r box 0,0,100,20 ffff0000 r 4,4,4,4 b 0 00000000 solid\np box 0,20,40,20 ff00ff00 r 10,10,10,10 b 0 00000000 solid\nu box 0,40,100,24 00000000 r 0,0,0,0 b 2 ff0000ff dashed\ns box -1,83,102,22 00000000 r 0,0,0,0 b 1 ff000000 solid\ns rect 0,84,3,20 ff0000ff\no rect 0,104,100,20 80ff0000\nt box 0,124,100,10 ff000000 r 6,6,0,0 b 0 00000000 solid\n");
 }
@@ -503,6 +539,11 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
                 format_flt(out, it.rad_bl, 0);
                 out.append(" b ");
                 format_flt(out, it.border, 0);
+                if it.border_right != it.border || it.border_bottom != it.border || it.border_left != it.border {
+                    out.push(','); format_flt(out, it.border_right, 0);
+                    out.push(','); format_flt(out, it.border_bottom, 0);
+                    out.push(','); format_flt(out, it.border_left, 0);
+                }
                 out.push(' ');
                 format_uint(out, it.border_color, 16, 8, '0');
                 out.append(if it.border_style == BORDER_DASHED { " dashed" } else { " solid" });

@@ -23,7 +23,8 @@ let BORDER_DASHED: i32 = 1;
 // One item of the display list, laid out as the compositor's DItem: positions
 // in points from the page's top-left; a text item's y is its baseline and its
 // text a span of the layout's text. A box is a rectangle with rounded corners
-// filled with `color`, and a border `border` wide inside its edge.
+// filled with `color`, and borders inside its edge in one colour and style:
+// `border` wide at the top, the others as wide as they say.
 struct DItem {
     kind: i32,
     x: f32, y: f32, w: f32, h: f32,
@@ -33,6 +34,7 @@ struct DItem {
     node: i32,               // the node it paints
     rad_tl: f32, rad_tr: f32, rad_br: f32, rad_bl: f32,   // a box's corner radii, top left first, clockwise
     border: f32, border_color: u32, border_style: i32,
+    border_right: f32, border_bottom: f32, border_left: f32,
 }
 
 struct Rect { x: f32, y: f32, w: f32, h: f32 }
@@ -373,8 +375,8 @@ fn content_width(s: Style, avail: f32, hz: f32) -> f32 {
     if s.width >= 0.0 { w = s.width - inside; }
     else if s.width_pct >= 0.0 { w = avail * s.width_pct / 100.0 - inside; }
     var limit: f32 = -1.0;
-    if s.max_width >= 0.0 { limit = s.max_width - inside; }
-    else if s.max_width_pct >= 0.0 { limit = avail * s.max_width_pct / 100.0 - inside; }
+    if s.max_width >= 0.0 { limit = max(s.max_width - inside, 0.0); }
+    else if s.max_width_pct >= 0.0 { limit = max(avail * s.max_width_pct / 100.0 - inside, 0.0); }
     if limit >= 0.0 && w > limit { w = limit; }
     let least = (if s.min_width_pct >= 0.0 { avail * s.min_width_pct / 100.0 } else { s.min_width }) - inside;
     if w < least { w = least; }
@@ -399,7 +401,8 @@ fn border_color(c: u32, s: Style) -> u32 { return if c == CURRENT_COLOR { s.colo
 
 fn rect_item(n: i32, x: f32, y: f32, w: f32, h: f32, color: u32) -> DItem {
     return DItem { kind: ITEM_RECT, x: x, y: y, w: w, h: h, color: color, font: 0, size: 0.0, text: 0, text_len: 0, node: n,
-                   rad_tl: 0.0, rad_tr: 0.0, rad_br: 0.0, rad_bl: 0.0, border: 0.0, border_color: 0, border_style: BORDER_SOLID };
+                   rad_tl: 0.0, rad_tr: 0.0, rad_br: 0.0, rad_bl: 0.0, border: 0.0, border_color: 0, border_style: BORDER_SOLID,
+                   border_right: 0.0, border_bottom: 0.0, border_left: 0.0 };
 }
 
 fn text_item(n: i32, x: f32, y: f32, w: f32, color: u32, font: i32, size: f32, text: i32, text_len: i32) -> DItem {
@@ -412,13 +415,16 @@ fn text_item(n: i32, x: f32, y: f32, w: f32, color: u32, font: i32, size: f32, t
     return it;
 }
 
-// A box item: a rectangle filled with `fill`, corners rounded by r, and a
-// border `border` wide.
-fn box_item(n: i32, x: f32, y: f32, w: f32, h: f32, fill: u32, r: Radii, border: f32, border_color: u32, dashed: bool) -> DItem {
+// A box item: a rectangle filled with `fill`, corners rounded by r, and
+// borders inside its edge as wide as b says on each side, in one colour.
+fn box_item(n: i32, x: f32, y: f32, w: f32, h: f32, fill: u32, r: Radii, b: Sides, border_color: u32, dashed: bool) -> DItem {
     var it = rect_item(n, x, y, w, h, fill);
     it.kind = ITEM_BOX;
     it.rad_tl = r.tl; it.rad_tr = r.tr; it.rad_br = r.br; it.rad_bl = r.bl;
-    it.border = border;
+    it.border = b.t;
+    it.border_right = b.r;
+    it.border_bottom = b.b;
+    it.border_left = b.l;
     it.border_color = border_color;
     it.border_style = if dashed { BORDER_DASHED } else { BORDER_SOLID };
     return it;
@@ -426,15 +432,15 @@ fn box_item(n: i32, x: f32, y: f32, w: f32, h: f32, fill: u32, r: Radii, border:
 
 struct Radii { tl: f32, tr: f32, br: f32, bl: f32 }
 
-fn radii_plus(r: Radii, by: f32) -> Radii {
-    return Radii { tl: max(r.tl + by, 0.0), tr: max(r.tr + by, 0.0), br: max(r.br + by, 0.0), bl: max(r.bl + by, 0.0) };
-}
+// Widths on each side: top, right, bottom, left.
+struct Sides { t: f32, r: f32, b: f32, l: f32 }
+
+fn even(w: f32) -> Sides { return Sides { t: w, r: w, b: w, l: w }; }
 
 fn any_radius(s: Style) -> bool { return s.rad_tl > 0.0 || s.rad_tr > 0.0 || s.rad_br > 0.0 || s.rad_bl > 0.0; }
 
 // Element n's corner radii on a border box w × h: percentages of its shorter
-// side, and all scaled down together when two on one side would overlap
-// (CSS Backgrounds 3 §5.5).
+// side, fitted to the box.
 fn radii_of(s: Style, w: f32, h: f32) -> Radii {
     let side = min(w, h);
     var r = Radii { tl: s.rad_tl, tr: s.rad_tr, br: s.rad_br, bl: s.rad_bl };
@@ -442,36 +448,100 @@ fn radii_of(s: Style, w: f32, h: f32) -> Radii {
     if (s.rad_pct & 2) != 0 { r.tr = s.rad_tr / 100.0 * side; }
     if (s.rad_pct & 4) != 0 { r.br = s.rad_br / 100.0 * side; }
     if (s.rad_pct & 8) != 0 { r.bl = s.rad_bl / 100.0 * side; }
+    return fit_radii(r, w, h);
+}
+
+// Radii scaled down together when two on one side of a box w × h would
+// overlap (CSS Backgrounds 3 §5.5).
+fn fit_radii(r: Radii, w: f32, h: f32) -> Radii {
     var f: f32 = 1.0;
     if r.tl + r.tr > w { f = min(f, w / (r.tl + r.tr)); }
     if r.bl + r.br > w { f = min(f, w / (r.bl + r.br)); }
     if r.tl + r.bl > h { f = min(f, h / (r.tl + r.bl)); }
     if r.tr + r.br > h { f = min(f, h / (r.tr + r.br)); }
-    if f < 1.0 { r.tl *= f; r.tr *= f; r.br *= f; r.bl *= f; }
-    return r;
+    var out = r;
+    if f < 1.0 { out.tl *= f; out.tr *= f; out.br *= f; out.bl *= f; }
+    return out;
 }
 
-// Whether all four borders match, so one box item can draw them.
-fn uniform_border(s: Style) -> bool {
-    return s.bt > 0.0 && s.bt == s.br && s.bt == s.bb && s.bt == s.bl
-        && s.bt_color == s.br_color && s.bt_color == s.bb_color && s.bt_color == s.bl_color
-        && s.bt_style == s.br_style && s.bt_style == s.bb_style && s.bt_style == s.bl_style;
+// The radius of a shadow's corner spread by `spread` from a corner of radius
+// r (CSS Backgrounds 3 §7.1.1): r plus the spread, but a corner sharper than
+// the spread keeps some of its sharpness, and a square one stays square.
+fn spread_radius(r: f32, spread: f32) -> f32 {
+    let a = abs(spread);
+    guard a > 0.0 else { return r; }
+    if r >= a { return max(r + spread, 0.0); }
+    let k = r / a - 1.0;
+    return max(r + spread * (1.0 + k * k * k), 0.0);
 }
 
-// One box item draws the background with the borders when the borders match
-// and the box is rounded or dashed; otherwise the background is one item
-// (a box if rounded) and each border a rect.
-fn one_box(s: Style) -> bool { return uniform_border(s) && (any_radius(s) || s.bt_style == K_DASHED); }
+// A shadow's radii, spread from a box's and fitted to its own size w × h.
+fn shadow_radii(r: Radii, spread: f32, w: f32, h: f32) -> Radii {
+    return fit_radii(Radii { tl: spread_radius(r.tl, spread), tr: spread_radius(r.tr, spread),
+                             br: spread_radius(r.br, spread), bl: spread_radius(r.bl, spread) }, w, h);
+}
+
+// The radii of the padding box: each corner's less its wider border.
+fn inner_radii(r: Radii, s: Style) -> Radii {
+    return Radii { tl: max(r.tl - max(s.bt, s.bl), 0.0), tr: max(r.tr - max(s.bt, s.br), 0.0),
+                   br: max(r.br - max(s.bb, s.br), 0.0), bl: max(r.bl - max(s.bb, s.bl), 0.0) };
+}
+
+// Side k's border (0 top, 1 right, 2 bottom, 3 left): its width, colour and style.
+fn side_border(s: Style, k: i64) -> f32, u32, i32 {
+    if k == 0 { return s.bt, border_color(s.bt_color, s), s.bt_style; }
+    if k == 1 { return s.br, border_color(s.br_color, s), s.br_style; }
+    if k == 2 { return s.bb, border_color(s.bb_color, s), s.bb_style; }
+    return s.bl, border_color(s.bl_color, s), s.bl_style;
+}
+
+// Whether one box item draws the background with the borders: the box is
+// rounded or a border dashed, and the sides that have a border share its
+// colour and style (their widths may differ). Otherwise the background is
+// one item (a box if rounded) and each border a rect.
+fn one_box(s: Style) -> bool {
+    var color: u32 = 0;
+    var style: i32 = -1;
+    var any = false;
+    var dashed = false;
+    for k in 4 {
+        let w, c, st = side_border(s, k);
+        guard w > 0.0 else { continue; }
+        if !any { color = c; style = st; any = true; }
+        else if c != color || st != style { return false; }
+        if st == K_DASHED { dashed = true; }
+    }
+    return any && (any_radius(s) || dashed);
+}
+
+// What one_box's borders share: their colour, and whether they are dashed.
+fn shared_border(s: Style) -> u32, bool {
+    for k in 4 {
+        let w, c, st = side_border(s, k);
+        if w > 0.0 { return c, st == K_DASHED; }
+    }
+    return 0, false;
+}
 
 // How many items box_paint writes for a block styled s: known before its
 // height is, so they can be reserved under its content.
 fn box_paint_count(s: Style) -> i64 {
     var n: i64 = 0;
+    let hides = (s.bg >> 24) == 255 || any_radius(s);
     for k in s.shadow_count {
         let sd = s.shadows[k];
         guard sd.blur == 0.0 else { continue; }
-        if sd.inset == 0 { n += 1; }
-        else if sd.ox == 0.0 && sd.oy == 0.0 { n += 1; }
+        let still = sd.ox == 0.0 && sd.oy == 0.0;
+        if sd.inset == 0 {
+            if still || hides { n += 1; }
+            else {
+                if sd.oy - sd.spread < 0.0 { n += 1; }
+                if sd.oy + sd.spread > 0.0 { n += 1; }
+                if sd.ox - sd.spread < 0.0 { n += 1; }
+                if sd.ox + sd.spread > 0.0 { n += 1; }
+            }
+        }
+        else if still { n += 1; }
         else {
             if sd.oy + sd.spread > 0.0 { n += 1; }
             if sd.spread - sd.oy > 0.0 { n += 1; }
@@ -492,45 +562,64 @@ fn box_paint_count(s: Style) -> i64 {
 // Writes block n's shadows, background and borders into the items reserved at
 // `at` (box_paint_count of them), now that its border box (x, y, w, h) is
 // known: outset shadows, then the background and borders, then inset shadows,
-// as CSS paints them, all under the content. Blurred shadows aren't drawn;
-// the inset ones with an offset are straight bars, their corners left square.
+// as CSS paints them, all under the content; of several shadows the first is
+// on top. Blurred shadows aren't drawn. An offset shadow shows only outside
+// the box: one item when the box's background hides the rest (or the box is
+// rounded, which it then doesn't always), else strips round it. Inset
+// shadows with an offset are straight bars, their corners left square.
 fn box_paint(L: Layout, n: i32, s: Style, at: i64, x: f32, y: f32, w: f32, h: f32) {
     var k = at;
     let r = radii_of(s, w, h);
     let rounded = any_radius(s);
-    for i in s.shadow_count {
-        let sd = s.shadows[i];
+    let hides = (s.bg >> 24) == 255 || rounded;
+    for j in s.shadow_count {
+        let sd = s.shadows[s.shadow_count - 1 - j];
         guard sd.blur == 0.0 && sd.inset == 0 else { continue; }
-        let sr = if rounded { radii_plus(r, sd.spread) } else { radii_plus(r, 0.0) };
+        let sx = x + sd.ox - sd.spread;
+        let sy = y + sd.oy - sd.spread;
+        let sw = w + 2.0 * sd.spread;
+        let sh = h + 2.0 * sd.spread;
+        let sr = shadow_radii(r, sd.spread, sw, sh);
         if sd.ox == 0.0 && sd.oy == 0.0 {
             // A ring round the box, so a box without a background shows through.
-            L.items[k] = box_item(n, x - sd.spread, y - sd.spread, w + 2.0 * sd.spread, h + 2.0 * sd.spread, 0, sr,
-                                  max(sd.spread, 0.0), sd.color, false);
+            L.items[k] = box_item(n, sx, sy, sw, sh, 0, sr, even(max(sd.spread, 0.0)), sd.color, false);
+            k += 1;
+        } else if hides {
+            L.items[k] = box_item(n, sx, sy, sw, sh, sd.color, sr, even(0.0), 0, false);
+            k += 1;
         } else {
-            L.items[k] = box_item(n, x + sd.ox - sd.spread, y + sd.oy - sd.spread, w + 2.0 * sd.spread, h + 2.0 * sd.spread,
-                                  sd.color, sr, 0.0, 0, false);
+            let top = min(y, sy + sh);
+            let bottom = max(y + h, sy);
+            let my0 = max(sy, y);
+            let my1 = min(sy + sh, y + h);
+            if sd.oy - sd.spread < 0.0 { L.items[k] = rect_item(n, sx, sy, sw, top - sy, sd.color); k += 1; }
+            if sd.oy + sd.spread > 0.0 { L.items[k] = rect_item(n, sx, bottom, sw, sy + sh - bottom, sd.color); k += 1; }
+            if sd.ox - sd.spread < 0.0 { L.items[k] = rect_item(n, sx, my0, min(x, sx + sw) - sx, my1 - my0, sd.color); k += 1; }
+            if sd.ox + sd.spread > 0.0 {
+                let rx = max(x + w, sx);
+                L.items[k] = rect_item(n, rx, my0, sx + sw - rx, my1 - my0, sd.color);
+                k += 1;
+            }
         }
-        k += 1;
     }
     if one_box(s) {
-        L.items[k] = box_item(n, x, y, w, h, s.bg, r, s.bt, border_color(s.bt_color, s), s.bt_style == K_DASHED);
+        let c, dashed = shared_border(s);
+        L.items[k] = box_item(n, x, y, w, h, s.bg, r, Sides { t: s.bt, r: s.br, b: s.bb, l: s.bl }, c, dashed);
         k += 1;
-    } else {
-        if (s.bg >> 24) != 0 {
-            L.items[k] = if rounded { box_item(n, x, y, w, h, s.bg, r, 0.0, 0, false) } else { rect_item(n, x, y, w, h, s.bg) };
-            k += 1;
-        }
+    } else if (s.bg >> 24) != 0 {
+        L.items[k] = if rounded { box_item(n, x, y, w, h, s.bg, r, even(0.0), 0, false) } else { rect_item(n, x, y, w, h, s.bg) };
+        k += 1;
     }
     // The padding box, where inset shadows go.
     let px = x + s.bl;
     let py = y + s.bt;
     let pw = max(w - s.bl - s.br, 0.0);
     let ph = max(h - s.bt - s.bb, 0.0);
-    for i in s.shadow_count {
-        let sd = s.shadows[i];
+    for j in s.shadow_count {
+        let sd = s.shadows[s.shadow_count - 1 - j];
         guard sd.blur == 0.0 && sd.inset != 0 else { continue; }
         if sd.ox == 0.0 && sd.oy == 0.0 {
-            L.items[k] = box_item(n, px, py, pw, ph, 0, radii_plus(r, -s.bt), max(sd.spread, 0.0), sd.color, false);
+            L.items[k] = box_item(n, px, py, pw, ph, 0, inner_radii(r, s), even(max(sd.spread, 0.0)), sd.color, false);
             k += 1;
             continue;
         }
