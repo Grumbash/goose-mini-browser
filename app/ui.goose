@@ -27,11 +27,12 @@ struct UiFiles { css: u8[>..]&, sprite: u8[>..]&, rest: u8[>..]&, run: u8[>..]& 
 
 // What the interface shows that isn't a tab's: the window's size, where the
 // traffic lights end in its bar (0: none), which tab is shown, the dev panel
-// and its tab, the window's oil (MB), CPU (%) and frames a second, and
-// whether the boar is out running a load.
+// and its tab, the window's oil (MB), the Mac's memory in use and in all
+// (MB), the window's CPU and the whole Mac's (%, of all its cores), its
+// frames a second, and whether the boar is out running a load.
 struct Ui {
     w: f32, h: f32, lights: f32, cur: i64, dev: bool, dev_tab: i32,
-    oil: f32, cpu: f32, fps: i32, running: bool,
+    oil: f32, mac_used: f32, mac_total: f32, cpu: f32, mac_cpu: f32, fps: i32, running: bool,
 }
 
 // What it reads of the main thread's strings: the pages' paths, one after
@@ -50,7 +51,6 @@ let BAR_H: f32 = 40.0;           // the top bar
 let PANEL_H: f32 = 60.0;         // the bottom panel; it never grows
 let DEV_W: f32 = 360.0;          // the dev panel, beside the content
 let LOADER_H: f32 = 56.0;        // the loader, over the content's foot
-let BUDGET_MB: f32 = 1000.0;     // the oil the window may burn
 let DROP: const u8[:] = "M12 1C12 1 2 13 2 20a10 10 0 0 0 20 0C22 13 12 1 12 1Z";
 
 fn read_ui(F: UiFiles) -> bool {
@@ -422,16 +422,16 @@ fn frame_graph(out: u8[>..]&, frames: const f32[:], dropped: i32, rebuild_ms: f3
 
 // The window's oil, and what each page weighs.
 fn oil(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText) {
-    out.append("<div class=\"oilv\"><div class=\"oilh\"><span><b>");
-    format_flt(out, U.oil, 1);
-    out.append("</b> of 1,000 MB</span>");
-    gauge(out, U.oil);
+    out.append("<div class=\"oilv\"><div class=\"oilh\"><span>");
+    weights(out, U);
+    out.append("</span>");
+    gauge(out, U);
     out.append("</div><ul><li class=\"bd\"><b>");
     esc(out, board_of(T));
     out.append("</b><small>in play</small><span class=\"v\">");
     format_flt(out, U.oil, 1);
     out.append(" MB</span><i style=\"width:");
-    format_flt(out, min(U.oil / BUDGET_MB * 100.0, 100.0), 1);
+    format_flt(out, min(U.oil / max(U.mac_total, 1.0) * 100.0, 100.0), 2);
     out.append("%\"></i></li>");
     for t, k in tabs {
         out.append("<li class=\"pgr\"><span>");
@@ -445,22 +445,51 @@ fn oil(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText) {
 }
 
 // Ten drops of 100 MB against the budget; the last fills to the level.
-fn gauge(out: u8[>..]&, mb: f32) {
-    let level = mb / BUDGET_MB * 10.0;
-    out.append("<span class=\"oilg\" role=\"img\" aria-label=\"Oil: ");
-    format_flt(out, mb, 1);
-    out.append(" of 1,000 MB\">");
+// The oil as ten drops, each a tenth of the Mac's memory, filled from the
+// left: with what the whole Mac uses, and over it, in the oil's colour, what
+// Tusk does.
+fn gauge(out: u8[>..]&, U: Ui) {
+    let total = max(U.mac_total, 1.0);
+    let mac = U.mac_used / total * 10.0;
+    let tusk = min(U.oil, U.mac_used) / total * 10.0;
+    out.append("<span class=\"oilg\" role=\"img\" aria-label=\"Oil: Tusk ");
+    format_flt(out, U.oil, 1);
+    out.append(" MB, the Mac ");
+    format_flt(out, U.mac_used / 1024.0, 1);
+    out.append(" of ");
+    format_flt(out, U.mac_total / 1024.0, 1);
+    out.append(" GB\">");
     for k in 10 {
-        let f = min(max(level - k, 0.0), 1.0);
         format(out, "<i><svg viewBox=\"0 0 24 31\"><path d=\"", DROP, "\"/></svg>");
-        if f > 0.0 {
-            out.append("<svg class=\"f\" viewBox=\"0 0 24 31\" style=\"clip-path:inset(");
-            format(out, ((1.0 - f) * 100.0) as i64);
-            format(out, "% 0 0 0)\"><path d=\"", DROP, "\"/></svg>");
-        }
+        fill(out, "m", min(max(mac - k, 0.0), 1.0));
+        fill(out, "f", min(max(tusk - k, 0.0), 1.0));
         out.append("</i>");
     }
     out.append("</span>");
+}
+
+// A drop filled to `f` (0 to 1) from the bottom, in class `kind`'s colour: a
+// box that tall at its foot, cutting a whole drop. A fill that isn't empty
+// shows at least a point, so that Tusk's few megabytes of a Mac's
+// gigabytes still show.
+fn fill(out: u8[>..]&, kind: const u8[:], f: f32) {
+    guard f > 0.0 else { return; }
+    format(out, "<b class=\"", kind, "\" style=\"height:");
+    format_flt(out, max(f * 100.0, 100.0 / 12.0), 1);
+    format(out, "%\"><svg viewBox=\"0 0 24 31\"><path d=\"", DROP, "\"/></svg></b>");
+}
+
+// What Tusk weighs, in MB, in the oil's colour; then what the whole Mac
+// uses of all it has, in GB.
+fn weights(out: u8[>..]&, U: Ui) {
+    out.append("<b class=\"t\">");
+    format_flt(out, U.oil, 1);
+    out.append("</b> MB · <b class=\"m\">");
+    format_flt(out, U.mac_used / 1024.0, 1);
+    out.append("</b> / ");
+    let gb = U.mac_total / 1024.0;
+    format_flt(out, gb, if gb == round(gb) { 0 } else { 1 });
+    out.append(" GB");
 }
 
 // The bottom panel: the boar's bay, the window's line, and the hand.
@@ -469,11 +498,14 @@ fn panel(out: u8[>..]&, F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText) {
     // He leaves his bay to run a load.
     if !U.running { out.append(F.rest); }
     out.append("</div><div class=\"ro\"><div class=\"r2\">");
-    gauge(out, U.oil);
-    out.append("<span><b>");
-    format_flt(out, U.oil, 1);
-    out.append("</b> / 1,000 MB</span><span class=\"k\">CPU</span><span><b>");
+    gauge(out, U);
+    out.append("<span>");
+    weights(out, U);
+    // The CPU as the oil is: Tusk's in its colour, then the whole Mac's.
+    out.append("</span><span class=\"k\">CPU</span><span><b class=\"t\">");
     format_flt(out, U.cpu, 1);
+    out.append("</b>% · <b class=\"m\">");
+    format_flt(out, U.mac_cpu, 1);
     out.append("</b>%</span><span><b>");
     format(out, U.fps);
     out.append(if U.fps == 0 { "</b> fps · idle</span>" } else { "</b> fps</span>" });

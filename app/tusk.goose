@@ -67,6 +67,8 @@ extern "tusk_platform" {
     fn tp_frame_stats(out: FrameStats&, reset: bool) -> i32;
     fn tp_frame_times(out: f32[:]) -> i64;
     fn tp_memory_footprint() -> i64;
+    fn tp_mac_memory(total: i64&, used: i64&) -> i32;
+    fn tp_mac_cpu(busy: i64&, total: i64&) -> i32;
     fn tp_cpu_ns() -> i64;
     fn tp_cores() -> i64;
     fn tp_frames() -> i64;
@@ -439,7 +441,8 @@ fn main() {
     // Its text is mostly what it was, each time it is laid out.
     tp_text_cache(SHAPE_CACHE);
     var U = Ui { w: WINDOW_W, h: WINDOW_H, lights: 0.0, cur: 0, dev: dev, dev_tab: dev_tab,
-                 oil: tp_memory_footprint() / 1048576.0, cpu: 0.0, fps: 0, running: false };
+                 oil: 0.0, mac_used: 0.0, mac_total: 0.0, cpu: 0.0, mac_cpu: 0.0, fps: 0, running: false };
+    weigh(U);
     var slot = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
 
     if mode == MODE_SCREENSHOT {
@@ -468,7 +471,7 @@ fn main() {
         place_tab(0, true, y, slot);
         var bg = tabs[0].info.background;
         if !bare {
-            U.oil = tp_memory_footprint() / 1048576.0;
+            weigh(U);
             show_ui(F, U, tabs, T, first_ms, scale, slot);
             bg = STEEL;
         }
@@ -497,7 +500,7 @@ fn main() {
         return;
     }
     U.lights = tp_lights_end() as f32;
-    U.oil = tp_memory_footprint() / 1048576.0;
+    weigh(U);
 
     var worker: i64 = -1;
     if mode == MODE_WAKE_TEST { worker = thread_spawn_contained(wake_after, 300, 42); }
@@ -514,10 +517,14 @@ fn main() {
     var sized_scale: f32 = 0.0;      // and the backing scale
     var last_step: i64 = 0;          // the boar's last step
     // The window's line: frames drawn for what changed on screen since it
-    // was measured, when it was, and the CPU time then.
+    // was measured, when it was, and the CPU time then, Tusk's and the
+    // whole Mac's (busy and in all, in ticks).
     var content_frames: i64 = 0;
     var tick_from = clock_ns();
     var cpu_from = tp_cpu_ns();
+    var mac_busy: i64 = 0;
+    var mac_ticks: i64 = 0;
+    mac_load(mac_busy, mac_ticks);
     var ticking = false;
     var settle = false;              // a frame has been drawn since the oil was last weighed
     var settle_at: i64 = 0;
@@ -655,11 +662,13 @@ fn main() {
             let fps = round(content_frames / secs) as i32;
             // As a share of the whole Mac: one busy core of 15 is 6.7%.
             let load = ((cpu - cpu_from) / 10000000.0 / secs / max(tp_cores(), 1)) as f32;
-            let oil = tp_memory_footprint() / 1048576.0;
-            if fps != U.fps || abs(load - U.cpu) >= 0.1 || abs(oil - U.oil) >= 0.1 {
+            let mac = mac_load(mac_busy, mac_ticks);
+            let was = U;
+            weigh(U);
+            if fps != U.fps || abs(load - U.cpu) >= 0.1 || abs(mac - U.mac_cpu) >= 0.1 || weighs_else(was, U) {
                 U.fps = fps;
                 U.cpu = load;
-                U.oil = oil;
+                U.mac_cpu = mac;
                 redo = true;
                 drawn_line = true;
             }
@@ -676,10 +685,12 @@ fn main() {
             let now = clock_ns();
             let cpu = tp_cpu_ns();
             let load = ((cpu - cpu_from) / 10000000.0 / (ms(tick_from, now) / 1000.0) / max(tp_cores(), 1)) as f32;
-            let oil = tp_memory_footprint() / 1048576.0;
-            if abs(oil - U.oil) >= 0.1 || abs(load - U.cpu) >= 0.1 {
-                U.oil = oil;
+            let mac = mac_load(mac_busy, mac_ticks);
+            let was = U;
+            weigh(U);
+            if weighs_else(was, U) || abs(load - U.cpu) >= 0.1 || abs(mac - U.mac_cpu) >= 0.1 {
                 U.cpu = load;
+                U.mac_cpu = mac;
                 redo = true;
                 drawn_line = true;
             }
@@ -721,6 +732,7 @@ fn main() {
                     ticking = true;
                     tick_from = clock_ns();
                     cpu_from = tp_cpu_ns();
+                    mac_load(mac_busy, mac_ticks);
                     content_frames = 1;
                 }
             }
@@ -788,6 +800,35 @@ fn full_path(p: const u8[:], out: u8[>..]&) {
         i = j;
     }
     if out.len == start { out.push('/'); }
+}
+
+// Weighs the window's oil and the Mac's memory into U, in MB.
+fn weigh(U: Ui&) {
+    U.oil = tp_memory_footprint() / 1048576.0;
+    var total: i64 = 0;
+    var used: i64 = 0;
+    if tp_mac_memory(total, used) == 0 {
+        U.mac_total = total / 1048576.0;
+        U.mac_used = used / 1048576.0;
+    }
+}
+
+// The whole Mac's CPU load since `busy` and `ticks` were read, in % of all
+// its cores (Activity Monitor's System and User together); reads them again.
+fn mac_load(busy: i64&, ticks: i64&) -> f32 {
+    var b: i64 = 0;
+    var t: i64 = 0;
+    guard tp_mac_cpu(b, t) == 0 else { return 0.0; }
+    let load = if t > ticks { ((b - busy) * 100.0 / (t - ticks)) as f32 } else { 0.0 };
+    busy = b;
+    ticks = t;
+    return load;
+}
+
+// Whether the readout's weights differ enough to show: Tusk's by 0.1 MB, as
+// it is written, and the Mac's by 0.1 GB.
+fn weighs_else(a: Ui, b: Ui) -> bool {
+    return abs(a.oil - b.oil) >= 0.1 || abs(a.mac_used - b.mac_used) >= 102.4 || a.mac_total != b.mac_total;
 }
 
 // The sooner of two waits in ms, -1 being none; never below 0.

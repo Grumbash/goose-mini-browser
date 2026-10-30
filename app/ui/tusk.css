@@ -28,7 +28,12 @@ body { background:var(--bg); color:var(--ink); font:400 17px/1.5 var(--f-ui); -w
 .oilg i { position:relative; width:9px; height:12px; flex:none }
 .oilg svg { position:absolute; inset:0; width:100%; height:100% }
 .oilg path { fill:none; stroke:var(--steel-4); stroke-width:2.2 }
+.oilg b { position:absolute; left:0; right:0; bottom:0; overflow:hidden }
+.oilg b svg { top:auto; bottom:0; height:12px }
 .oilg .f path { fill:#1FB5A8; stroke:none }
+.oilg .m path { fill:var(--steel-5); stroke:none }
+.ro b.t, .oilh b.t { color:#1FB5A8 }
+.ro b.m, .oilh b.m { color:var(--steel-5) }
 .drop { position:absolute; z-index:2; left:-8px; top:-11px; width:26px; height:34px; display:flex; align-items:flex-end; justify-content:center; padding-bottom:6px }
 .drop svg { position:absolute; inset:0; width:100%; height:100% }
 .drop path { fill:#1FB5A8; stroke:var(--oil); stroke-width:1.5 }

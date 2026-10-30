@@ -88,7 +88,7 @@ fn doc_for(title: const u8[:], path: const u8[:], w: f32, out: u8[>..]&) {
     tabs.push(Tab { worker: 0, ready: true, failed: false, info: info, paint: 1.0, waiting: false, scroll: 0.0,
                     opened: 0, load_ms: 4.0, title_at: 0, title_len: title.len, why_at: 0, why_len: 0, elems_at: 0,
                     elems_len: 0 });
-    let U = Ui { w: w, h: 760.0, lights: 0.0, cur: 0, dev: true, dev_tab: DEV_CONSOLE, oil: 50.0, cpu: 1.0, fps: 0,
+    let U = Ui { w: w, h: 760.0, lights: 0.0, cur: 0, dev: true, dev_tab: DEV_CONSOLE, oil: 50.0, mac_used: 12288.0, mac_total: 24576.0, cpu: 1.0, mac_cpu: 12.0, fps: 0,
                  running: false };
     ui_html(F, U, tabs, T, [], 0, 1.0, out);
 }
