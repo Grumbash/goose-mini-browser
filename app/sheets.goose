@@ -26,13 +26,14 @@ struct SheetFetch { parent: i32, depth: i32, url_at: i64, url_len: i64, text_at:
                     media_len: i64, req: i32 }
 
 // The sheets of document `d`, at `page` (its URL; "file://..." for a file),
-// with relative URLs resolving against `base`: onto `texts`, one after
+// with relative URLs resolving against `base`, fetched with tp_net_open's
+// `flags`: onto `texts`, one after
 // another in the cascade's order (each one's imports before it), each
 // ending where `ends` says, and the media each applies under onto `medias`,
 // and `media_ends`, as load_sheets_with reads them. What went wrong goes on
 // `log`, a line each. What the main thread asks meanwhile goes in `later`.
 // False if the tab quits first.
-fn gather_sheets(tab: i32, profile: i32, d: Doc, page: const u8[:], base: const u8[:], texts: u8[>..]&,
+fn gather_sheets(tab: i32, profile: i32, flags: i32, d: Doc, page: const u8[:], base: const u8[:], texts: u8[>..]&,
                  ends: i64[>..]&, medias: u8[>..]&, media_ends: i64[>..]&, later: TabMsg[>..]&, log: u8[>..]&) -> bool {
     var sources: i32[>..] = [];
     sheet_sources(d, sources);
@@ -58,7 +59,7 @@ fn gather_sheets(tab: i32, profile: i32, d: Doc, page: const u8[:], base: const 
             fetches[k].text_len = pool.len - fetches[k].text_at;
         } else {
             let href, has = attr_value(d, n, "href");
-            start_sheet(tab, profile, page, base, href, fetches, k, pool, log);
+            start_sheet(tab, profile, flags, page, base, href, fetches, k, pool, log);
         }
     }
     // A wave: wait for what runs, then start what the sheets that came import.
@@ -87,7 +88,7 @@ fn gather_sheets(tab: i32, profile: i32, d: Doc, page: const u8[:], base: const 
                                           req: 0 });
                 var url: u8[>..] = [];
                 url.append(pool[fetches[k].url_at..fetches[k].url_at + fetches[k].url_len]);
-                start_sheet(tab, profile, page, url[..], hrefs[from..e], fetches, at, pool, log);
+                start_sheet(tab, profile, flags, page, url[..], hrefs[from..e], fetches, at, pool, log);
                 from = e;
             }
         }
@@ -150,7 +151,8 @@ fn put_sheets(fetches: const SheetFetch[:], pool: const u8[:], out: u8[>..]&, en
 // Starts fetching sheet k, `href` against `base`. A page from the web loads
 // it over the network, http or https; a file's page reads it from a file. A
 // sheet already among those that import it is a cycle, and left out.
-fn start_sheet(tab: i32, profile: i32, page: const u8[:], base: const u8[:], href: const u8[:], fetches: SheetFetch[>..]&,
+fn start_sheet(tab: i32, profile: i32, flags: i32, page: const u8[:], base: const u8[:], href: const u8[:],
+               fetches: SheetFetch[>..]&,
                k: i32, pool: u8[>..]&, log: u8[>..]&) {
     var url: u8[>..] = [];
     guard resolve_url(base, href, url) else {
@@ -169,7 +171,7 @@ fn start_sheet(tab: i32, profile: i32, page: const u8[:], base: const u8[:], hre
     pool.append(url);
     fetches[k].url_len = url.len;
     if is_web(page) {
-        let req = tp_net_open(tab, profile, NET_STYLE, url[..], page, 0);
+        let req = tp_net_open(tab, profile, NET_STYLE, url[..], page, flags);
         if req > 0 { fetches[k].req = req; }
         else if req == ERR_BLOCKED { format(log, "Sheet ", url, " is blocked: an https page loads no http sheets\n"); }
         else { format(log, "Sheet ", url, " can't be loaded\n"); }

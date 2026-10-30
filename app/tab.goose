@@ -25,6 +25,7 @@ let MSG_HIT: i32 = 2;        // a, b: a point on the page
 let MSG_SNAPSHOT: i32 = 3;   // a: the width to lay the page out at, b: the view's height
 let MSG_QUIT: i32 = 4;
 let MSG_NET: i32 = 5;        // a: a request that ended (platform/src/net.rs)
+let MSG_CLICK: i32 = 6;      // a, b: a point on the page; c: 1 to open a link there in a new tab
 
 // What a display list comes with: the page's height and canvas colour, its
 // size in nodes and bytes, what each stage took in milliseconds, the backing
@@ -44,6 +45,9 @@ let REPLY_ELEMENTS: i32 = 5; // text: its elements under <body>, a line each (el
 let REPLY_READ: i32 = 6;     // value: the document's size in bytes, once read
 let REPLY_URL: i32 = 7;      // value: the HTTP status; text: the page's URL after redirects
 let REPLY_LOG: i32 = 8;      // text: what went wrong loading the page, a line each
+let REPLY_LINK: i32 = 9;     // value: 1 for a new tab; text: the URL a clicked link leads to
+let REPLY_JUMP: i32 = 10;    // value: where on the page to scroll to (-1: nowhere); text: the URL with its fragment
+let REPLY_GONE: i32 = 11;    // the worker has ended
 
 // How much of a page's own text the interface takes: a page's title or an
 // element's id or class could be any length, and the interface is laid out
@@ -79,17 +83,19 @@ struct Page {
     fonts: FontInfo[>..]&,
 }
 
-// What the main thread knows of a tab: its worker; what came with its last
-// display list (`ready` once one has) and what taking it cost there; whether
-// it failed; whether a display list waits to be taken when it is shown; how
-// far it is scrolled; when it opened and how long it took to show; its
-// page's HTTP status (0 for a file); and spans of the main thread's notes:
-// where it is (a file's path or a URL), its title, why it failed, what went
-// wrong loading it (a line each), its elements.
+// What the main thread knows of a tab: its page's worker and mailbox (-1
+// for none: stopped); what came with its last display list (`ready` once one
+// has) and what taking it cost there; whether it failed; whether a display
+// list waits to be taken when it is shown; how far it is scrolled, and where
+// to scroll once its page comes (-1: the top); when it opened and how long it
+// took to show; its page's HTTP status (0 for a file); its place in history
+// (an entry, tusk.goose); and spans of the main thread's notes: where it is
+// (a file's path or a URL), its title, why it failed, what went wrong loading
+// it (a line each), its elements.
 struct Tab {
-    worker: i64, ready: bool, failed: bool, info: FrameInfo, paint: f32, waiting: bool, scroll: f32, opened: i64,
-    load_ms: f32, status: i32, loc_at: i64, loc_len: i64, title_at: i64, title_len: i64, why_at: i64, why_len: i64,
-    log_at: i64, log_len: i64, elems_at: i64, elems_len: i64,
+    worker: i64, page: i32, ready: bool, failed: bool, info: FrameInfo, paint: f32, waiting: bool, scroll: f32,
+    restore: f32, opened: i64, load_ms: f32, status: i32, entry: i64, loc_at: i64, loc_len: i64, title_at: i64,
+    title_len: i64, why_at: i64, why_len: i64, log_at: i64, log_len: i64, elems_at: i64, elems_len: i64,
 }
 
 // How fetching a document ended.
@@ -99,25 +105,33 @@ let LOAD_QUIT: i32 = 2;      // the tab closed meanwhile
 
 fn ms_since(from: i64) -> f32 { return ((clock_ns() - from) / 1000000.0) as f32; }
 
-// Tab `tab`'s worker, for the page at `loc`: a file's path, or an http or
-// https URL, loaded on profile `profile`'s session. Its media queries see
-// dark mode when `dark` says so.
-thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32, dark: bool) {
+// The worker of page `tab` (its mailbox), for the page at `loc`: a file's
+// path, or an http or https URL, loaded on profile `profile`'s session, past
+// the cache when `reload` says so. Its media queries see dark mode when
+// `dark` does. It says when it has ended, so the main thread can let it go
+// without waiting for it.
+thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32, dark: bool, reload: bool) {
+    show_page(tab, loc[..], profile, dark, reload);
+    tp_post_reply(tab, REPLY_GONE, 0, "");
+}
+
+fn show_page(tab: i32, loc: const u8[:], profile: i32, dark: bool, reload: bool) {
     var src: u8[>..] = [];
     var later: TabMsg[>..] = [];     // what the main thread asked while the page came
     var page: u8[>..] = [];          // the page's URL, after redirects
     var t = clock_ns();
-    if is_web(loc[..]) {
-        let got = fetch_document(tab, profile, loc[..], src, page, later);
+    let flags = if reload { NET_RELOAD } else { 0 };
+    if is_web(loc) {
+        let got = fetch_document(tab, profile, loc, flags, src, page, later);
         guard got != LOAD_QUIT else { return; }
         guard got == LOAD_OK else { serve_nothing(tab); return; }
     } else {
-        guard read_file(loc[..], src) else {
+        guard read_file(loc, src) else {
             tp_post_reply(tab, REPLY_FAILED, 0, str("can't read ", loc)[..]);
             serve_nothing(tab);
             return;
         }
-        file_url(loc[..], page);
+        file_url(loc, page);
     }
     var info = FrameInfo { height: 0.0, background: 0xFFFFFFFF, nodes: 0, bytes: src.len as i32,
                            parse: 0.0, style: 0.0, measure: 0.0, layout: 0.0, scale: 1.0, read: ms_since(t) };
@@ -138,8 +152,8 @@ thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32, dark: bool) {
     var sheet_medias: u8[>..] = [];
     var sheet_media_ends: i64[>..] = [];
     var log: u8[>..] = [];
-    guard gather_sheets(tab, profile, d, page[..], base[..], sheet_texts, sheet_ends, sheet_medias, sheet_media_ends,
-                        later, log) else { return; }
+    guard gather_sheets(tab, profile, flags, d, page[..], base[..], sheet_texts, sheet_ends, sheet_medias,
+                        sheet_media_ends, later, log) else { return; }
     if log.len > 0 { tp_post_reply(tab, REPLY_LOG, 0, log[..]); }
     info.read += ms_since(t);
     t = clock_ns();
@@ -185,15 +199,16 @@ thread_fn tab_worker(tab: i32, loc: u8[>..], profile: i32, dark: bool) {
     var elems: u8[>..] = [];
     elements_of(d, elems);
     tp_post_reply(tab, REPLY_ELEMENTS, 0, elems[..]);
-    serve(tab, P, sh, env, info, later[..]);
+    serve(tab, P, sh, env, info, later[..], base[..], page[..]);
 }
 
 // Loads the document at `url` on profile `profile`'s session into `src`, as
 // HTML: a text response goes in a <pre>. Its URL after redirects goes onto
 // `page` and to the main thread, with its status; or why it failed. What the
 // main thread asks meanwhile goes in `later`, to answer once there is a page.
-fn fetch_document(tab: i32, profile: i32, url: const u8[:], src: u8[>..]&, page: u8[>..]&, later: TabMsg[>..]&) -> i32 {
-    let req = tp_net_open(tab, profile, NET_DOCUMENT, url, "", 0);
+fn fetch_document(tab: i32, profile: i32, url: const u8[:], flags: i32, src: u8[>..]&, page: u8[>..]&,
+                  later: TabMsg[>..]&) -> i32 {
+    let req = tp_net_open(tab, profile, NET_DOCUMENT, url, "", flags);
     guard req > 0 else {
         tp_post_reply(tab, REPLY_FAILED, 0, str("can't load ", url)[..]);
         return LOAD_FAILED;
@@ -326,8 +341,10 @@ fn one_line(out: u8[>..]&, s: const u8[:], max: i64) {
 // each size, the pointer's shape for each point, a tree for each snapshot.
 // What it asked while the page came, `later`, is answered first. A size that
 // turns one of its sheets' @media on or off styles and measures it again
-// first, against sheets `sh`, for viewport `env`.
-fn serve(tab: i32, P: Page, sh: Sheet, env: MediaEnv, info: FrameInfo&, later: const TabMsg[:]) {
+// first, against sheets `sh`, for viewport `env`. A click on a link says
+// where it leads, its URL resolved against `base`, the page being `page`.
+fn serve(tab: i32, P: Page, sh: Sheet, env: MediaEnv, info: FrameInfo&, later: const TabMsg[:], base: const u8[:],
+         page: const u8[:]) {
     var viewport = env;
     var items: DItem[>..<] = [];     // the display list as laid out last, for hit tests
     var bounds: f32[>..<] = [];      // where its items are: made at the first hit test after a layout
@@ -373,12 +390,75 @@ fn serve(tab: i32, P: Page, sh: Sheet, env: MediaEnv, info: FrameInfo&, later: c
             }
             let link = link_at(P.d, node_at(items[..], P.fonts[..], bounds[..], m.a, m.b));
             tp_post_reply(tab, REPLY_HIT, if link >= 0 { CURSOR_POINTER } else { CURSOR_ARROW }, "");
+        } else if m.kind == MSG_CLICK {
+            if !bounded {
+                hit_bounds(items[..], P.fonts[..], bounds);
+                bounded = true;
+            }
+            let link = link_at(P.d, node_at(items[..], P.fonts[..], bounds[..], m.a, m.b));
+            if link >= 0 { follow(tab, P, items[..], base, page, link, m.c != 0.0); }
         } else if m.kind == MSG_SNAPSHOT {
             var out: u8[>..] = [];
             snapshot_of(P, m.a, m.b, info, out);
             tp_post_reply(tab, REPLY_SNAPSHOT, 0, out[..]);
         }
     }
+}
+
+// Where a click on link `link` of page P (at `page`, its URLs resolving
+// against `base`) leads, to the main thread. A link to a place on this page
+// jumps there, unless it opens in a new tab. A web page's links lead to the
+// web; a file's to the web or to files. javascript:, mailto: and the rest do
+// nothing yet.
+fn follow(tab: i32, P: Page, items: const DItem[:], base: const u8[:], page: const u8[:], link: i32, new_tab: bool) {
+    let href, has = attr_value(P.d, link, "href");
+    guard has else { return; }
+    var url: u8[>..] = [];
+    guard resolve_url(base, href, url) else { return; }
+    let file = starts_with(url[..], "file:");
+    guard is_web(url[..]) || (file && !is_web(page)) else { return; }
+    let hash = find(url[..], "#");
+    var page_end = find(page, "#");
+    if page_end < 0 { page_end = page.len; }
+    if hash >= 0 && !new_tab && url[..hash] == page[..page_end] {
+        tp_post_reply(tab, REPLY_JUMP, fragment_y(P, items, url[hash + 1..]), url[..]);
+        return;
+    }
+    tp_post_reply(tab, REPLY_LINK, if new_tab { 1 } else { 0 }, url[..]);
+}
+
+// Where on page P fragment `frag` is (HTML §7.4.6.4): the top for none or
+// "top"; else the element whose id it is, or the <a> it names, as high as
+// its first item, or the first after it; -1 for none.
+fn fragment_y(P: Page, items: const DItem[:], frag: const u8[:]) -> i32 {
+    var name: u8[>..] = [];
+    if !percent_decoded(frag, name) { name.resize(0); name.append(frag); }
+    guard name.len > 0 && !same_word(name[..], "top") else { return 0; }
+    var target: i32 = -1;
+    for n, k in P.d.nodes {
+        guard n.kind == NODE_ELEMENT else { continue; }
+        let id, has = attr_value(P.d, k as i32, "id");
+        if has && id == name[..] { target = k as i32; break; }
+    }
+    if target < 0 {
+        for n, k in P.d.nodes {
+            guard n.kind == NODE_ELEMENT && node_name(P.d, k as i32) == "a" else { continue; }
+            let a, has = attr_value(P.d, k as i32, "name");
+            if has && a == name[..] { target = k as i32; break; }
+        }
+    }
+    guard target >= 0 else { return -1; }
+    // Nodes are in document order: the first item of it or after it.
+    var best: i32 = -1;
+    var y: f32 = 0.0;
+    for it in items {
+        guard it.node >= target else { continue; }
+        if best < 0 || it.node < best || (it.node == best && it.y < y) {
+            best = it.node;
+            y = it.y;
+        }
+    }
+    return if best < 0 { -1 } else { max(y, 0.0) as i32 };
 }
 
 // For a page that didn't load: answers until quit, with nothing to show.

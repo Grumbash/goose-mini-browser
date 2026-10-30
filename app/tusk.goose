@@ -8,8 +8,11 @@
 // and nothing else, and an idle window draws nothing.
 //
 //   tusk [page ...]                      open pages, one tab each: files, or http and https URLs
-//                                        (the Focaccia article by default); ⌘1 to ⌘9 show a tab,
-//                                        ⌘⌥I hides the dev panel, ⌘⇧S opens the page in Safari
+//                                        (the Focaccia article by default); a click on a link
+//                                        follows it (⌘-click: in a new tab); ⌘[ and ⌘] go back
+//                                        and forward, ⌘R reloads (⌘⇧R past the cache), Esc stops
+//                                        a load; ⌘1 to ⌘9 show a tab, ⌘⌥I hides the dev panel,
+//                                        ⌘⇧S opens the page in Safari
 //   tusk snapshot [page.html]            print the page as a tree for agents (docs/adr/0007)
 //   tusk --screenshot out.png [--at Y] [--size WxH] [--dev-tab NAME] [--bare] [page.html]
 //                                        draw the window offscreen into a PNG, W × H points
@@ -35,6 +38,8 @@ import engine.layout;
 import .tab;
 import .ui;
 import .net;
+import .sheets;
+import .history;
 
 struct Event { kind: i32, code: i32, x: f64, y: f64, w: f64, h: f64 }
 
@@ -51,6 +56,20 @@ struct Place {
     x: f32, y: f32, scroll_x: f32, scroll_y: f32, a: f32, b: f32, c: f32, d: f32,
     clip_x: f32, clip_y: f32, clip_w: f32, clip_h: f32, radius: f32, opacity: f32, z: i32, shown: i32,
 }
+
+// The pages' workers: the next mailbox to give one, the profile and dark
+// mode they load with, and those told to quit that haven't said they've
+// gone, with their mailboxes.
+struct Pages { next: i32, profile: i32, dark: bool, workers: i64[>..]&, ids: i32[>..]& }
+
+// Where a page's link leads, from its replies: nowhere, another page, another
+// page in a new tab, or a place on the page (`y`; -1: none), its URL a span
+// of the notes.
+struct Follow { kind: i32, y: i32, at: i64, len: i64 }
+let FOLLOW_NONE: i32 = 0;
+let FOLLOW_LINK: i32 = 1;
+let FOLLOW_NEW_TAB: i32 = 2;
+let FOLLOW_JUMP: i32 = 3;
 
 struct FrameStats {
     frames: i32, dropped: i32, refresh_hz: f32,
@@ -88,8 +107,10 @@ let EV_NONE: i32 = 0;
 let EV_CLOSE: i32 = 1;
 let EV_RESIZE: i32 = 2;
 let EV_KEY: i32 = 3;
+let EV_MOUSE: i32 = 4;
 let EV_SCROLL: i32 = 5;
 let EV_WAKE: i32 = 6;
+let EV_MOUSE_UP: i32 = 7;
 let EV_MOUSE_MOVE: i32 = 8;
 let EV_MOUSE_LEAVE: i32 = 9;
 let EV_FRAME: i32 = 10;          // code: a tab whose display list waits
@@ -99,6 +120,12 @@ let EV_REPLY: i32 = 11;          // code: a tab whose reply waits
 let KEY_Q: i32 = 12;
 let KEY_W: i32 = 13;
 let KEY_S: i32 = 1;
+let KEY_R: i32 = 15;
+let KEY_LEFT_BRACKET: i32 = 33;
+let KEY_RIGHT_BRACKET: i32 = 30;
+let KEY_ESCAPE: i32 = 53;
+let KEY_LEFT: i32 = 123;
+let KEY_RIGHT: i32 = 124;
 let KEY_I: i32 = 34;
 let KEY_SPACE: i32 = 49;
 let KEY_HOME: i32 = 115;
@@ -135,6 +162,7 @@ let LAYER_LOADER: i32 = 62;      // the boar on his rail, over them
 let LOAD_WAIT_MS: i64 = 60000;   // how long the modes without a window wait for a page
 let MAX_PAGE: f32 = 8000000.0;   // how far down a page scrolls (whole points in an f32: 2^23)
 let SHAPE_CACHE: i64 = 4 << 20;  // the interface's shaped text kept, in bytes
+let CLICK_SLOP: f32 = 4.0;       // points a press may move and still be a click
 let ERR_ARGUMENT: i32 = -4;      // platform/src/lib.rs
 let ERR_NO_DEVICE: i32 = -5;     // platform/src/lib.rs
 
@@ -162,10 +190,11 @@ fn place_at(layer: i32, y: f32, z: i32) {
                          clip_x: 0.0, clip_y: 0.0, clip_w: -1.0, clip_h: 0.0, radius: 0.0, opacity: 1.0, z: z, shown: 1 });
 }
 
-// Takes tab k's waiting display list into its layer; true if one waited.
+// Takes tab k's waiting display list into its layer; true if one waited. A
+// page's first scrolls to where the tab is to go back to.
 fn take_frame(tabs: Tab[>..]&, k: i64) -> bool {
     let t0 = clock_ns();
-    let got = tp_take_frame(k as i32, k as i32, tabs[k].info);
+    let got = tp_take_frame(tabs[k].page, k as i32, tabs[k].info);
     guard got >= 0 else {
         write_stderr(str("tusk: the compositor refused tab ", k, "'s page (error ", got, ")\n"));
         exit(1);
@@ -175,19 +204,32 @@ fn take_frame(tabs: Tab[>..]&, k: i64) -> bool {
     tabs[k].paint = ms(t0, clock_ns()) as f32;
     // What loading the page took its worker; the wait to be shown isn't.
     let i = tabs[k].info;
-    if !tabs[k].ready { tabs[k].load_ms = i.read + i.parse + i.style + i.measure + i.layout; }
+    if !tabs[k].ready {
+        tabs[k].load_ms = i.read + i.parse + i.style + i.measure + i.layout;
+        if tabs[k].restore >= 0.0 { tabs[k].scroll = tabs[k].restore; }
+        tabs[k].restore = -1.0;
+    }
     tabs[k].ready = true;
     return true;
 }
 
 // Reads tab k's waiting replies into its state; true if one changes what the
 // interface shows. A hit's pointer shape goes to `cursor` (-1: none came),
-// and `titled` says whether its title came, or why it failed.
+// `titled` says whether its title came, or why it failed, and where a
+// clicked link leads goes to `follow`.
 fn read_replies(tabs: Tab[>..]&, k: i64, notes: u8[>..]&, head: ReplyHead&, text: u8[>..<]&, cursor: i32&,
-                titled: bool&) -> bool {
+                titled: bool&, follow: Follow&) -> bool {
     var changed = false;
-    while take_reply(k, head, text) {
+    while take_reply(tabs[k].page, head, text) {
         if head.kind == REPLY_HIT { cursor = head.value; continue; }
+        if head.kind == REPLY_GONE { continue; }
+        if head.kind == REPLY_LINK || head.kind == REPLY_JUMP {
+            follow = Follow { kind: if head.kind == REPLY_JUMP { FOLLOW_JUMP } else if head.value == 1 { FOLLOW_NEW_TAB }
+                                    else { FOLLOW_LINK },
+                              y: head.value, at: notes.len, len: text.len };
+            notes.append(text);
+            continue;
+        }
         changed = true;
         if head.kind == REPLY_READ {
             // Known before its display list is: a hidden tab's weighs this too.
@@ -232,18 +274,108 @@ fn clamp_scroll(y: f32, page_h: f32, view_h: f32) -> f32 {
     return max(min(y, min(page_h, MAX_PAGE) - view_h), 0.0);
 }
 
-fn post(tab: i64, kind: i32, a: f32, b: f32, c: f32) {
+// Posts a message to page `page`'s worker; none goes to no page (-1).
+fn post(page: i32, kind: i32, a: f32, b: f32, c: f32) {
+    guard page >= 0 else { return; }
     let m = TabMsg { kind: kind, a: a, b: b, c: c };
-    tp_tab_post(tab as i32, m);
+    tp_tab_post(page, m);
 }
 
-// Takes tab k's next waiting reply: its head into `head` and its text into
-// `text`. False when none waits.
-fn take_reply(k: i64, head: ReplyHead&, text: u8[>..<]&) -> bool {
-    guard tp_reply_head(k as i32, head) == 1 else { return false; }
+// Takes page `page`'s next waiting reply: its head into `head` and its text
+// into `text`. False when none waits.
+fn take_reply(page: i32, head: ReplyHead&, text: u8[>..<]&) -> bool {
+    guard page >= 0 && tp_reply_head(page, head) == 1 else { return false; }
     text.resize(0);
     for i in head.len { text.push(0); }
-    return tp_take_reply(k as i32, head, text[..]) == 0;
+    return tp_take_reply(page, head, text[..]) == 0;
+}
+
+// The tab whose page is `page`, or -1: a page that has been left.
+fn tab_of(tabs: const Tab[:], page: i32) -> i64 {
+    for t, k in tabs { if t.page == page && page >= 0 { return k; } }
+    return -1;
+}
+
+// Tells tab k's page to quit and lets it go: its worker is reaped when it
+// says it has gone (reap), so the window never waits for it.
+fn retire(tabs: Tab[>..]&, k: i64, pages: Pages&) {
+    guard tabs[k].page >= 0 else { return; }
+    post(tabs[k].page, MSG_QUIT, 0.0, 0.0, 0.0);
+    pages.workers.push(tabs[k].worker);
+    pages.ids.push(tabs[k].page);
+    tabs[k].worker = -1;
+    tabs[k].page = -1;
+}
+
+// Reads what a page that has been left still says; once it says it has gone,
+// waits for its worker, which has returned, and closes its mailbox.
+fn reap(pages: Pages&, page: i32, head: ReplyHead&, text: u8[>..<]&) {
+    var gone = false;
+    while take_reply(page, head, text) { if head.kind == REPLY_GONE { gone = true; } }
+    guard gone else { return; }
+    for id, j in pages.ids {
+        guard id == page else { continue; }
+        var why: u8[>..] = [];
+        if !thread_wait(pages.workers[j], why) { write_stderr(str("tusk: a page left behind failed: ", why, "\n")); }
+        tp_tab_drop(page);
+        pages.ids[j] = -1;
+        return;
+    }
+}
+
+// Loads where tab k is to be (the span of the notes `at`, `len`) in a new
+// page: the one it showed is let go, but stays on screen until the new one
+// draws. Scrolls to `restore` once it comes (-1: the top), past the cache
+// when `reload` says so, and lays it out for `slot` at `scale` (0: not yet
+// known).
+fn load(tabs: Tab[>..]&, k: i64, notes: const u8[:], at: i64, len: i64, restore: f32, reload: bool, pages: Pages&,
+        slot: Rect, scale: f32) {
+    retire(tabs, k, pages);
+    let page = pages.next;
+    pages.next += 1;
+    tp_tab_open(page);
+    let worker = thread_spawn_contained(tab_worker, page, str(notes[at..at + len]), pages.profile, pages.dark, reload);
+    let info = FrameInfo { height: 0.0, background: 0xFFFFFFFF, nodes: 0, bytes: 0, parse: 0.0, style: 0.0,
+                           measure: 0.0, layout: 0.0, scale: 1.0, read: 0.0 };
+    tabs[k].worker = worker;
+    tabs[k].page = page;
+    tabs[k].ready = false;
+    tabs[k].failed = false;
+    tabs[k].info = info;
+    tabs[k].waiting = false;
+    tabs[k].scroll = 0.0;
+    tabs[k].restore = restore;
+    tabs[k].opened = clock_ns();
+    tabs[k].load_ms = 0.0;
+    tabs[k].status = 0;
+    tabs[k].loc_at = at;
+    tabs[k].loc_len = len;
+    tabs[k].title_len = 0;
+    tabs[k].why_len = 0;
+    tabs[k].log_len = 0;
+    tabs[k].elems_len = 0;
+    if scale > 0.0 && slot.w > 0.0 { post(page, MSG_SIZE, slot.w, slot.h, scale); }
+}
+
+// Tab k goes back or forward to place j of its history: on the page it shows
+// (another place on it), it scrolls there; else it loads the page and
+// scrolls once it comes.
+fn go(tabs: Tab[>..]&, k: i64, entries: Entry[>..]&, j: i64, notes: const u8[:], pages: Pages&, slot: Rect,
+      scale: f32) {
+    guard j >= 0 else { return; }
+    let cur = tabs[k].entry;
+    if cur >= 0 { entries[cur].scroll = tabs[k].scroll; }
+    let e = entries[j];
+    tabs[k].entry = j;
+    let here = notes[tabs[k].loc_at..tabs[k].loc_at + tabs[k].loc_len];
+    let there = notes[e.loc_at..e.loc_at + e.loc_len];
+    if tabs[k].ready && doc_part(here) == doc_part(there) {
+        tabs[k].loc_at = e.loc_at;
+        tabs[k].loc_len = e.loc_len;
+        tabs[k].scroll = e.scroll;
+        return;
+    }
+    load(tabs, k, notes, e.loc_at, e.loc_len, e.scroll, false, pages, slot, scale);
 }
 
 // Waits, without a window, for tab 0's display list, reading its replies
@@ -253,8 +385,9 @@ fn wait_for_frame(tabs: Tab[>..]&, notes: u8[>..]&) {
     var text: u8[>..<] = [];
     var cursor: i32 = -1;
     var titled = false;
+    var follow = Follow { kind: FOLLOW_NONE, y: 0, at: 0, len: 0 };
     loop {
-        let got = tp_wait_tab(0, LOAD_WAIT_MS);
+        let got = tp_wait_tab(tabs[0].page, LOAD_WAIT_MS);
         guard got == 1 || got == 2 else {
             write_stderr("tusk: the page didn't come\n");
             exit(1);
@@ -262,17 +395,18 @@ fn wait_for_frame(tabs: Tab[>..]&, notes: u8[>..]&) {
         }
         if got == 1 && take_frame(tabs, 0) {
             // Its title and elements came before it.
-            read_replies(tabs, 0, notes, head, text, cursor, titled);
+            read_replies(tabs, 0, notes, head, text, cursor, titled, follow);
             return;
         }
-        read_replies(tabs, 0, notes, head, text, cursor, titled);
+        read_replies(tabs, 0, notes, head, text, cursor, titled, follow);
         guard !tabs[0].failed else { exit(1); return; }
     }
 }
 
 // The interface for what Tusk shows now, into its layer; its slot into
 // `slot`. Returns what laying it out took, in ms.
-fn show_ui(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, last_ms: f32, scale: f32, slot: Rect&) -> f32 {
+fn show_ui(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, last_ms: f32, scale: f32, slot: Rect&,
+           actions: f32[>..<]&) -> f32 {
     var times: f32[>..<] = [];
     for i in 56 { times.push(0.0); }
     var n = tp_frame_times(times[..]);
@@ -284,7 +418,8 @@ fn show_ui(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, last_ms: f32, scale
     ui_html(F, U, tabs, T, times[..n], stats.dropped, last_ms, html);
     var drag: f32[>..<] = [];
     var holes: f32[>..<] = [];
-    let took = show_doc(html[..], U.w, U.h, scale, LAYER_UI, slot, drag, holes);
+    actions.resize(0);
+    let took = show_doc(html[..], U.w, U.h, scale, LAYER_UI, slot, drag, holes, actions);
     place_at(LAYER_UI, 0.0, 0);
     // Pressed there, the bar moves the window; its controls are Goose's. No
     // window, no regions (a screenshot).
@@ -305,7 +440,8 @@ fn show_loader(F: UiFiles, U: Ui, k: i64, t: f32, scale: f32) {
     var none = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
     var drag: f32[>..<] = [];
     var holes: f32[>..<] = [];
-    show_doc(html[..], U.w, LOADER_H, scale, LAYER_LOADER, none, drag, holes);
+    var actions: f32[>..<] = [];
+    show_doc(html[..], U.w, LOADER_H, scale, LAYER_LOADER, none, drag, holes, actions);
     place_at(LAYER_LOADER, U.h - PANEL_H - LOADER_H, 2);
 }
 
@@ -409,31 +545,29 @@ fn main() {
     var notes: u8[>..] = [];
     notes.append(paths);
     var tabs: Tab[>..] = [];
+    var entries: Entry[>..] = [];    // the tabs' histories
+    var leaving: i64[>..] = [];      // workers of pages left, until they've gone
+    var leaving_ids: i32[>..] = [];
+    var pages = Pages { next: 0, profile: profile, dark: dark, workers: leaving, ids: leaving_ids };
+    let none = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
     var start: i64 = 0;
     for end, k in path_ends {
-        tp_tab_open(k as i32);
-        let info = FrameInfo { height: 0.0, background: 0xFFFFFFFF, nodes: 0, bytes: 0, parse: 0.0, style: 0.0,
-                               measure: 0.0, layout: 0.0, scale: 1.0, read: 0.0 };
-        let opened = clock_ns();
-        let worker = thread_spawn_contained(tab_worker, k as i32, str(paths[start..end]), profile, dark);
-        tabs.push(Tab { worker: worker, ready: false, failed: false, info: info, paint: 0.0, waiting: false, scroll: 0.0,
-                        opened: opened, load_ms: 0.0, status: 0, loc_at: start, loc_len: end - start, title_at: 0,
-                        title_len: 0, why_at: 0, why_len: 0, log_at: 0, log_len: 0, elems_at: 0, elems_len: 0 });
+        open_tab(tabs, entries, notes, start, end - start, pages, none, 0.0);
         start = end;
     }
 
     if mode == MODE_SNAPSHOT {
-        post(0, MSG_SNAPSHOT, SNAPSHOT_W, SNAPSHOT_H, 0.0);
+        post(tabs[0].page, MSG_SNAPSHOT, SNAPSHOT_W, SNAPSHOT_H, 0.0);
         var head = ReplyHead { kind: 0, value: 0, len: 0 };
         var text: u8[>..<] = [];
         var done = false;
         while !done {
-            guard tp_wait_tab(0, LOAD_WAIT_MS) == 2 else {
+            guard tp_wait_tab(tabs[0].page, LOAD_WAIT_MS) == 2 else {
                 write_stderr("tusk: the page didn't come\n");
                 exit(1);
                 return;
             }
-            while take_reply(0, head, text) {
+            while take_reply(tabs[0].page, head, text) {
                 guard head.kind != REPLY_FAILED else {
                     write_stderr(str("tusk: ", text, "\n"));
                     exit(1);
@@ -445,7 +579,7 @@ fn main() {
                 }
             }
         }
-        end_tabs(tabs);
+        end_tabs(tabs, pages);
         return;
     }
 
@@ -464,9 +598,11 @@ fn main() {
     // Its text is mostly what it was, each time it is laid out.
     tp_text_cache(SHAPE_CACHE);
     var U = Ui { w: WINDOW_W, h: WINDOW_H, lights: 0.0, cur: 0, dev: dev, dev_tab: dev_tab,
-                 oil: 0.0, mac_used: 0.0, mac_total: 0.0, cpu: 0.0, mac_cpu: 0.0, fps: 0, running: false };
+                 oil: 0.0, mac_used: 0.0, mac_total: 0.0, cpu: 0.0, mac_cpu: 0.0, fps: 0, running: false,
+                 back: false, forward: false };
     weigh(U);
     var slot = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    var actions: f32[>..<] = [];     // what clicks on the interface do: x, y, w, h and an ACT_ each
 
     if mode == MODE_SCREENSHOT {
         // Metal is set up before the page is timed, as tp_open does for the
@@ -486,8 +622,8 @@ fn main() {
         U.h = shot_h;
         var first_ms: f32 = 0.0;
         if bare { slot = Rect { x: 0.0, y: 0.0, w: shot_w, h: shot_h }; }
-        else { first_ms = show_ui(F, U, tabs, T, 0.0, scale, slot); }
-        post(0, MSG_SIZE, slot.w, slot.h, scale);
+        else { first_ms = show_ui(F, U, tabs, T, 0.0, scale, slot, actions); }
+        post(tabs[0].page, MSG_SIZE, slot.w, slot.h, scale);
         wait_for_frame(tabs, notes);
         let page_h = tabs[0].info.height;
         let y = clamp_scroll(at, page_h, slot.h);
@@ -495,7 +631,7 @@ fn main() {
         var bg = tabs[0].info.background;
         if !bare {
             weigh(U);
-            show_ui(F, U, tabs, T, first_ms, scale, slot);
+            show_ui(F, U, tabs, T, first_ms, scale, slot, actions);
             bg = STEEL;
         }
         let rc = tp_screenshot(shot, shot_w, shot_h, scale, bg);
@@ -508,7 +644,7 @@ fn main() {
             exit(1);
             return;
         }
-        end_tabs(tabs);
+        end_tabs(tabs, pages);
         print("wrote ", shot, ": the window at 2x, scrolled to ", y, " of a page ", page_h, " points tall");
         return;
     }
@@ -532,6 +668,10 @@ fn main() {
     var woken = false;
     var pointer_x: f32 = -1.0;       // where the pointer is over the content, or -1 off it
     var pointer_y: f32 = -1.0;
+    var press_x: f32 = -1.0;         // where the last button went down, which, and with what keys
+    var press_y: f32 = -1.0;
+    var press_button: i32 = -1;
+    var press_mods: i64 = 0;
     var head = ReplyHead { kind: 0, value: 0, len: 0 };
     var text: u8[>..<] = [];
     var e = Event { kind: 0, code: 0, x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
@@ -588,27 +728,74 @@ fn main() {
                     U.h = e.h as f32;
                     scale = e.x as f32;
                     redo = true;
-                } else if e.kind == EV_FRAME && e.code >= 0 && e.code < tabs.len {
+                } else if e.kind == EV_FRAME && tab_of(tabs, e.code) >= 0 {
                     // A hidden tab's display list waits in its mailbox, the
                     // latest replacing the one before, until the tab is shown:
                     // the main thread builds what it shows, and the GPU holds
-                    // no more.
-                    if e.code == U.cur {
-                        let first = !tabs[e.code].ready;
-                        if take_frame(tabs, e.code) {
+                    // no more. A page left behind draws nothing.
+                    let k = tab_of(tabs, e.code);
+                    if k == U.cur {
+                        let first = !tabs[k].ready;
+                        if take_frame(tabs, k) {
                             arrived = true;
                             if first { redo = true; }
                         }
                     } else {
-                        tabs[e.code].waiting = true;
+                        tabs[k].waiting = true;
                     }
-                } else if e.kind == EV_REPLY && e.code >= 0 && e.code < tabs.len {
-                    let k: i64 = e.code;
+                } else if e.kind == EV_REPLY && tab_of(tabs, e.code) < 0 {
+                    reap(pages, e.code, head, text);
+                } else if e.kind == EV_REPLY {
+                    let k = tab_of(tabs, e.code);
                     var shape: i32 = -1;
                     var titled = false;
-                    if read_replies(tabs, k, notes, head, text, shape, titled) && k == U.cur { redo = true; }
+                    var follow = Follow { kind: FOLLOW_NONE, y: 0, at: 0, len: 0 };
+                    if read_replies(tabs, k, notes, head, text, shape, titled, follow) && k == U.cur { redo = true; }
                     if k == U.cur && shape >= 0 { cursor = shape; }
                     if k == U.cur && titled { tp_set_title(title_of(tabs[k], T)); }
+                    if follow.kind != FOLLOW_NONE {
+                        // Where a link leads, as a tab is: a file's URL is its path.
+                        var loc: u8[>..] = [];
+                        as_loc(notes[follow.at..follow.at + follow.len], loc);
+                        let at = notes.len;
+                        notes.append(loc);
+                        if follow.kind == FOLLOW_NEW_TAB {
+                            open_tab(tabs, entries, notes, at, loc.len, pages, slot, scale);
+                        } else if follow.kind == FOLLOW_JUMP {
+                            push_entry(tabs, k, entries, at, loc.len);
+                            tabs[k].loc_at = at;
+                            tabs[k].loc_len = loc.len;
+                            if follow.y >= 0 { tabs[k].scroll = follow.y; }
+                        } else {
+                            push_entry(tabs, k, entries, at, loc.len);
+                            load(tabs, k, notes, at, loc.len, -1.0, false, pages, slot, scale);
+                            if k == U.cur { tp_set_title(title_of(tabs[k], T)); }
+                        }
+                        redo = true;
+                    }
+                } else if e.kind == EV_MOUSE {
+                    press_x = e.x as f32;
+                    press_y = e.y as f32;
+                    press_button = e.code;
+                    press_mods = e.w as i64;
+                } else if e.kind == EV_MOUSE_UP {
+                    // A click: up where it went down. On the page, it asks the
+                    // page what is there (a link with ⌘ or the middle button
+                    // opens in a new tab); on the interface, it does what the
+                    // element there says.
+                    let x = e.x as f32;
+                    let y = e.y as f32;
+                    let clicked = e.code == press_button && abs(x - press_x) < CLICK_SLOP && abs(y - press_y) < CLICK_SLOP;
+                    let new_tab = (press_mods & MOD_COMMAND) != 0 || e.code == 2;
+                    if clicked && (e.code == 0 || e.code == 2) && in_slot(x, y, slot) && tabs[U.cur].ready {
+                        post(tabs[U.cur].page, MSG_CLICK, x - slot.x, y - slot.y + tabs[U.cur].scroll, if new_tab { 1.0 } else { 0.0 });
+                    } else if clicked && e.code == 0 {
+                        let act = action_at(actions[..], x, y);
+                        if act == ACT_BACK { go(tabs, U.cur, entries, entries[tabs[U.cur].entry].prev, notes, pages, slot, scale); }
+                        else if act == ACT_FORWARD { go(tabs, U.cur, entries, entries[tabs[U.cur].entry].next, notes, pages, slot, scale); }
+                        else if act == ACT_RELOAD { reload(tabs, U.cur, notes, pages, slot, scale, false); }
+                        if act != ACT_NONE { redo = true; }
+                    }
                 } else if e.kind == EV_SCROLL {
                     pointer_x = e.w as f32;
                     pointer_y = e.h as f32;
@@ -628,7 +815,29 @@ fn main() {
                 } else if e.kind == EV_KEY {
                     let mods = e.x as i64;
                     let page = slot.h - 40.0;
-                    if (mods & MOD_COMMAND) != 0 && (e.code == KEY_Q || e.code == KEY_W) { quit = true; }
+                    let cmd = (mods & MOD_COMMAND) != 0;
+                    if cmd && (e.code == KEY_Q || e.code == KEY_W) { quit = true; }
+                    else if cmd && (e.code == KEY_LEFT_BRACKET || e.code == KEY_LEFT) {
+                        go(tabs, U.cur, entries, entries[tabs[U.cur].entry].prev, notes, pages, slot, scale);
+                        redo = true;
+                    }
+                    else if cmd && (e.code == KEY_RIGHT_BRACKET || e.code == KEY_RIGHT) {
+                        go(tabs, U.cur, entries, entries[tabs[U.cur].entry].next, notes, pages, slot, scale);
+                        redo = true;
+                    }
+                    else if cmd && e.code == KEY_R {
+                        reload(tabs, U.cur, notes, pages, slot, scale, (mods & MOD_SHIFT) != 0);
+                        redo = true;
+                    }
+                    else if e.code == KEY_ESCAPE && !tabs[U.cur].ready && !tabs[U.cur].failed {
+                        // Esc stops a load: its page is let go, and the tab says so.
+                        retire(tabs, U.cur, pages);
+                        tabs[U.cur].failed = true;
+                        tabs[U.cur].why_at = notes.len;
+                        notes.append("Stopped");
+                        tabs[U.cur].why_len = 7;
+                        redo = true;
+                    }
                     else if (mods & MOD_COMMAND) != 0 && (mods & MOD_OPTION) != 0 && e.code == KEY_I {
                         // ⌘⌥I hides the dev panel, and the page takes its room; again, it shows.
                         U.dev = !U.dev;
@@ -729,13 +938,16 @@ fn main() {
             cpu_from = cpu;
         }
         if redo && U.w > 0.0 && scale > 0.0 {
-            ui_ms = show_ui(F, U, tabs, T, ui_ms, scale, slot);
+            let place = tabs[U.cur].entry;
+            U.back = place >= 0 && entries[place].prev >= 0;
+            U.forward = place >= 0 && entries[place].next >= 0;
+            ui_ms = show_ui(F, U, tabs, T, ui_ms, scale, slot, actions);
             // Every tab lays out again for a new slot at once, each on its own
             // core, so showing another is instant.
             // And for a new backing scale: a display list carries the scale
             // it was made for.
             if slot.w != sized.w || slot.h != sized.h || scale != sized_scale {
-                for t, k in tabs { post(k, MSG_SIZE, slot.w, slot.h, scale); }
+                for t in tabs { post(t.page, MSG_SIZE, slot.w, slot.h, scale); }
                 sized = slot;
                 sized_scale = scale;
             }
@@ -776,7 +988,7 @@ fn main() {
         if cursor >= 0 && in_slot(pointer_x, pointer_y, slot) { tp_set_cursor(cursor); }
         if inside && (moved || arrived || switched || scrolled || redo) {
             if in_slot(pointer_x, pointer_y, slot) && tabs[U.cur].ready {
-                post(U.cur, MSG_HIT, pointer_x - slot.x, pointer_y - slot.y + tabs[U.cur].scroll, 0.0);
+                post(tabs[U.cur].page, MSG_HIT, pointer_x - slot.x, pointer_y - slot.y + tabs[U.cur].scroll, 0.0);
             } else {
                 tp_set_cursor(CURSOR_ARROW);
             }
@@ -792,7 +1004,7 @@ fn main() {
     print(line);
     print("frames presented: ", tp_frames());
     tp_close();
-    end_tabs(tabs);
+    end_tabs(tabs, pages);
     if mode == MODE_WAKE_TEST && !(woken && worker_ok) {
         write_stderr("tusk: the worker's wake never arrived\n");
         exit(1);
@@ -898,16 +1110,48 @@ fn weight(t: Tab, T: UiText, ui_ms: f32, line: u8[>..]&) {
     line.append(" MB");
 }
 
-// Tells every tab to quit, waits for its worker and closes its mailbox. A
-// worker that failed says why.
-fn end_tabs(tabs: Tab[>..]&) {
-    for t, k in tabs { post(k, MSG_QUIT, 0.0, 0.0, 0.0); }
+// Tells every tab's page to quit, waits for its worker and closes its
+// mailbox, and those of the pages left behind. A worker that failed says why.
+fn end_tabs(tabs: Tab[>..]&, pages: Pages&) {
+    for t in tabs { post(t.page, MSG_QUIT, 0.0, 0.0, 0.0); }
     for t, k in tabs {
+        guard t.worker >= 0 else { continue; }
         var why: u8[>..] = [];
         if !thread_wait(t.worker, why) { write_stderr(str("tusk: tab ", k, " failed: ", why, "\n")); }
-        tp_tab_drop(k as i32);
+        tp_tab_drop(t.page);
+    }
+    for id, j in pages.ids {
+        guard id >= 0 else { continue; }
+        var why: u8[>..] = [];
+        thread_wait(pages.workers[j], why);
+        tp_tab_drop(id);
     }
 }
+
+// Opens a tab for where the span `at`, `len` of the notes says, at the end,
+// in layer `tabs.len`; none past MAX_TABS.
+fn open_tab(tabs: Tab[>..]&, entries: Entry[>..]&, notes: const u8[:], at: i64, len: i64, pages: Pages&, slot: Rect,
+            scale: f32) {
+    guard tabs.len < MAX_TABS else { return; }
+    let info = FrameInfo { height: 0.0, background: 0xFFFFFFFF, nodes: 0, bytes: 0, parse: 0.0, style: 0.0,
+                           measure: 0.0, layout: 0.0, scale: 1.0, read: 0.0 };
+    tabs.push(Tab { worker: -1, page: -1, ready: false, failed: false, info: info, paint: 0.0, waiting: false,
+                    scroll: 0.0, restore: -1.0, opened: clock_ns(), load_ms: 0.0, status: 0, entry: -1, loc_at: at,
+                    loc_len: len, title_at: 0, title_len: 0, why_at: 0, why_len: 0, log_at: 0, log_len: 0,
+                    elems_at: 0, elems_len: 0 });
+    let k = tabs.len - 1;
+    push_entry(tabs, k, entries, at, len);
+    load(tabs, k, notes, at, len, -1.0, false, pages, slot, scale);
+}
+
+// Loads tab k's page again where it is, past the cache when `hard` says so,
+// and scrolls back to where it was once it comes.
+fn reload(tabs: Tab[>..]&, k: i64, notes: const u8[:], pages: Pages&, slot: Rect, scale: f32, hard: bool) {
+    let back_to = tabs[k].scroll;
+    load(tabs, k, notes, tabs[k].loc_at, tabs[k].loc_len, back_to, hard, pages, slot, scale);
+}
+
+
 
 // Scrolls down the page and back in its slot for 10 s at a brisk flick's
 // speed, a frame per display refresh, the interface around it, and prints
@@ -926,8 +1170,9 @@ fn scroll_test(tabs: Tab[>..]&, cur: i64, slot: Rect) {
             if e.kind == EV_CLOSE { return; }
             if e.kind == EV_KEY && ((e.x as i64) & MOD_COMMAND) != 0 && e.code == KEY_Q { return; }
             // A display list's wake comes once: taking it lets the next one wake.
-            if e.kind == EV_FRAME && e.code == cur { take_frame(tabs, cur); }
-            if e.kind == EV_FRAME && e.code != cur && e.code >= 0 && e.code < tabs.len { tabs[e.code].waiting = true; }
+            let k = if e.kind == EV_FRAME { tab_of(tabs, e.code) } else { -1 };
+            if k == cur { take_frame(tabs, cur); }
+            else if k >= 0 { tabs[k].waiting = true; }
         }
         let s = ms(start, clock_ns()) / 1000.0;
         if s >= 10.0 { break; }

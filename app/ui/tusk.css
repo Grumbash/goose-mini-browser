@@ -68,6 +68,7 @@ body { background:var(--bg); color:var(--ink); font:400 17px/1.5 var(--f-ui); -w
 .plate .i { width:12px; height:12px; transform:rotate(90deg) }
 .nav { left:168px; gap:12px; color:var(--steel-5) }
 .nav .i { width:16px; height:16px }
+.nav .off { opacity:.35 }
 .url { left:290px; width:620px; gap:10px; padding:0 10px 0 6px; border-radius:5px; background:var(--oil); box-shadow:inset 0 0 0 1px var(--steel-3);
   font:400 12.5px/1 var(--f-mono); color:var(--steel-5) }
 .env { padding:4px 6px; border-radius:3px; background:var(--ok); color:var(--oil); font:700 9.5px/1 var(--f-mono); letter-spacing:.08em }

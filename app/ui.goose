@@ -29,10 +29,25 @@ struct UiFiles { css: u8[>..]&, sprite: u8[>..]&, rest: u8[>..]&, run: u8[>..]& 
 // traffic lights end in its bar (0: none), which tab is shown, the dev panel
 // and its tab, the window's oil (MB), the Mac's memory in use and in all
 // (MB), the window's CPU and the whole Mac's (%, of all its cores), its
-// frames a second, and whether the boar is out running a load.
+// frames a second, whether the boar is out running a load, and whether the
+// tab shown can go back and forward.
 struct Ui {
     w: f32, h: f32, lights: f32, cur: i64, dev: bool, dev_tab: i32,
     oil: f32, mac_used: f32, mac_total: f32, cpu: f32, mac_cpu: f32, fps: i32, running: bool,
+    back: bool, forward: bool,
+}
+
+// What a click on the interface does: its elements' data-action.
+let ACT_NONE: i32 = 0;
+let ACT_BACK: i32 = 1;
+let ACT_FORWARD: i32 = 2;
+let ACT_RELOAD: i32 = 3;
+
+fn action_of(name: const u8[:]) -> i32 {
+    if name == "back" { return ACT_BACK; }
+    if name == "forward" { return ACT_FORWARD; }
+    if name == "reload" { return ACT_RELOAD; }
+    return ACT_NONE;
 }
 
 // What it reads of the main thread's strings: the notes the tabs' spans
@@ -90,6 +105,14 @@ fn px(out: u8[>..]&, v: f32) {
 
 fn icon(out: u8[>..]&, name: const u8[:]) {
     format(out, "<svg class=\"i\" aria-hidden=\"true\"><use href=\"#", name, "\"/></svg>");
+}
+
+// An icon that does `action` when clicked; dimmed, and doing nothing, when
+// it can't.
+fn action_icon(out: u8[>..]&, name: const u8[:], action: const u8[:], can: bool) {
+    format(out, "<svg class=\"i", if can { "" } else { " off" }, "\" aria-hidden=\"true\"");
+    if can { format(out, " data-action=\"", action, "\""); }
+    format(out, "><use href=\"#", name, "\"/></svg>");
 }
 
 fn drop_icon(out: u8[>..]&) {
@@ -210,9 +233,9 @@ fn bar(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText) {
     out.append("</span><span class=\"nav\" data-nodrag style=\"left:");
     px(out, 168.0 + shift);
     out.append("\">");
-    icon(out, "i-chev-l");
-    icon(out, "i-chev-r");
-    icon(out, "i-reload");
+    action_icon(out, "i-chev-l", "back", U.back);
+    action_icon(out, "i-chev-r", "forward", U.forward);
+    action_icon(out, "i-reload", "reload", true);
     let url_w = max(U.w - 290.0 - shift - 190.0, 120.0);
     out.append("</span><span class=\"url\" data-nodrag style=\"left:");
     px(out, 290.0 + shift);
@@ -743,10 +766,11 @@ fn fract(v: f32) -> f32 { return v - floor(v); }
 // Lays document `html` out `w` × `h` at `scale` into layer `layer`, and finds
 // its slot: the box of the element with data-slot (none: a width of 0); and
 // where a press drags the window: the boxes of the elements with data-drag
-// into `drag`, and of those with data-nodrag into `holes`, x, y, w, h each.
-// Returns what it took, in ms.
+// into `drag`, and of those with data-nodrag into `holes`, x, y, w, h each;
+// and what a click does: the box of each element with a data-action, then
+// its action (ACT_), into `actions`. Returns what it took, in ms.
 fn show_doc(html: const u8[:], w: f32, h: f32, scale: f32, layer: i32, slot: Rect&,
-            drag: f32[>..<]&, holes: f32[>..<]&) -> f32 {
+            drag: f32[>..<]&, holes: f32[>..<]&, actions: f32[>..<]&) -> f32 {
     let t0 = clock_ns();
     var nodes: Node[>..] = [];
     var attrs: Attr[>..] = [];
@@ -795,6 +819,11 @@ fn show_doc(html: const u8[:], w: f32, h: f32, scale: f32, layer: i32, slot: Rec
         let b = boxes[k];
         if dragged { drag.push(b.x); drag.push(b.y); drag.push(b.w); drag.push(b.h); }
         if hole { holes.push(b.x); holes.push(b.y); holes.push(b.w); holes.push(b.h); }
+        let av, acts = attr_value(d, k as i32, "data-action");
+        if acts && action_of(av) != ACT_NONE {
+            actions.push(b.x); actions.push(b.y); actions.push(b.w); actions.push(b.h);
+            actions.push(action_of(av));
+        }
     }
     let rc = tp_set_layer(layer, items[..], text[..], paths[..], scale);
     if rc != 0 {
@@ -802,4 +831,18 @@ fn show_doc(html: const u8[:], w: f32, h: f32, scale: f32, layer: i32, slot: Rec
         exit(1);
     }
     return ((clock_ns() - t0) / 1000000.0) as f32;
+}
+
+// What a click at x, y on the interface does: the action of the last
+// element of `actions` there (x, y, w, h and an ACT_ each), or ACT_NONE.
+fn action_at(actions: const f32[:], x: f32, y: f32) -> i32 {
+    var act = ACT_NONE;
+    var i: i64 = 0;
+    while i + 4 < actions.len {
+        if x >= actions[i] && x < actions[i] + actions[i + 2] && y >= actions[i + 1] && y < actions[i + 1] + actions[i + 3] {
+            act = actions[i + 4] as i32;
+        }
+        i += 5;
+    }
+    return act;
 }
