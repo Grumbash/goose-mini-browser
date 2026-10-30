@@ -10,12 +10,16 @@ use std::ptr::null;
 use crate::cg::*;
 use crate::{ERR_ARGUMENT, GSlice, guarded};
 
-// Font ids, as Goose writes them: the family in the low bits, then the face.
+// Font ids, as Goose writes them: the family in the low four bits, the weight
+// over 100 in the next four (0 is 400, normal), then whether it is italic.
 pub const FAMILY_SANS: i32 = 0;
 pub const FAMILY_SERIF: i32 = 1;
 pub const FAMILY_MONO: i32 = 2;
-pub const FONT_BOLD: i32 = 1 << 4;
-pub const FONT_ITALIC: i32 = 1 << 5;
+pub const FAMILY_CONDENSED: i32 = 3; // Barlow Condensed, bundled
+pub const FAMILY_CODE: i32 = 4; // JetBrains Mono, bundled
+pub const FONT_WEIGHT_SHIFT: i32 = 4;
+pub const FONT_BOLD: i32 = 7 << FONT_WEIGHT_SHIFT;
+pub const FONT_ITALIC: i32 = 1 << 8;
 
 /// Horizontal subpixel positions a glyph is rasterized at, per device pixel.
 pub const PHASES: u32 = 4;
@@ -78,34 +82,175 @@ impl Fonts {
 }
 
 /// Generic families map to fonts every Mac has: the system font for sans-serif,
-/// Georgia for serif, Menlo for monospace. A family without a bold or italic
-/// face keeps its regular one.
+/// Georgia for serif, Menlo for monospace, a weight or italic picking the
+/// family's nearest face. The bundled families (tp_register_fonts) are Barlow
+/// Condensed, by its nearest face, and JetBrains Mono, by its variable weight
+/// axis; neither has italics, and until they are registered the system font
+/// and Menlo stand in for them.
 fn create_font(id: i32, size: f64) -> Option<Cf> {
     if !(size > 0.0 && size < 10_000.0) {
         return None;
     }
-    let base = match id & 0xF {
-        FAMILY_SERIF => {
-            Cf::take(unsafe { CTFontCreateWithName(cf_str("Georgia")?.get(), size, null()) })?
-        }
-        FAMILY_MONO => {
-            Cf::take(unsafe { CTFontCreateWithName(cf_str("Menlo")?.get(), size, null()) })?
-        }
-        _ => Cf::take(unsafe { CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, size, null()) })?,
+    let weight = match (id >> FONT_WEIGHT_SHIFT) & 0xF {
+        0 => 400,
+        w => w * 100,
     };
-    let mut traits = 0;
-    if id & FONT_BOLD != 0 {
-        traits |= kCTFontTraitBold;
-    }
-    if id & FONT_ITALIC != 0 {
-        traits |= kCTFontTraitItalic;
-    }
-    if traits == 0 {
+    let italic = id & FONT_ITALIC != 0;
+    let named =
+        |name: &str| Cf::take(unsafe { CTFontCreateWithName(cf_str(name)?.get(), size, null()) });
+    let system =
+        || Cf::take(unsafe { CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, size, null()) });
+    let base = match id & 0xF {
+        FAMILY_SERIF => named("Georgia"),
+        FAMILY_MONO => named("Menlo"),
+        FAMILY_CONDENSED => {
+            // Medium is the lightest face bundled, Black the heaviest.
+            let face = match weight {
+                ..=550 => "BarlowCondensed-Medium",
+                551..=650 => "BarlowCondensed-SemiBold",
+                651..=750 => "BarlowCondensed-Bold",
+                751..=850 => "BarlowCondensed-ExtraBold",
+                _ => "BarlowCondensed-Black",
+            };
+            match registered(face, "Barlow Condensed", size) {
+                Some(font) => return Some(font),
+                None => system(),
+            }
+        }
+        FAMILY_CODE => match registered("JetBrainsMono-Regular", "JetBrains Mono", size) {
+            Some(font) => return Some(at_weight(&font, weight.clamp(100, 800)).unwrap_or(font)),
+            None => named("Menlo"),
+        },
+        _ => system(),
+    }?;
+    if weight == 400 && !italic {
         return Some(base);
     }
-    // A size of 0 keeps the base font's size.
-    Cf::take(unsafe { CTFontCreateCopyWithSymbolicTraits(base.get(), 0.0, null(), traits, traits) })
-        .or(Some(base))
+    styled(&base, size, weight, italic).or(Some(base))
+}
+
+/// Font `name` at `size`, only when it is of family `family`: Core Text gives
+/// another font for a name it doesn't know, before the bundled ones are
+/// registered.
+fn registered(name: &str, family: &str, size: f64) -> Option<Cf> {
+    let font = Cf::take(unsafe { CTFontCreateWithName(cf_str(name)?.get(), size, null()) })?;
+    let got = Cf::take(unsafe { CTFontCopyFamilyName(font.get()) })?;
+    (unsafe { CFEqual(got.get(), cf_str(family)?.get()) } != 0).then_some(font)
+}
+
+/// A variable font with its weight axis set to `weight`.
+fn at_weight(font: &Cf, weight: i32) -> Option<Cf> {
+    let axis = integer(0x7767_6874)?; // 'wght'
+    let value = number(weight as f64)?;
+    let variation = dictionary(&[axis.get()], &[value.get()])?;
+    let attributes = dictionary(&[unsafe { kCTFontVariationAttribute }], &[variation.get()])?;
+    let descriptor = Cf::take(unsafe { CTFontDescriptorCreateWithAttributes(attributes.get()) })?;
+    // A size of 0 keeps the font's size.
+    Cf::take(unsafe { CTFontCreateCopyWithAttributes(font.get(), 0.0, null(), descriptor.get()) })
+}
+
+/// `base`'s family at CSS weight `weight` (100 to 1000), italic if asked: the
+/// face Core Text matches to the weight trait.
+fn styled(base: &Cf, size: f64, weight: i32, italic: bool) -> Option<Cf> {
+    let family = Cf::take(unsafe { CTFontCopyFamilyName(base.get()) })?;
+    let mut symbolic = if italic { kCTFontTraitItalic } else { 0 };
+    if weight >= 600 {
+        symbolic |= kCTFontTraitBold;
+    }
+    let trait_weight = number(trait_of(weight))?;
+    let trait_symbolic = integer(symbolic as i32)?;
+    let traits = dictionary(
+        &[unsafe { kCTFontWeightTrait }, unsafe {
+            kCTFontSymbolicTrait
+        }],
+        &[trait_weight.get(), trait_symbolic.get()],
+    )?;
+    let attributes = dictionary(
+        &[unsafe { kCTFontFamilyNameAttribute }, unsafe {
+            kCTFontTraitsAttribute
+        }],
+        &[family.get(), traits.get()],
+    )?;
+    let descriptor = Cf::take(unsafe { CTFontDescriptorCreateWithAttributes(attributes.get()) })?;
+    Cf::take(unsafe { CTFontCreateWithFontDescriptor(descriptor.get(), size, null()) })
+}
+
+/// A CSS weight as Core Text's weight trait, from -1 (thinnest) to 1 (heaviest).
+fn trait_of(weight: i32) -> f64 {
+    match weight {
+        ..=100 => -0.8,
+        101..=200 => -0.6,
+        201..=300 => -0.4,
+        301..=400 => 0.0,
+        401..=500 => 0.23,
+        501..=600 => 0.3,
+        601..=700 => 0.4,
+        701..=800 => 0.56,
+        _ => 0.62,
+    }
+}
+
+fn number(v: f64) -> Option<Cf> {
+    Cf::take(unsafe { CFNumberCreate(null(), kCFNumberFloat64Type, (&v as *const f64).cast()) })
+}
+
+fn integer(v: i32) -> Option<Cf> {
+    Cf::take(unsafe { CFNumberCreate(null(), kCFNumberSInt32Type, (&v as *const i32).cast()) })
+}
+
+fn dictionary(keys: &[CFTypeRef], values: &[CFTypeRef]) -> Option<Cf> {
+    Cf::take(unsafe {
+        CFDictionaryCreate(
+            null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            keys.len() as CFIndex,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        )
+    })
+}
+
+/// Registers the fonts in directory `dir` (its .ttf and .otf files) for this
+/// process, so that the bundled families are there. Returns how many it
+/// registered; one already registered doesn't count again.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_register_fonts(dir: GSlice<u8>) -> i32 {
+    guarded(|| {
+        let dir = unsafe { dir.as_slice() }.ok_or(ERR_ARGUMENT)?;
+        let dir = std::str::from_utf8(dir).map_err(|_| ERR_ARGUMENT)?;
+        let entries = std::fs::read_dir(dir).map_err(|_| ERR_ARGUMENT)?;
+        let mut count = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !ext.eq_ignore_ascii_case("ttf") && !ext.eq_ignore_ascii_case("otf") {
+                continue;
+            }
+            let bytes = path.as_os_str().as_encoded_bytes();
+            let Some(url) = Cf::take(unsafe {
+                CFURLCreateFromFileSystemRepresentation(
+                    null(),
+                    bytes.as_ptr(),
+                    bytes.len() as CFIndex,
+                    0,
+                )
+            }) else {
+                continue;
+            };
+            let ok = unsafe {
+                CTFontManagerRegisterFontsForURL(
+                    url.get(),
+                    kCTFontManagerScopeProcess,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok {
+                count += 1;
+            }
+        }
+        Ok(count)
+    })
 }
 
 /// One glyph of a shaped run.
@@ -570,6 +715,39 @@ mod tests {
             t.shaper.carets(&mut t.fonts, f, s, &mut c).unwrap();
         });
         c
+    }
+
+    /// The PostScript name of the font Goose's id `id` gets at 20 points.
+    fn face_of(id: i32) -> String {
+        let font = create_font(id, 20.0).unwrap();
+        let name = Cf::take(unsafe { CTFontCopyPostScriptName(font.get()) }).unwrap();
+        let mut buf = [0u8; 128];
+        let ok =
+            unsafe { CFStringGetCString(name.get(), buf.as_mut_ptr(), 128, kCFStringEncodingUTF8) };
+        assert!(ok);
+        let end = buf.iter().position(|&b| b == 0).unwrap();
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    }
+
+    #[test]
+    fn bundled_families_have_their_weights() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../app/fonts");
+        let dir = GSlice::<u8> {
+            data: dir.as_ptr() as *mut u8,
+            len: dir.len() as i64,
+        };
+        // Six files the first time; nothing more if another test got there first.
+        assert!((0..=6).contains(&tp_register_fonts(dir)));
+        let w = |weight: i32| (weight / 100) << FONT_WEIGHT_SHIFT;
+        assert_eq!(face_of(FAMILY_CONDENSED | w(500)), "BarlowCondensed-Medium");
+        assert_eq!(face_of(FAMILY_CONDENSED | w(700)), "BarlowCondensed-Bold");
+        assert_eq!(face_of(FAMILY_CONDENSED | w(900)), "BarlowCondensed-Black");
+        assert!(face_of(FAMILY_CODE).starts_with("JetBrainsMono"));
+        assert_ne!(face_of(FAMILY_CODE | w(700)), face_of(FAMILY_CODE));
+        // The system font gets wider as it gets heavier.
+        let wide = |id: i32| *carets_of(id, 17.0, b"Focaccia bread").last().unwrap();
+        assert!(wide(FAMILY_SANS) < wide(FAMILY_SANS | w(600)));
+        assert!(wide(FAMILY_SANS | w(600)) < wide(FAMILY_SANS | w(900)));
     }
 
     #[test]

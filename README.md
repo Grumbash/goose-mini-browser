@@ -205,7 +205,8 @@ shim can go, not a spec-compliant browser. Known, intentional gaps:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The fonts in `app/fonts` (Barlow Condensed, JetBrains Mono)
+are under the SIL Open Font License 1.1, in the `OFL-*.txt` files beside them.
 
 ## Acknowledgments
 

@@ -171,6 +171,8 @@ let K_LIGHTER: i32 = 62;
 let FAMILY_SANS: i32 = 0;
 let FAMILY_SERIF: i32 = 1;
 let FAMILY_MONO: i32 = 2;
+let FAMILY_CONDENSED: i32 = 3;  // Barlow Condensed, bundled (app/fonts)
+let FAMILY_CODE: i32 = 4;       // JetBrains Mono, bundled
 
 // Origins, lowest first.
 let ORIGIN_UA: i32 = 0;
@@ -247,8 +249,8 @@ struct Var { name: i32, name_len: i32, value: i32, value_len: i32, next: i32 }
 struct Style {
     display: i32,
     color: u32, bg: u32,                 // 0xAARRGGBB; a background with alpha 0 is none
-    font_size: f32, bold: i32, italic: i32, family: i32,
-    weight: i32,                         // font-weight, 1 to 1000; bold is 1 from 600 on
+    font_size: f32, italic: i32, family: i32,
+    weight: i32,                         // font-weight, 1 to 1000
     spacing: f32,                        // letter-spacing, in points
     text_case: i32,                      // text-transform: K_NONE, K_UPPERCASE, K_LOWERCASE or K_CAPITALIZE
     lh_mult: f32, lh_px: f32,            // line-height: a multiple of the font size, or pixels when lh_mult is 0
@@ -319,7 +321,7 @@ fn line_height(s: Style) -> f32 {
 fn no_shadow() -> Shadow { return Shadow { ox: 0.0, oy: 0.0, blur: 0.0, spread: 0.0, color: 0, inset: 0 }; }
 
 fn root_style() -> Style {
-    return Style { display: K_BLOCK, color: 0xFF000000, bg: 0, font_size: 16.0, bold: 0, italic: 0, family: FAMILY_SANS,
+    return Style { display: K_BLOCK, color: 0xFF000000, bg: 0, font_size: 16.0, italic: 0, family: FAMILY_SANS,
                    weight: 400, spacing: 0.0, text_case: K_NONE,
                    lh_mult: 1.2, lh_px: 0.0, align: K_LEFT, ws: K_NORMAL, list: K_DISC, deco: K_NONE, valign: K_BASELINE,
                    mt: 0.0, mr: 0.0, mb: 0.0, ml: 0.0, auto_ml: 0, auto_mr: 0, auto_mt: 0, auto_mb: 0, pt: 0.0, pr: 0.0, pb: 0.0, pl: 0.0,
@@ -1375,7 +1377,11 @@ fn family_of(v: const u8[:]) -> i32 {
             var f: u8[>..] = [];
             for c in trim(it) { if c != '"' && c != '\'' { f.push(lower(c)); } }
             let s = trim(f[..]);
-            if s == "monospace" || find(s, "mono") >= 0 || find(s, "courier") >= 0 || find(s, "menlo") >= 0 || find(s, "consolas") >= 0 {
+            // The bundled families by name, then the generic ones by what
+            // their names suggest.
+            if s == "barlow condensed" { family = FAMILY_CONDENSED; }
+            else if s == "jetbrains mono" { family = FAMILY_CODE; }
+            else if s == "monospace" || find(s, "mono") >= 0 || find(s, "courier") >= 0 || find(s, "menlo") >= 0 || find(s, "consolas") >= 0 {
                 family = FAMILY_MONO;
             } else if s == "serif" || find(s, "georgia") >= 0 || find(s, "times") >= 0 || find(s, "palatino") >= 0
                 || find(s, "garamond") >= 0 || find(s, "baskerville") >= 0 || find(s, "linux libertine") >= 0 {
@@ -2313,7 +2319,7 @@ fn inherit_value(s: Style&, parent: Style, p: i32) {
 // initial values of the rest.
 fn inherit(p: Style) -> Style {
     var s = root_style();
-    s.color = p.color; s.font_size = p.font_size; s.bold = p.bold; s.italic = p.italic; s.family = p.family;
+    s.color = p.color; s.font_size = p.font_size; s.italic = p.italic; s.family = p.family;
     s.weight = p.weight; s.spacing = p.spacing; s.text_case = p.text_case;
     s.lh_mult = p.lh_mult; s.lh_px = p.lh_px; s.align = p.align; s.ws = p.ws; s.list = p.list; s.deco = p.deco;
     s.indent = p.indent; s.root_size = p.root_size; s.vars = p.vars;
@@ -2351,7 +2357,6 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
         else if k == K_BOLDER { w = if w < 350 { 400 } else if w < 550 { 700 } else if w < 900 { 900 } else { w }; }
         else if k == K_LIGHTER { w = if w < 100 { w } else if w < 550 { 100 } else if w < 750 { 400 } else { 700 }; }
         s.weight = w;
-        s.bold = if w >= 600 { 1 } else { 0 };
     }
     else if p == P_LETTER_SPACING { s.spacing = if dc.kind == V_LENGTH { px(dc, s, parent) } else { 0.0 }; }
     else if p == P_TEXT_TRANSFORM { if k == K_NONE || k == K_UPPERCASE || k == K_LOWERCASE || k == K_CAPITALIZE { s.text_case = k; } }

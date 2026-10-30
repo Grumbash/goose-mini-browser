@@ -49,6 +49,7 @@ const LAYERS: usize = 2; // 0: the page, scrolled; 1: the overlay, fixed
 /// them, points to points; all 0: none), and its clip one that takes its
 /// points to the clip's (`c_a` … `c_f`; all 0: they are the same). A second
 /// clip (`oclip_w` above 0) cuts it square on the page, after its transform.
+/// A text item's `spacing` goes after each of its characters (letter-spacing).
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct DItem {
@@ -97,6 +98,7 @@ pub struct DItem {
     pub oclip_y: f32,
     pub oclip_w: f32,
     pub oclip_h: f32,
+    pub spacing: f32,
 }
 
 /// One quad, in device pixels: solid when `uv[2]` is 0, otherwise the atlas
@@ -623,6 +625,7 @@ fn snapped(x: f32, y: f32, w: f32, h: f32, scale: f64) -> [f32; 4] {
 /// phases. Clips snap like rects.
 pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut Vec<Instance>) {
     let mut glyphs = Vec::new();
+    let mut before = Vec::new(); // per byte of a spaced text, the characters before it
     for &item in items {
         let DItem {
             clip_x,
@@ -772,9 +775,25 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
             if t.shaper.shape(&mut t.fonts, f, span, &mut glyphs).is_none() {
                 continue;
             }
+            let spacing = item.spacing;
+            if spacing != 0.0 {
+                before.clear();
+                let mut n = 0u32;
+                for &b in span {
+                    before.push(n);
+                    if b & 0xC0 != 0x80 {
+                        n += 1;
+                    }
+                }
+            }
             let baseline = y as f64 * scale;
             for g in &glyphs {
-                let pen = (x as f64 + g.x as f64) * scale;
+                let spaced = if spacing != 0.0 {
+                    spacing * *before.get(g.byte as usize).unwrap_or(&0) as f32
+                } else {
+                    0.0
+                };
+                let pen = (x as f64 + (g.x + spaced) as f64) * scale;
                 let by = (baseline - g.y as f64 * scale).round();
                 let mut px = pen.floor();
                 let mut phase = ((pen - px) * PHASES as f64).round() as u32;
@@ -1009,7 +1028,7 @@ mod tests {
 
     #[test]
     fn items_match_the_goose_layout() {
-        assert_eq!(std::mem::size_of::<DItem>(), 180);
+        assert_eq!(std::mem::size_of::<DItem>(), 184);
         assert_eq!(std::mem::align_of::<DItem>(), 1);
         assert_eq!(std::mem::size_of::<GpFrameStats>(), 28);
         // The shader reads instances as fourteen float4s.
@@ -1262,6 +1281,31 @@ mod tests {
         });
         assert_eq!(out[0].rect, [1.0, 2.0, 20.0, 1.0]);
         assert_eq!(out[0].color, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn letter_spacing_goes_after_each_character() {
+        // "éb" twice, the second 10 points apart per character: its b, one
+        // character (two bytes) in, is 20 device pixels (at 2x) further on.
+        let plain = DItem {
+            kind: ITEM_TEXT,
+            y: 20.0,
+            color: 0xFF1C_1C1C,
+            size: 17.0,
+            text: 0,
+            text_len: 3,
+            ..Default::default()
+        };
+        let spaced = DItem {
+            spacing: 10.0,
+            ..plain
+        };
+        let gap = |item: DItem| {
+            let mut out = Vec::new();
+            with_text(|t| build(&[item], "éb".as_bytes(), 2.0, t, &mut out));
+            out[1].rect[0] - out[0].rect[0]
+        };
+        assert_eq!(gap(spaced) - gap(plain), 20.0);
     }
 
     #[test]

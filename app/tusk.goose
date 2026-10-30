@@ -247,6 +247,8 @@ fn main() {
     }
     guard !has_at || mode == MODE_SCREENSHOT else { usage(); return; }
     if path.len == 0 { path.append(str(resource_dir(), "../tests/pages/focaccia.html")); }
+    // The fonts Tusk brings (Barlow Condensed, JetBrains Mono), before any text is measured.
+    tp_register_fonts(str(resource_dir(), "fonts")[..]);
     var name_start: i64 = 0;
     for ch, k in path { if ch == '/' { name_start = k + 1; } }
 

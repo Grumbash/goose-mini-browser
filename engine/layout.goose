@@ -52,6 +52,7 @@ struct DItem {
     m_a: f32, m_b: f32, m_c: f32, m_d: f32, m_e: f32, m_f: f32,
     c_a: f32, c_b: f32, c_c: f32, c_d: f32, c_e: f32, c_f: f32,
     oclip_x: f32, oclip_y: f32, oclip_w: f32, oclip_h: f32,
+    spacing: f32,            // text: letter-spacing, after each character
 }
 
 struct Rect { x: f32, y: f32, w: f32, h: f32 }
@@ -66,6 +67,7 @@ struct Metrics {
 extern "tusk_platform" {
     fn tp_font_metrics(font: i32, size: f32, out: Metrics&) -> i32;
     fn tp_text_carets(font: i32, size: f32, text: const u8[:], carets: f32[:]) -> i32;
+    fn tp_register_fonts(dir: const u8[:]) -> i32;
 }
 
 // A font at one size, with what layout needs from it.
@@ -115,11 +117,11 @@ struct Line {
     atom: bool,                  // an inline-block came last, so a break may follow
 }
 
-// The platform's font id: the family, then bold and italic bits.
+// The platform's font id: the family in the low four bits, the weight over
+// 100 (to the nearest) in the next four, then whether it is italic.
 fn font_of(s: Style) -> i32 {
-    var f = s.family;
-    if s.bold != 0 { f = f | 16; }
-    if s.italic != 0 { f = f | 32; }
+    var f = s.family | (max((s.weight + 50) / 100, 1) << 4);
+    if s.italic != 0 { f = f | 256; }
     return f;
 }
 
@@ -196,7 +198,48 @@ fn add_text_run(L: Layout, n: i32) {
             last_space = false;
         }
     }
+    if s.text_case != K_NONE { change_case(L.text[start..], s.text_case); }
     add_run(L, n, s, start);
+}
+
+// text-transform, in place: upper or lower case, or capitals to start the
+// words, for ASCII, Latin-1 and Cyrillic, whose cases are as long in UTF-8.
+fn change_case(t: u8[:], to: i32) {
+    var word_start = true;
+    var i: i64 = 0;
+    while i < t.len {
+        let c = t[i];
+        let upper = to == K_UPPERCASE || (to == K_CAPITALIZE && word_start);
+        let lower = to == K_LOWERCASE;
+        word_start = c == ' ' || c == '\n';
+        if c < 128 {
+            if upper && c >= 'a' && c <= 'z' { t[i] = c - 32; }
+            else if lower && c >= 'A' && c <= 'Z' { t[i] = c + 32; }
+            i += 1;
+            continue;
+        }
+        guard i + 1 < t.len else { return; }
+        let d = t[i + 1];
+        if c == 0xC3 {
+            // Latin-1: à to þ (bar ÷) and À to Þ (bar ×) are 32 apart.
+            if upper && d >= 0xA0 && d <= 0xBE && d != 0xB7 { t[i + 1] = d - 32; }
+            else if lower && d >= 0x80 && d <= 0x9E && d != 0x97 { t[i + 1] = d + 32; }
+        } else if c == 0xD0 && upper && d >= 0xB0 && d <= 0xBF {
+            t[i + 1] = d - 32;                                      // а to п
+        } else if c == 0xD1 && upper && d >= 0x80 && d <= 0x8F {
+            t[i] = 0xD0; t[i + 1] = d + 32;                          // р to я
+        } else if c == 0xD1 && upper && d >= 0x90 && d <= 0x9F {
+            t[i] = 0xD0; t[i + 1] = d - 16;                          // ѐ to џ
+        } else if c == 0xD0 && lower && d >= 0x90 && d <= 0x9F {
+            t[i + 1] = d + 32;                                      // А to П
+        } else if c == 0xD0 && lower && d >= 0xA0 && d <= 0xAF {
+            t[i] = 0xD1; t[i + 1] = d - 32;                          // Р to Я
+        } else if c == 0xD0 && lower && d >= 0x80 && d <= 0x8F {
+            t[i] = 0xD1; t[i + 1] = d + 16;                          // Ѐ to Џ
+        }
+        i += 1;
+        while i < t.len && (t[i] & 0xC0) == 0x80 { i += 1; }
+    }
 }
 
 fn add_marker_run(L: Layout, li: i32, ordinal: i32) {
@@ -236,6 +279,14 @@ fn add_run(L: Layout, n: i32, s: Style, start: i64) {
     } else if tp_text_carets(font, s.font_size, L.text[start..start + len], L.carets[caret..caret + len + 1]) != 0 {
         // No platform text: even steps, so layout still runs.
         for k in len + 1 { L.carets[caret + k] = k * s.font_size * 0.5; }
+    }
+    if s.spacing != 0.0 {
+        // letter-spacing after each character, the last one's too.
+        var before: f32 = 0.0;
+        for k in len + 1 {
+            L.carets[caret + k] += before * s.spacing;
+            if k < len && (L.text[start + k] & 0xC0) != 0x80 { before += 1.0; }
+        }
     }
     L.run_of[n] = L.runs.len as i32;
     L.runs.push(Run { node: n, start: start as i32, len: len as i32, caret: caret as i32, font: fi });
@@ -539,7 +590,7 @@ fn rect_item(n: i32, x: f32, y: f32, w: f32, h: f32, color: u32) -> DItem {
                    clip_x: 0.0, clip_y: 0.0, clip_w: 0.0, clip_h: 0.0, clip_tl: 0.0, clip_tr: 0.0, clip_br: 0.0, clip_bl: 0.0,
                    m_a: 0.0, m_b: 0.0, m_c: 0.0, m_d: 0.0, m_e: 0.0, m_f: 0.0,
                    c_a: 0.0, c_b: 0.0, c_c: 0.0, c_d: 0.0, c_e: 0.0, c_f: 0.0,
-                   oclip_x: 0.0, oclip_y: 0.0, oclip_w: 0.0, oclip_h: 0.0 };
+                   oclip_x: 0.0, oclip_y: 0.0, oclip_w: 0.0, oclip_h: 0.0, spacing: 0.0 };
 }
 
 fn text_item(n: i32, x: f32, y: f32, w: f32, color: u32, font: i32, size: f32, text: i32, text_len: i32) -> DItem {
@@ -549,6 +600,13 @@ fn text_item(n: i32, x: f32, y: f32, w: f32, color: u32, font: i32, size: f32, t
     it.size = size;
     it.text = text;
     it.text_len = text_len;
+    return it;
+}
+
+// A text item in style s: its font, size, colour and letter-spacing.
+fn styled_text(n: i32, x: f32, y: f32, w: f32, s: Style, text: i32, text_len: i32) -> DItem {
+    var it = text_item(n, x, y, w, s.color, font_of(s), s.font_size, text, text_len);
+    it.spacing = s.spacing;
     return it;
 }
 
@@ -1063,8 +1121,7 @@ fn place(line: Line&, w: f32, space: bool, trailing: f32, above: f32, below: f32
 // with its decoration. Until the line closes, y is relative to its baseline.
 fn emit_text(L: Layout, line: Line&, run: Run, s: Style, from: i32, to: i32, x: f32, raise: f32) {
     let c = run.caret;
-    L.items.push(text_item(run.node, line.left + x, -raise, L.carets[c + to] - L.carets[c + from], s.color, font_of(s),
-                           s.font_size, run.start + from, to - from));
+    L.items.push(styled_text(run.node, line.left + x, -raise, L.carets[c + to] - L.carets[c + from], s, run.start + from, to - from));
     guard s.deco == K_UNDERLINE || s.deco == K_LINE_THROUGH;
     var ink = to;                 // decoration stops at the last visible character
     while ink > from && L.text[run.start + ink - 1] == ' ' { ink -= 1; }
@@ -1153,7 +1210,7 @@ fn ellipsize(L: Layout, line: Line&) -> f32 {
         end_x = max(end_x, it.x + cut_w);
     }
     let s = L.styles[er.node];
-    L.items.push(text_item(er.node, end_x, 0.0, ew, s.color, font_of(s), s.font_size, er.start, er.len));
+    L.items.push(styled_text(er.node, end_x, 0.0, ew, s, er.start, er.len));
     return end_x + ew - line.left;
 }
 
@@ -1200,8 +1257,7 @@ fn paint_marker(L: Layout, li: i32, content_x: f32, baseline: f32) {
     let run = L.runs[r];
     let s = L.styles[li];
     let w = L.carets[run.caret + run.len] - L.carets[run.caret];
-    L.items.push(text_item(li, content_x - w - s.font_size * 0.45, baseline, w, s.color, font_of(s), s.font_size,
-                           run.start, run.len));
+    L.items.push(styled_text(li, content_x - w - s.font_size * 0.45, baseline, w, s, run.start, run.len));
 }
 
 fn union(a: Rect, b: Rect) -> Rect {

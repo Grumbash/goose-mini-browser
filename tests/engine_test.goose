@@ -259,7 +259,7 @@ fn test_css_interface() {
         <style>h1 { font: italic 600 20px/1.5 "Barlow Condensed", Georgia, serif }
         h2 { font: 12px monospace; font-weight: bold } h3 { font: bold }</style><h1>a</h1><h2>b</h2><h3>c</h3>
         """;
-    check("the font shorthand", style_at(fonts, "h1", 0, true), "italic=1 bold=1 size=20.0 lh=30.0 family=1 weight=600");
+    check("the font shorthand", style_at(fonts, "h1", 0, true), "italic=1 bold=1 size=20.0 lh=30.0 family=3 weight=600");
     check("a longhand after the shorthand wins", style_at(fonts, "h2", 0, true), "italic=0 bold=1 size=12.0 lh=14.4 family=2 weight=700");
     check("a font with no size is ignored", style_at(fonts, "h3", 0, true), "italic=0 bold=1 size=20.4 lh=26.5 family=0 weight=700");
 
@@ -849,10 +849,44 @@ fn test_fonts() {
     check("lighter from 700", style_at(weights, "i", 0, true), "italic=1 bold=0 size=17.0 lh=27.2 family=0 weight=400");
     check("bolder from over 900 stays", style_at(weights, "b", 1, true), "italic=0 bold=1 size=17.0 lh=27.2 family=0 weight=950");
     check("lighter from under 100 stays", style_at(weights, "i", 1, true), "italic=1 bold=0 size=17.0 lh=27.2 family=0 weight=50");
+
+    // The bundled families by name.
+    let bundled = """
+        <style>h1 { font: 800 20px/1 "Barlow Condensed", sans-serif } h2 { font: 500 11px/1 "JetBrains Mono", monospace }</style>
+        <h1>a</h1><h2>b</h2>
+        """;
+    check("a bundled family by name", style_at(bundled, "h1", 0, true), "italic=0 bold=1 size=20.0 lh=20.0 family=3 weight=800");
+    check("the other bundled family", style_at(bundled, "h2", 0, true), "italic=0 bold=0 size=11.0 lh=11.0 family=4 weight=500");
+
+    // A font id carries the family, the weight to the nearest hundred (from
+    // 100 to 1000) and italic.
+    var ids: u8[>..] = [];
+    var st = root_style();
+    st.family = FAMILY_CONDENSED;
+    for w in [1, 449, 450, 1000] {
+        st.weight = w as i32;
+        st.italic = if w == 450 { 1 } else { 0 };
+        let id = font_of(st);
+        format(ids, id & 15, "/", (id >> 4) & 15, "/", id >> 8, " ");
+    }
+    check("font ids", ids[..], "3/1/0 3/4/0 3/5/1 3/10/0 ");
+
+    // letter-spacing comes after each character: three characters (four
+    // bytes) with 10 points each are 30 wider; text-transform changes case
+    // before measuring.
+    let spaced = """
+        <style>body { margin: 0; padding: 0; max-width: none } p { margin: 0 } #s { letter-spacing: 10px }
+        #u { text-transform: uppercase } #c { text-transform: capitalize } #l { text-transform: lowercase }</style>
+        <p id=a>aéb</p><p id=s>aéb</p><p id=u>abc é я</p><p id=c>two words</p><p id=l>ÉCOLE ПРИВЕТ</p>
+        """;
+    check("letter-spacing", layout_probe(spaced, 400.0, PROBE_SPACING), "30.0");
+    check("text-transform", layout_probe(spaced, 400.0, PROBE_TEXT),
+          "\"aéb\" line 1 x 0\n\"aéb\" line 2 x 0\n\"ABC É Я\" line 3 x 0\n\"Two Words\" line 4 x 0\n\"école привет\" line 5 x 0\n");
 }
 
 // ------------------------------------------------------------------ layout
 
+let PROBE_SPACING: i32 = 16; // how much wider #s's text is than #a's
 let PROBE_PAGE: i32 = 17;   // the page's height
 let PROBE_XF: i32 = 15;     // each item of an element with an id: its matrix, or "none"; with a clip, how it is mapped
 let PROBE_ORDER: i32 = 9;   // the elements with an id, in the order their items paint
@@ -1055,6 +1089,16 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             }
             out.push('\n');
         }
+    } else if probe == PROBE_SPACING {
+        var a: f32 = 0.0;
+        var b: f32 = 0.0;
+        for it in items {
+            guard it.kind == ITEM_TEXT else { continue; }
+            let id, has = attr_value(d, nodes[it.node].parent, "id");
+            if has && id == "a" { a = it.w; }
+            if has && id == "s" { b = it.w; }
+        }
+        format_flt(out, b - a, 1);
     } else if probe == PROBE_PAGE {
         format_flt(out, page_h, 1);
     } else if probe == PROBE_XF {
@@ -1236,6 +1280,7 @@ fn test_page() {
 
 fn main() {
     // The bundled fonts, as the app registers them; run from the repository.
+    tp_register_fonts("app/fonts");
     test_html();
     test_css();
     test_css_interface();
