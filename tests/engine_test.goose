@@ -120,6 +120,29 @@ fn style_at(src: const u8[:], name: const u8[:], k: i64, font: bool) -> u8[>..] 
     return out;
 }
 
+// How many bytes of substituted custom properties styling `src` keeps.
+fn var_bytes_of(src: const u8[:]) -> i64 {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes };
+    load_sheets(d, sh);
+    var styles: Style[>..] = [];
+    compute_styles(d, sh, styles);
+    return var_bytes.len;
+}
+
 // The tree under <body> once styled: the ::before and ::after the cascade
 // made are in it.
 fn styled_tree(src: const u8[:]) -> u8[>..] {
@@ -166,6 +189,36 @@ fn test_css_interface() {
     check("a cycle takes the fallback", style_at(vars, "u", 0, false), "display=2 size=17.0 bold=0 italic=0 color=ff123456 mt=0.0 ml=0.0 auto_ml=0");
     check("an ancestor's variable overrides the root's",
           style_at(vars, "p", 1, false), "display=1 size=17.0 bold=0 italic=0 color=ff00ffff mt=6.0 ml=0.0 auto_ml=0");
+
+    // As CSS has them: a chain longer than eight, every property in a cycle
+    // invalid (so the var()'s own fallback, not the one inside the cycle),
+    // inherit and initial, and var( in a string, which is only text.
+    let rules = """
+        <style>:root { --c1: var(--c2); --c2: var(--c3); --c3: var(--c4); --c4: var(--c5); --c5: var(--c6);
+        --c6: var(--c7); --c7: var(--c8); --c8: var(--c9); --c9: #ff0000; --a: var(--b, #00ff00); --b: var(--a); --i: 7px }
+        p { color: var(--c1) } b { color: var(--a, #0000ff) } i { --i: inherit; margin-left: var(--i) }
+        em { --i: initial; margin-left: var(--i, 2px) } u::before { content: "var(--i)" }</style>
+        <p>x <b>b</b> <i>i</i> <em>e</em> <u>u</u></p>
+        """;
+    check("a chain of nine variables", style_at(rules, "p", 0, false), "display=1 size=17.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check("a cycle makes all of its variables invalid",
+          style_at(rules, "b", 0, false), "display=2 size=17.0 bold=1 italic=0 color=ff0000ff mt=0.0 ml=0.0 auto_ml=0");
+    check("inherit takes the parent's variable", style_at(rules, "i", 0, false), "display=2 size=17.0 bold=0 italic=1 color=ffff0000 mt=0.0 ml=7.0 auto_ml=0");
+    check("initial makes a variable invalid", style_at(rules, "em", 0, false), "display=2 size=17.0 bold=0 italic=1 color=ffff0000 mt=0.0 ml=2.0 auto_ml=0");
+    check("var( in a string is text", styled_tree("""<style>:root { --i: 7px } u::before { content: "var(--i)" }</style><u>u</u>"""),
+          "body\n  u\n    ::before\n      \"var(--i)\"\n    \"u\"\n");
+
+    // Each variable using the one before ten times: from the fifth on they pass
+    // the cap and are invalid, so styling stays small.
+    var laughs: u8[>..] = [];
+    laughs.append("<style>:root { --v0: x;");
+    for lv in 1..8 {
+        format(laughs, " --v", lv, ":");
+        for r in 10 { format(laughs, " var(--v", lv - 1, ")"); }
+        laughs.append(";");
+    }
+    laughs.append(" } p { color: var(--v7) }</style><p>x</p>");
+    check("variables that multiply stop at the cap", if var_bytes_of(laughs[..]) < 100000 { "small" } else { "huge" }, "small");
 
     // The font shorthand, then a longhand after it; one without a size is ignored.
     let fonts = """

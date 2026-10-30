@@ -156,13 +156,15 @@ struct Sheet {
     decls: Decl[>..]&,
     bytes: u8[>..]&,
     vars: Var[>..]&,          // every element's own custom properties, see Var
-    var_bytes: u8[>..]&,      // their names and their values, substituted
+    var_bytes: u8[>..]&,      // their values, substituted
 }
 
 // One custom property of one element, in a chain: an element's own come
-// first, and `next` leads on to its parent's. Spans are into Sheet.var_bytes.
-// A value_len of -1 is one that couldn't be substituted (a cycle, or a var()
-// with no value and no fallback): var() treats it as missing.
+// first, and `next` leads on to its parent's. The name is a span into
+// Sheet.bytes, where its declaration keeps it, and the value one into
+// Sheet.var_bytes. A value_len of -1 is a value that is invalid (initial, a
+// cycle, past a cap, or a var() with no value and no fallback): var() treats
+// it as missing.
 struct Var { name: i32, name_len: i32, value: i32, value_len: i32, next: i32 }
 
 // Computed style for one element; text nodes use their parent's.
@@ -627,7 +629,7 @@ fn parse_declarations(body: const u8[:], out: Decl[>..]&, bytes: u8[>..]&) {
         var name: u8[>..] = [];
         name.append(raw_name);
         to_lower(name[..]);
-        if find(value, "var(") >= 0 { add_pending(name[..], value, important, out, bytes); continue; }
+        if next_var(value, 0) >= 0 { add_pending(name[..], value, important, out, bytes); continue; }
         add_declaration(name[..], value, important, out, bytes);
     }
 }
@@ -1368,78 +1370,148 @@ fn keep_custom(sh: Sheet, w: Work, from: i64, dc: Decl, p: i64) {
     w.prio.push(p);
 }
 
+// What one of an element's own custom properties is while own_vars works
+// through them.
+struct OwnVar { state: i32, depth: i32, at: i32 }
+let OV_TODO: i32 = 0;
+let OV_BUSY: i32 = 1;           // being substituted, `depth` down the stack
+let OV_DONE: i32 = 2;           // substituted, into sh.vars[at]
+let OV_INHERIT: i32 = 3;        // inherit or unset: the parent's shows through
+let NO_CYCLE: i32 = 1000000;
+
+// Caps, so that a few lines of variables that each use the one before many
+// times can't grow into gigabytes: a substituted value's length, the whole
+// document's substituted values, and how deep references and fallbacks nest.
+let VAR_MAX: i64 = 65536;
+let VAR_BYTES_MAX: i64 = 33554432;
+let VAR_DEPTH_MAX: i32 = 64;
+
 // Puts an element's own custom properties in front of the chain its parent's
-// start at, each substituted (it may use the others, or inherited ones), and
-// returns the new head. Substituted here, a value is inherited as it came out
-// where it was set.
+// start at, each substituted once (it may use the others, or inherited ones),
+// and returns the new head. Substituted here, a value is inherited as it came
+// out where it was set.
 fn own_vars(sh: Sheet, own: const Decl[:], head: i32, scratch: u8[>..<]&) -> i32 {
-    var at = head;
+    var ov: OwnVar[>..<] = [];
     for dc in own {
-        let mark = scratch.len;
-        let ok = substitute(sh, span_of(sh, dc.text, dc.text_len), own, head, 0, scratch);
-        var v = Var { name: sh.var_bytes.len as i32, name_len: dc.name_len, value: 0, value_len: -1, next: at };
-        sh.var_bytes.append(span_of(sh, dc.name, dc.name_len));
-        if ok {
-            v.value = sh.var_bytes.len as i32;
-            v.value_len = (scratch.len - mark) as i32;
-            sh.var_bytes.append(scratch[mark..]);
-        }
-        scratch.resize(mark);
-        at = sh.vars.len as i32;
-        sh.vars.push(v);
+        let v = trim(span_of(sh, dc.text, dc.text_len));
+        let inherits = v == "inherit" || v == "unset" || v == "revert" || v == "revert-layer";
+        ov.push(OwnVar { state: if inherits { OV_INHERIT } else { OV_TODO }, depth: 0, at: -1 });
+    }
+    for i in own.len { if ov[i].state == OV_TODO { resolve_own(sh, own, ov, i, 0, head, scratch); } }
+    var at = head;
+    for o in ov {
+        guard o.state == OV_DONE else { continue; }
+        sh.vars[o.at].next = at;
+        at = o.at;
     }
     return at;
 }
 
+// Substitutes own custom property i and files its value as a Var. initial, a
+// cycle through it (CSS makes every property in a cycle invalid) and a value
+// past the caps make it invalid. Returns how far down the stack a cycle met on
+// the way reaches, when that is below i; else NO_CYCLE.
+recursive fn resolve_own(sh: Sheet, own: const Decl[:], ov: OwnVar[>..<]&, i: i64, depth: i32, head: i32, scratch: u8[>..<]&) -> i32 {
+    ov[i].state = OV_BUSY;
+    ov[i].depth = depth;
+    let dc = own[i];
+    let text = span_of(sh, dc.text, dc.text_len);
+    let mark = scratch.len;
+    var ok = trim(text) != "initial";
+    var low = NO_CYCLE;
+    if ok {
+        let done, reach = substitute(sh, text, own, ov, depth, head, mark + VAR_MAX, scratch);
+        ok = done && reach > depth && sh.var_bytes.len + (scratch.len - mark) <= VAR_BYTES_MAX;
+        low = reach;
+    }
+    var v = Var { name: dc.name, name_len: dc.name_len, value: sh.var_bytes.len as i32, value_len: -1, next: -1 };
+    if ok {
+        v.value_len = (scratch.len - mark) as i32;
+        sh.var_bytes.append(scratch[mark..]);
+    }
+    scratch.resize(mark);
+    ov[i].state = OV_DONE;
+    ov[i].at = sh.vars.len as i32;
+    sh.vars.push(v);
+    return if low < depth { low } else { NO_CYCLE };
+}
+
 // Appends `text` to `out` with each var() replaced by its custom property:
-// the element's own (`own`, still text, so substituted in turn), else the one
+// the element's own (`own`, substituted when first used), else the one
 // inherited from `head` on, else the var()'s fallback. False, with `out` as it
-// was, when one has none of those, or when references go 8 deep, as a cycle's
-// do.
-recursive fn substitute(sh: Sheet, text: const u8[:], own: const Decl[:], head: i32, depth: i32, out: u8[>..<]&) -> bool {
-    guard depth < 8 else { return false; }
+// was, when one has none of those, when `out` would grow past `limit`, or when
+// references nest VAR_DEPTH_MAX deep. Also returns how far down the stack a
+// cycle met on the way reaches (NO_CYCLE when there was none).
+recursive fn substitute(sh: Sheet, text: const u8[:], own: const Decl[:], ov: OwnVar[>..<]&, depth: i32, head: i32,
+                        limit: i64, out: u8[>..<]&) -> bool, i32 {
+    guard depth < VAR_DEPTH_MAX else { return false, NO_CYCLE; }
     let mark = out.len;
+    var low = NO_CYCLE;
     var i: i64 = 0;
     while i < text.len {
-        let k = find(text[i..], "var(");
-        if k < 0 { out.append(text[i..]); return true; }
-        out.append(text[i..i + k]);
-        let open = i + k + 4;
+        let k = next_var(text, i);
+        let end = if k < 0 { text.len } else { k };
+        if out.len + (end - i) > limit { out.resize(mark); return false, low; }
+        out.append(text[i..end]);
+        if k < 0 { break; }
+        let open = k + 4;
         let close = close_paren(text, open);
-        if close < 0 { out.resize(mark); return false; }
+        if close < 0 { out.resize(mark); return false, low; }
         let inside = text[open..close];
         let comma = top_comma(inside);
-        let name = trim(if comma >= 0 { inside[..comma] } else { inside });
-        if !lookup_var(sh, name, own, head, depth, out) {
-            if comma < 0 || !substitute(sh, trim(inside[comma + 1..]), own, head, depth + 1, out) {
-                out.resize(mark);
-                return false;
-            }
+        let found, reach = lookup_var(sh, trim(if comma >= 0 { inside[..comma] } else { inside }), own, ov, depth, head, limit, out);
+        low = min(low, reach);
+        if !found {
+            guard comma >= 0 else { out.resize(mark); return false, low; }
+            let fell, back = substitute(sh, trim(inside[comma + 1..]), own, ov, depth + 1, head, limit, out);
+            low = min(low, back);
+            if !fell { out.resize(mark); return false, low; }
         }
         i = close + 1;
     }
-    return true;
+    return true, low;
 }
 
 // Appends the value of custom property `name`, found as substitute says;
-// false, with `out` as it was, when there is none.
-recursive fn lookup_var(sh: Sheet, name: const u8[:], own: const Decl[:], head: i32, depth: i32, out: u8[>..<]&) -> bool {
-    for dc in own {
-        if span_of(sh, dc.name, dc.name_len) == name {
-            return substitute(sh, span_of(sh, dc.text, dc.text_len), own, head, depth + 1, out);
-        }
-    }
+// false, with `out` as it was, when there is none or it is invalid. Also
+// returns how far down the stack a cycle met on the way reaches.
+recursive fn lookup_var(sh: Sheet, name: const u8[:], own: const Decl[:], ov: OwnVar[>..<]&, depth: i32, head: i32,
+                        limit: i64, out: u8[>..<]&) -> bool, i32 {
     var at = head;
+    var low = NO_CYCLE;
+    for dc, i in own {
+        guard ov[i].state != OV_INHERIT && span_of(sh, dc.name, dc.name_len) == name else { continue; }
+        // Still being substituted further up: a cycle, down to there.
+        if ov[i].state == OV_BUSY { return false, ov[i].depth; }
+        if ov[i].state == OV_TODO { low = resolve_own(sh, own, ov, i, depth + 1, head, out); }
+        at = ov[i].at;
+        break;
+    }
     while at >= 0 {
         let v = sh.vars[at];
-        if var_span(sh, v.name, v.name_len) == name {
-            guard v.value_len >= 0 else { return false; }
+        if span_of(sh, v.name, v.name_len) == name {
+            guard v.value_len >= 0 && out.len + v.value_len <= limit else { return false, low; }
             out.append(var_span(sh, v.value, v.value_len));
-            return true;
+            return true, low;
         }
         at = v.next;
     }
-    return false;
+    return false, low;
+}
+
+// The index of the next var( in s from i on, outside strings; -1 when there
+// is none.
+fn next_var(s: const u8[:], i: i64) -> i64 {
+    var j = i;
+    while j + 4 <= s.len {
+        let c = s[j];
+        if c == '"' || c == '\'' { j = skip_string(s, j); continue; }
+        if lower(c) == 'v' && lower(s[j + 1]) == 'a' && lower(s[j + 2]) == 'r' && s[j + 3] == '(' && (j == 0 || !is_ident(s[j - 1])) {
+            return j;
+        }
+        j += 1;
+    }
+    return -1;
 }
 
 // The index of the ')' that closes a '(' just before s[i], nesting and quotes
@@ -1479,7 +1551,9 @@ fn top_comma(s: const u8[:]) -> i64 {
 fn apply_decl(s: Style&, parent: Style, dc: Decl, sh: Sheet, scratch: u8[>..<]&) {
     if dc.kind != V_VAR { apply(s, parent, dc); return; }
     let mark = scratch.len;
-    if substitute(sh, span_of(sh, dc.text, dc.text_len), sh.decls[0..0], s.vars, 0, scratch) {
+    var none: OwnVar[>..<] = [];
+    let ok, reach = substitute(sh, span_of(sh, dc.text, dc.text_len), sh.decls[0..0], none, 0, s.vars, mark + VAR_MAX, scratch);
+    if ok {
         var name: u8[>..] = [];
         name.append(span_of(sh, dc.name, dc.name_len));
         // Shorthands keep slices of their value (words), so it goes into an array
