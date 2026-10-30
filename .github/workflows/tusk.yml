@@ -16,14 +16,14 @@ jobs:
       GOOSE_PIN: cce94b919d27458856ae2685974049eac78debcf  # docs/adr/0001
       RUST_TOOLCHAIN: "1.99.1"  # pinned, so a new release's lints can't fail a run
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Where Goose lives
         run: echo "GOOSE_BIN=$HOME/goose/build/goose" >> "$GITHUB_ENV"
 
       - name: Cache the Goose compiler
         id: goose
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/goose
           key: goose-${{ env.GOOSE_PIN }}-${{ runner.os }}-${{ runner.arch }}
@@ -44,7 +44,7 @@ jobs:
           rustup default "$RUST_TOOLCHAIN"
 
       - name: Cache Rust builds
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -82,7 +82,7 @@ jobs:
           # A blank window compresses to a few KB; the article is hundreds.
           test "$(stat -f %z focaccia.png)" -gt 100000
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: tusk-m1
