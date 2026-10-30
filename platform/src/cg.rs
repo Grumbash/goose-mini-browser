@@ -244,6 +244,7 @@ unsafe extern "C" {
     pub fn CGContextAddPath(context: CFTypeRef, path: CFTypeRef);
     pub fn CGContextFillPath(context: CFTypeRef);
     pub fn CGContextEOFillPath(context: CFTypeRef);
+    pub fn CGContextClip(context: CFTypeRef);
     pub fn CGPathCreateMutable() -> CFTypeRef;
     pub fn CGPathMoveToPoint(path: CFTypeRef, m: *const c_void, x: f64, y: f64);
     pub fn CGPathAddLineToPoint(path: CFTypeRef, m: *const c_void, x: f64, y: f64);

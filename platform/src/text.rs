@@ -775,12 +775,16 @@ impl Atlas {
         phase_x: u8,
         phase_y: u8,
     ) -> Option<AtlasEntry> {
-        let path = device_path(
-            data,
-            self.scale,
+        let (own, clip) = split_clip(data);
+        let (dx, dy) = (
             phase_x as f64 / PHASES as f64,
             phase_y as f64 / PHASES as f64,
-        )?;
+        );
+        let path = device_path(own, self.scale, dx, dy)?;
+        let clip = match clip {
+            Some(corners) => Some(device_polygon(corners, self.scale, dx, dy)?),
+            None => None,
+        };
         let outline = if stroke > 0.0 {
             let cap = if flags & PATH_CAP_ROUND != 0 {
                 1
@@ -809,7 +813,19 @@ impl Atlas {
         } else {
             path
         };
-        let r = unsafe { CGPathGetPathBoundingBox(outline.get()) };
+        let mut r = unsafe { CGPathGetPathBoundingBox(outline.get()) };
+        if let Some(c) = &clip {
+            // Only what the clip shows needs a mask.
+            let b = unsafe { CGPathGetPathBoundingBox(c.get()) };
+            let x0 = r.origin.x.max(b.origin.x);
+            let y0 = r.origin.y.max(b.origin.y);
+            let x1 = (r.origin.x + r.size.width).min(b.origin.x + b.size.width);
+            let y1 = (r.origin.y + r.size.height).min(b.origin.y + b.size.height);
+            r.origin.x = x0;
+            r.origin.y = y0;
+            r.size.width = x1 - x0;
+            r.size.height = y1 - y0;
+        }
         if !(r.size.width > 0.0 && r.size.height > 0.0) {
             return None;
         }
@@ -844,6 +860,10 @@ impl Atlas {
                 // Device pixels have y down; the bitmap's first row is its top.
                 CGContextTranslateCTM(c, -x0 as f64, y1 as f64);
                 CGContextScaleCTM(c, 1.0, -1.0);
+                if let Some(clip) = &clip {
+                    CGContextAddPath(c, clip.get());
+                    CGContextClip(c);
+                }
                 CGContextAddPath(c, outline.get());
                 if stroke <= 0.0 && flags & PATH_EVENODD != 0 {
                     CGContextEOFillPath(c);
@@ -945,6 +965,50 @@ fn device_path(data: &[f32], scale: f64, dx: f64, dy: f64) -> Option<Cf> {
     if unsafe { CGPathIsEmpty(p) } {
         return None;
     }
+    Some(path)
+}
+
+/// Path data's own part, and the corners of the polygon it shows inside when
+/// it ends with a clip (4, then a count of corners and each one's x y).
+fn split_clip(data: &[f32]) -> (&[f32], Option<&[f32]>) {
+    let mut k = 0;
+    while k < data.len() {
+        let op = data[k];
+        if op == 4.0 {
+            let corners = data.get(k + 1).map_or(0, |&n| n.max(0.0) as usize);
+            let end = (k + 2 + 2 * corners).min(data.len());
+            return (&data[..k], Some(&data[(k + 2).min(end)..end]));
+        }
+        k += if op == 2.0 {
+            7
+        } else if op == 3.0 {
+            1
+        } else {
+            3
+        };
+    }
+    (data, None)
+}
+
+/// A clip's corners as a closed Core Graphics polygon in device pixels, from
+/// (dx, dy), as device_path places points.
+fn device_polygon(corners: &[f32], scale: f64, dx: f64, dy: f64) -> Option<Cf> {
+    if corners.len() < 6 {
+        return None;
+    }
+    let path = Cf::take(unsafe { CGPathCreateMutable() })?;
+    let p = path.get();
+    for (i, &[x, y]) in corners.as_chunks::<2>().0.iter().enumerate() {
+        let (x, y) = (x as f64 * scale + dx, y as f64 * scale + dy);
+        unsafe {
+            if i == 0 {
+                CGPathMoveToPoint(p, null(), x, y);
+            } else {
+                CGPathAddLineToPoint(p, null(), x, y);
+            }
+        }
+    }
+    unsafe { CGPathCloseSubpath(p) };
     Some(path)
 }
 
@@ -1306,5 +1370,54 @@ mod tests {
             tp_font_metrics(FAMILY_SANS, 17.0, std::ptr::null_mut()),
             ERR_ARGUMENT
         );
+    }
+
+    #[test]
+    fn a_clip_cuts_a_path_mask() {
+        let mut atlas = Atlas::new(1.0);
+        // A 20 × 20 square, then the same shown only left of x = 10.
+        let square = [
+            0.0, 0.0, 0.0, 1.0, 20.0, 0.0, 1.0, 20.0, 20.0, 1.0, 0.0, 20.0, 3.0,
+        ];
+        let mut half = square.to_vec();
+        half.extend_from_slice(&[4.0, 4.0, 0.0, 0.0, 10.0, 0.0, 10.0, 20.0, 0.0, 20.0]);
+        let a = atlas.path(&square, 0.0, 0, 0, 0);
+        let b = atlas.path(&half, 0.0, 0, 0, 0);
+        let at = |e: AtlasEntry, x: i32, y: i32| {
+            let (mx, my) = ((x - e.left as i32) as u32, (y - e.top as i32) as u32);
+            atlas.pixels[((e.y as u32 + my) * atlas.width + e.x as u32 + mx) as usize]
+        };
+        assert!(a.w >= 20 && b.w < a.w && b.h == a.h, "{a:?} {b:?}");
+        assert_eq!(at(a, 15, 10), 255);
+        assert_eq!(at(b, 5, 10), 255);
+        // Its mask stops a pixel past the clip, though the square goes on.
+        assert!(b.left as i32 + b.w as i32 <= 12, "{b:?}");
+    }
+
+    #[test]
+    fn a_turned_clip_cuts_inside_its_bounds() {
+        let mut atlas = Atlas::new(1.0);
+        // The square shown only above its diagonal.
+        let mut corner = vec![
+            0.0, 0.0, 0.0, 1.0, 20.0, 0.0, 1.0, 20.0, 20.0, 1.0, 0.0, 20.0, 3.0,
+        ];
+        corner.extend_from_slice(&[4.0, 3.0, 0.0, 0.0, 20.0, 0.0, 0.0, 20.0]);
+        let e = atlas.path(&corner, 0.0, 0, 0, 0);
+        let at = |x: i32, y: i32| {
+            let (mx, my) = ((x - e.left as i32) as u32, (y - e.top as i32) as u32);
+            atlas.pixels[((e.y as u32 + my) * atlas.width + e.x as u32 + mx) as usize]
+        };
+        assert_eq!(at(4, 4), 255);
+        assert_eq!(at(15, 15), 0);
+    }
+
+    #[test]
+    fn a_path_mask_is_drawn_at_its_phase() {
+        let mut atlas = Atlas::new(1.0);
+        let triangle = [0.0, 0.0, 0.0, 1.0, 9.5, 0.0, 1.0, 0.0, 9.5, 3.0];
+        let a = atlas.path(&triangle, 0.0, 0, 0, 0);
+        let b = atlas.path(&triangle, 0.0, 0, 2, 0);
+        assert_ne!(a, b);
+        assert_eq!(atlas.path(&triangle, 0.0, 0, 0, 0), a);
     }
 }

@@ -961,7 +961,9 @@ fn test_svg() {
         <svg width=40 height=40><g transform="translate(20 10)"><g class=leg><path d="M-2 0 H2 V10 H-2 Z"/></g></g></svg>
         """;
     check("use, symbol and fill-box", layout_probe(uses, 400.0, PROBE_PATHS),
-          str("stroke 4.0 ffff0000 M0,0 L20,20\nfill ff0000ff M0,20 L20,0\nstroke 4.0 ffff0000 M0,20 L20,0\n",
+          str("stroke 4.0 ffff0000 M0,0 L20,20 clip 0.0,0.0 20.0,0.0 20.0,20.0 0.0,20.0\n",
+              "fill ff0000ff M0,20 L20,0 clip 0.0,0.0 20.0,0.0 20.0,20.0 0.0,20.0\n",
+              "stroke 4.0 ffff0000 M0,20 L20,0 clip 0.0,0.0 20.0,0.0 20.0,20.0 0.0,20.0\n",
               "fill ff000000 M20,28 L20,32 L10,32 L10,28 Z\n")[..]);
 
     // A rect with one radius 0 is square; fill-opacity and stroke-opacity,
@@ -992,6 +994,23 @@ fn test_svg() {
     check("transform origins and boxes in svg", layout_probe(origins, 400.0, PROBE_PATHS),
           str("fill ff000000 M17,-3 L17,7 L13,7 L13,-3 L17,-3 Z\nfill ff000000 M30,2.5 C50,2.5\n",
               "fill ff000000 M57,-3 L57,7 L53,7 L53,-3 L57,-3 Z\nstroke 4.0 ff000000 M71,11 L79,11 L79,19 L71,19 L71,11 Z\n")[..]);
+    // A nested <svg> shows what is inside its box: a shape across its edge
+    // carries the clip, one inside doesn't, one outside isn't drawn; turned,
+    // the clip turns; nested, the boxes meet; overflow: visible shows it all.
+    let nested = """
+        <style>body { margin: 0; padding: 0; max-width: none } svg { display: block }</style>
+        <svg width=200 height=100><svg x=10 y=10 width=20 height=20><circle cx=10 cy=10 r=5 /><rect x=15 y=15 width=10 height=10 />
+        <rect x=50 y=50 width=5 height=5 /></svg><g transform="rotate(45 50 50)"><svg x=40 y=40 width=20 height=20><rect width=30 height=30 /></svg></g>
+        <svg x=70 width=30 height=30><svg x=20 y=20 width=20 height=20><rect width=20 height=20 /></svg></svg>
+        <svg x=120 width=10 height=10 style="overflow: visible"><rect width=20 height=20 /></svg></svg>
+        """;
+    check("nested viewports clip", layout_probe(nested, 400.0, PROBE_PATHS),
+          str("fill ff000000 M25,20 C20,25 C15,20 C20,15 C25,20 Z\n",
+              "fill ff000000 M25,25 L35,25 L35,35 L25,35 L25,25 Z clip 10.0,10.0 30.0,10.0 30.0,30.0 10.0,30.0\n",
+              "fill ff000000 M50,35.9 L71.2,57.1 L50,78.3 L28.8,57.1 L50,35.9 Z clip 50.0,35.9 64.1,50.0 50.0,64.1 35.9,50.0\n",
+              "fill ff000000 M90,20 L110,20 L110,40 L90,40 L90,20 Z clip 100.0,20.0 100.0,30.0 90.0,30.0 90.0,20.0\n",
+              "fill ff000000 M120,0 L140,0 L140,20 L120,20 L120,0 Z\n")[..]);
+
     // Path numbers as WebKit reads them: a point needs a digit after it, a
     // comma goes only after a number, once, and a big coordinate is a number.
     let numbers = """
@@ -1461,6 +1480,7 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             let end = k + it.text_len;
             while k < end {
                 let op = paths[k];
+                guard op != PATH_CLIP else { break; }
                 let n: i64 = if op == PATH_CUBIC { 3 } else if op == PATH_CLOSE { 0 } else { 1 };
                 if k > it.text { out.push(' '); }
                 out.append(if op == PATH_MOVE { "M" } else if op == PATH_LINE { "L" } else if op == PATH_CUBIC { "C" } else { "Z" });
@@ -1489,6 +1509,19 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             let end = k + it.text_len;
             while k < end {
                 let op = paths[k];
+                if op == PATH_CLIP {
+                    // The clip's corners, on the page.
+                    out.append(" clip");
+                    let n = paths[k + 1] as i64;
+                    for j in n {
+                        out.push(' ');
+                        format_flt(out, round((it.x + paths[k + 2 + 2 * j]) * 10.0) / 10.0, 1);
+                        out.push(',');
+                        format_flt(out, round((it.y + paths[k + 3 + 2 * j]) * 10.0) / 10.0, 1);
+                    }
+                    k += 2 + 2 * n;
+                    continue;
+                }
                 let n: i64 = if op == PATH_CUBIC { 3 } else if op == PATH_CLOSE { 0 } else { 1 };
                 out.append(if op == PATH_MOVE { " M" } else if op == PATH_LINE { " L" } else if op == PATH_CUBIC { " C" } else { " Z" });
                 if n > 0 {

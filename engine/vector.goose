@@ -18,6 +18,7 @@ let PATH_MOVE: f32 = 0.0;    // x y
 let PATH_LINE: f32 = 1.0;    // x y
 let PATH_CUBIC: f32 = 2.0;   // x1 y1 x2 y2 x y
 let PATH_CLOSE: f32 = 3.0;
+let PATH_CLIP: f32 = 4.0;    // n, then n corners x y: a convex polygon the path shows inside, last
 
 // How a path is painted, as the platform reads Painted.flags.
 let PATH_EVENODD: i32 = 1;
@@ -41,6 +42,19 @@ struct Painted { start: i32, len: i32, x: f32, y: f32, w: f32, h: f32, color: u3
 
 // x' = a x + c y + e, y' = b x + d y + f, as CSS's matrix() has it.
 struct Affine { a: f32, b: f32, c: f32, d: f32, e: f32, f: f32 }
+
+// What nested viewports leave visible, on the page: a convex polygon of n
+// corners, n -1 for no limit and 0 for nothing.
+struct Clip { n: i32, x: f32[CLIP_CORNERS], y: f32[CLIP_CORNERS] }
+
+// The most corners a clip keeps: four viewports turned every way.
+let CLIP_CORNERS: i64 = 16;
+
+// A clip of n corners, all at (0, 0) for now.
+fn clip_of(n: i32) -> Clip {
+    let z: f32[CLIP_CORNERS] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    return Clip { n: n, x: z, y: z };
+}
 
 fn affine(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> Affine { return Affine { a: a, b: b, c: c, d: d, e: e, f: f }; }
 fn shift(x: f32, y: f32) -> Affine { return affine(1.0, 0.0, 0.0, 1.0, x, y); }
@@ -92,13 +106,15 @@ fn draw_svg(d: Doc, styles: Style[>..]&, ids: i32[>..]&, n: i32, x: f32, y: f32,
     var uses: i32[>..<] = [];
     var V = Drawing { d: d, styles: styles, ids: ids, uses: uses, left: SVG_ELEMENTS_MAX, paths: paths, out: out };
     let vw, vh = view_size(d, n, w, h);
-    draw_children(V, n, times(shift(x, y), fit_view(d, n, w, h)), inherited(styles[n]), 1.0, vw, vh, 0);
+    // Its own box clips through layout; what is inside, here.
+    draw_children(V, n, times(shift(x, y), fit_view(d, n, w, h)), inherited(styles[n]), 1.0, vw, vh, clip_of(-1), 0);
 }
 
-recursive fn draw_children(V: Drawing&, n: i32, m: Affine, up: Inherited, alpha: f32, vw: f32, vh: f32, depth: i32) {
+recursive fn draw_children(V: Drawing&, n: i32, m: Affine, up: Inherited, alpha: f32, vw: f32, vh: f32, clip: Clip,
+                           depth: i32) {
     var c = V.d.nodes[n].first;
     while c >= 0 {
-        if V.d.nodes[c].kind == NODE_ELEMENT { draw_node(V, c, m, up, alpha, vw, vh, depth); }
+        if V.d.nodes[c].kind == NODE_ELEMENT { draw_node(V, c, m, up, alpha, vw, vh, clip, depth); }
         c = V.d.nodes[c].next;
     }
 }
@@ -106,7 +122,8 @@ recursive fn draw_children(V: Drawing&, n: i32, m: Affine, up: Inherited, alpha:
 // Element e, its user space taken to the page by m: a group's children, a
 // nested <svg>'s in its viewport, what a <use> refers to, or a shape.
 // vw × vh is the viewport that percentages count in.
-recursive fn draw_node(V: Drawing&, e: i32, m: Affine, up: Inherited, alpha: f32, vw: f32, vh: f32, depth: i32) {
+recursive fn draw_node(V: Drawing&, e: i32, m: Affine, up: Inherited, alpha: f32, vw: f32, vh: f32, clip: Clip,
+                       depth: i32) {
     let s = V.styles[e];
     guard s.display != K_NONE && depth < SVG_DEPTH_MAX && V.left > 0;
     V.left -= 1;
@@ -116,12 +133,12 @@ recursive fn draw_node(V: Drawing&, e: i32, m: Affine, up: Inherited, alpha: f32
     let own = times(m, local_transform(V, e, vw, vh, depth));
     let name = node_name(V.d, e);
     if name == "g" || name == "a" || name == "switch" {
-        draw_children(V, e, own, p, a, vw, vh, depth + 1);
+        draw_children(V, e, own, p, a, vw, vh, clip, depth + 1);
     } else if name == "svg" {
         // A viewport of its own: x, y, width and height, then its viewBox.
-        let at, iw, ih, ok = viewport(V.d, e, own, vw, vh, vw, vh);
+        let at, iw, ih, ok = viewport(V.d, e, own, -1.0, -1.0, vw, vh);
         guard ok;
-        draw_children(V, e, at, p, a, iw, ih, depth + 1);
+        draw_children(V, e, at, p, a, iw, ih, viewport_clip(V, e, own, -1.0, -1.0, vw, vh, clip), depth + 1);
     } else if name == "use" {
         let t = use_target(V, e);
         guard t > 0;
@@ -133,13 +150,15 @@ recursive fn draw_node(V: Drawing&, e: i32, m: Affine, up: Inherited, alpha: f32
             // all of the viewport.
             let inner, iw, ih, ok = viewport(V.d, t, at, length_attr(V.d, e, "width", vw, -1.0),
                                              length_attr(V.d, e, "height", vh, -1.0), vw, vh);
-            if ok { draw_children(V, t, inner, paint_of(V.styles[t], p), a, iw, ih, depth + 1); }
+            let uw = length_attr(V.d, e, "width", vw, -1.0);
+            let uh = length_attr(V.d, e, "height", vh, -1.0);
+            if ok { draw_children(V, t, inner, paint_of(V.styles[t], p), a, iw, ih, viewport_clip(V, t, at, uw, uh, vw, vh, clip), depth + 1); }
         } else {
-            draw_node(V, t, at, p, a, vw, vh, depth + 1);
+            draw_node(V, t, at, p, a, vw, vh, clip, depth + 1);
         }
         V.uses.pop();
     } else {
-        draw_shape(V, e, name, own, p, a, vw, vh);
+        draw_shape(V, e, name, own, p, a, vw, vh, clip);
     }
 }
 
@@ -150,13 +169,85 @@ recursive fn draw_node(V: Drawing&, e: i32, m: Affine, up: Inherited, alpha: f32
 // fitted by its viewBox. Also the size of its user space, and whether it
 // has any.
 fn viewport(d: Doc, e: i32, m: Affine, w: f32, h: f32, pw: f32, ph: f32) -> Affine, f32, f32, bool {
+    let nx, ny, nw, nh = viewport_box(d, e, w, h, pw, ph);
+    guard nw > 0.0 && nh > 0.0 else { return m, 0.0, 0.0, false; }
+    let iw, ih = view_size(d, e, nw, nh);
+    return times(m, times(shift(nx, ny), fit_view(d, e, nw, nh))), iw, ih, true;
+}
+
+// Viewport element e's box in its parent's user space: x, y, width and
+// height, as viewport() takes them.
+fn viewport_box(d: Doc, e: i32, w: f32, h: f32, pw: f32, ph: f32) -> f32, f32, f32, f32 {
     let nx = length_attr(d, e, "x", pw, 0.0);
     let ny = length_attr(d, e, "y", ph, 0.0);
     let nw = if w >= 0.0 { w } else { length_attr(d, e, "width", pw, pw) };
     let nh = if h >= 0.0 { h } else { length_attr(d, e, "height", ph, ph) };
-    guard nw > 0.0 && nh > 0.0 else { return m, 0.0, 0.0, false; }
-    let iw, ih = view_size(d, e, nw, nh);
-    return times(m, times(shift(nx, ny), fit_view(d, e, nw, nh))), iw, ih, true;
+    return nx, ny, nw, nh;
+}
+
+// What is visible inside viewport element e as well as `clip`: its box, which
+// m takes to the page, unless its overflow shows.
+fn viewport_clip(V: Drawing&, e: i32, m: Affine, w: f32, h: f32, pw: f32, ph: f32, clip: Clip) -> Clip {
+    guard V.styles[e].clips != 0 else { return clip; }
+    let x, y, bw, bh = viewport_box(V.d, e, w, h, pw, ph);
+    var box = clip_of(4);
+    let xs: f32[4] = [x, x + bw, x + bw, x];
+    let ys: f32[4] = [y, y, y + bh, y + bh];
+    for k in 4 {
+        box.x[k] = m.a * xs[k] + m.c * ys[k] + m.e;
+        box.y[k] = m.b * xs[k] + m.d * ys[k] + m.f;
+    }
+    return cut(clip, box);
+}
+
+// The part of convex polygon a inside convex polygon b (Sutherland and
+// Hodgman), where a limit of -1 corners is none.
+fn cut(a: Clip, b: Clip) -> Clip {
+    guard a.n >= 0 else { return b; }
+    guard b.n >= 0 else { return a; }
+    var out = a;
+    // Which side of b's edges its inside is on, as its corners turn.
+    var area: f32 = 0.0;
+    for i in b.n { let j = (i + 1) % b.n; area += b.x[i] * b.y[j] - b.x[j] * b.y[i]; }
+    let turn: f32 = if area < 0.0 { -1.0 } else { 1.0 };
+    for i in b.n {
+        guard out.n > 0 else { return out; }
+        let j = (i + 1) % b.n;
+        let ex = b.x[j] - b.x[i];
+        let ey = b.y[j] - b.y[i];
+        var next = clip_of(0);
+        for k in out.n {
+            let l = (k + 1) % out.n;
+            let sk = turn * (ex * (out.y[k] - b.y[i]) - ey * (out.x[k] - b.x[i]));
+            let sl = turn * (ex * (out.y[l] - b.y[i]) - ey * (out.x[l] - b.x[i]));
+            if sk >= 0.0 && next.n < CLIP_CORNERS {
+                next.x[next.n] = out.x[k];
+                next.y[next.n] = out.y[k];
+                next.n += 1;
+            }
+            if (sk >= 0.0) != (sl >= 0.0) && next.n < CLIP_CORNERS {
+                // Where the edge from corner k to corner l crosses b's.
+                let t = sk / (sk - sl);
+                next.x[next.n] = out.x[k] + t * (out.x[l] - out.x[k]);
+                next.y[next.n] = out.y[k] + t * (out.y[l] - out.y[k]);
+                next.n += 1;
+            }
+        }
+        out = next;
+    }
+    return out;
+}
+
+// Whether point (x, y) is inside convex polygon c, its edges included.
+fn in_clip(c: Clip, x: f32, y: f32) -> bool {
+    var area: f32 = 0.0;
+    for i in c.n { let j = (i + 1) % c.n; area += c.x[i] * c.y[j] - c.x[j] * c.y[i]; }
+    let turn: f32 = if area < 0.0 { -1.0 } else { 1.0 };
+    for i in c.n {
+        let j = (i + 1) % c.n;
+        guard turn * ((c.x[j] - c.x[i]) * (y - c.y[i]) - (c.y[j] - c.y[i]) * (x - c.x[i])) >= -0.001 else { return false; }
+    }
+    return true;
 }
 
 // What <use> e draws: the element its href names, unless that holds e or a
@@ -183,7 +274,8 @@ fn holds(d: Doc, t: i32, n: i32) -> bool {
 }
 
 // Shape e, with its points taken to the page by m: filled, then stroked.
-fn draw_shape(V: Drawing&, e: i32, name: const u8[:], m: Affine, p: Inherited, alpha: f32, vw: f32, vh: f32) {
+fn draw_shape(V: Drawing&, e: i32, name: const u8[:], m: Affine, p: Inherited, alpha: f32, vw: f32, vh: f32, clip: Clip) {
+    guard clip.n != 0;
     let start = V.paths.len;
     add_shape(V.d, e, name, m, vw, vh, V.paths);
     guard V.paths.len > start;
@@ -200,20 +292,49 @@ fn draw_shape(V: Drawing&, e: i32, name: const u8[:], m: Affine, p: Inherited, a
     // What a stroke may reach past the points: half its width, four times
     // that at a sharp miter.
     let reach = if sw > 0.0 { sw * (if p.join == K_MITER { 2.0 } else { 1.0 }) } else { 0.0 };
-    let x0, y0, x1, y1 = path_bounds(V.paths[..], start);
-    let ox = x0 - reach;
-    let oy = y0 - reach;
+    let px0, py0, px1, py1 = path_bounds(V.paths[..], start);
+    var ox = px0 - reach;
+    var oy = py0 - reach;
+    var ex = px1 + reach;
+    var ey = py1 + reach;
+    if clip.n > 0 {
+        // Cut where it leaves what nested viewports show; nothing at all
+        // when it is all outside them.
+        var cx0: f32 = clip.x[0];
+        var cy0: f32 = clip.y[0];
+        var cx1: f32 = clip.x[0];
+        var cy1: f32 = clip.y[0];
+        for k in clip.n {
+            cx0 = min(cx0, clip.x[k]);
+            cy0 = min(cy0, clip.y[k]);
+            cx1 = max(cx1, clip.x[k]);
+            cy1 = max(cy1, clip.y[k]);
+        }
+        if ex <= cx0 || ox >= cx1 || ey <= cy0 || oy >= cy1 { V.paths.resize(start); return; }
+        if !(in_clip(clip, ox, oy) && in_clip(clip, ex, oy) && in_clip(clip, ex, ey) && in_clip(clip, ox, ey)) {
+            V.paths.push(PATH_CLIP);
+            V.paths.push(clip.n);
+            for k in clip.n {
+                V.paths.push(clip.x[k]);
+                V.paths.push(clip.y[k]);
+            }
+            ox = max(ox, cx0);
+            oy = max(oy, cy0);
+            ex = min(ex, cx1);
+            ey = min(ey, cy1);
+        }
+    }
     move_path(V.paths[..], start, -ox, -oy);
     let span = (V.paths.len - start) as i32;
     if fills {
-        V.out.push(Painted { start: start as i32, len: span, x: ox, y: oy, w: x1 - x0 + 2.0 * reach, h: y1 - y0 + 2.0 * reach,
+        V.out.push(Painted { start: start as i32, len: span, x: ox, y: oy, w: ex - ox, h: ey - oy,
                              color: fill, stroke: 0.0, flags: if p.rule == K_EVENODD { PATH_EVENODD } else { 0 } });
     }
     if sw > 0.0 {
         var flags: i32 = 0;
         if p.cap == K_ROUND { flags = flags | PATH_CAP_ROUND; } else if p.cap == K_SQUARE { flags = flags | PATH_CAP_SQUARE; }
         if p.join == K_ROUND { flags = flags | PATH_JOIN_ROUND; } else if p.join == K_BEVEL { flags = flags | PATH_JOIN_BEVEL; }
-        V.out.push(Painted { start: start as i32, len: span, x: ox, y: oy, w: x1 - x0 + 2.0 * reach, h: y1 - y0 + 2.0 * reach,
+        V.out.push(Painted { start: start as i32, len: span, x: ox, y: oy, w: ex - ox, h: ey - oy,
                              color: stroke, stroke: sw, flags: flags });
     }
 }
@@ -609,6 +730,7 @@ fn path_bounds(paths: const f32[:], start: i64) -> f32, f32, f32, f32 {
     var k = start;
     while k < paths.len {
         let op = paths[k];
+        if op == PATH_CLIP { break; }
         if op == PATH_CLOSE {
             px = sx;
             py = sy;
@@ -679,16 +801,20 @@ fn bezier(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
     return u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d;
 }
 
-// Moves the points of the path data from `start` on by (dx, dy).
+// Moves the points of the path data from `start` on by (dx, dy), a clip's
+// corners too.
 fn move_path(paths: f32[:], start: i64, dx: f32, dy: f32) {
     var k = start;
     while k < paths.len {
-        let n: i64 = if paths[k] == PATH_CUBIC { 3 } else if paths[k] == PATH_CLOSE { 0 } else { 1 };
+        // A clip's corners come after its count.
+        let clip = paths[k] == PATH_CLIP;
+        let n: i64 = if clip { paths[k + 1] as i64 } else if paths[k] == PATH_CUBIC { 3 } else if paths[k] == PATH_CLOSE { 0 } else { 1 };
+        let at: i64 = if clip { k + 2 } else { k + 1 };
         for j in n {
-            paths[k + 1 + 2 * j] += dx;
-            paths[k + 2 + 2 * j] += dy;
+            paths[at + 2 * j] += dx;
+            paths[at + 1 + 2 * j] += dy;
         }
-        k += 1 + 2 * n;
+        k = at + 2 * n;
     }
 }
 
