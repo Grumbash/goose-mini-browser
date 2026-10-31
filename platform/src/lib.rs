@@ -417,10 +417,11 @@ pub(crate) fn refresh_hz() -> f64 {
     PLATFORM.with(|cell| cell.borrow().as_ref().map_or(0.0, |p| p.refresh_hz))
 }
 
-/// Wakes the main thread's `tp_next_event` with an EV_WAKE carrying `token`.
-/// Safe to call from any thread: a tab worker calls it when a frame is ready.
+/// Wakes the main thread's `tp_next_event` with an EV_WAKE carrying `token`
+/// as its code. Safe to call from any thread: a tab worker calls it when a
+/// frame is ready.
 #[unsafe(no_mangle)]
-pub extern "C" fn tp_wake(token: i64) -> i32 {
+pub extern "C" fn tp_wake(token: i32) -> i32 {
     guarded(|| {
         dispatch2::DispatchQueue::main().exec_async(move || {
             let Some(mtm) = MainThreadMarker::new() else { return };
