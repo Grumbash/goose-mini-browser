@@ -4,6 +4,7 @@
 // idle window draws nothing. The bar at the bottom shows the page's weight.
 //
 //   tusk [page.html]                     open a page (the Focaccia article by default)
+//   tusk snapshot [page.html]            print the page as a tree for agents (docs/adr/0007)
 //   tusk --screenshot out.png [--at Y] [page.html]
 //                                        draw the window offscreen into a PNG; no window opens
 //   tusk --scroll-test [page.html]       scroll the page for 10 s and print frame times
@@ -21,6 +22,7 @@ import engine.dom;
 import engine.html;
 import engine.css;
 import engine.layout;
+import engine.snapshot;
 
 struct Event { kind: i32, code: i32, x: f64, y: f64, w: f64, h: f64 }
 
@@ -65,6 +67,7 @@ let MOD_SHIFT: i64 = 0x20000;
 let MOD_COMMAND: i64 = 0x100000;
 
 let MODE_WINDOW: i32 = 0;
+let MODE_SNAPSHOT: i32 = 1;
 let MODE_SCREENSHOT: i32 = 2;
 let MODE_SCROLL_TEST: i32 = 3;
 let MODE_WAKE_TEST: i32 = 4;
@@ -198,7 +201,7 @@ thread_fn wake_after(ms: i64, token: i32) {
 }
 
 fn usage() {
-    write_stderr("usage: tusk [--screenshot out.png [--at Y] | --scroll-test | --idle-exit MS | --wake-test] [page.html]\n");
+    write_stderr("usage: tusk [snapshot | --screenshot out.png [--at Y] | --scroll-test | --idle-exit MS | --wake-test] [page.html]\n");
     exit(2);
 }
 
@@ -214,9 +217,10 @@ fn main() {
     while i < argv.len {
         let a = argv[i];
         let valued = i + 1 < argv.len;
-        if a == "--scroll-test" || a == "--wake-test" || (a == "--screenshot" && valued) {
+        if a == "snapshot" || a == "--scroll-test" || a == "--wake-test" || (a == "--screenshot" && valued) {
             guard mode == MODE_WINDOW else { usage(); return; }   // one mode a run
-            if a == "--scroll-test" { mode = MODE_SCROLL_TEST; }
+            if a == "snapshot" { mode = MODE_SNAPSHOT; }
+            else if a == "--scroll-test" { mode = MODE_SCROLL_TEST; }
             else if a == "--wake-test" { mode = MODE_WAKE_TEST; idle_exit_ms = 5000; }
             else { mode = MODE_SCREENSHOT; i += 1; shot.append(argv[i]); }
         } else if a == "--at" && valued {
@@ -277,6 +281,10 @@ fn main() {
     cost.measure = ms(t2, t3);
     let bg = background_of(P);
 
+    if mode == MODE_SNAPSHOT {
+        print_snapshot(P, cost, src.len);
+        return;
+    }
     if mode == MODE_SCREENSHOT {
         // Metal is set up before the page is timed, as tp_open does for the
         // window, so paint is the page's cost and not the setup's.
@@ -410,6 +418,36 @@ fn main() {
         write_stderr("tusk: the worker's wake never arrived\n");
         exit(1);
     }
+}
+
+// `tusk snapshot`: the page as a tree on stdout, and what it cost on stderr.
+fn print_snapshot(P: Page, cost: Cost, html_bytes: i64) {
+    var boxes: Rect[>..] = [];
+    var items: DItem[>..] = [];
+    let L = Layout { d: P.d, styles: P.styles, text: P.text, carets: P.carets, runs: P.runs, run_of: P.run_of,
+                     fonts: P.fonts, boxes: boxes, items: items };
+    let t0 = clock_ns();
+    let h = layout_page(L, WINDOW_W);
+    let t1 = clock_ns();
+    var out: u8[>..] = [];
+    let entries = snapshot(L, WINDOW_W, h, out);
+    let t2 = clock_ns();
+    write_stdout(out);
+    var note: u8[>..] = [];
+    format(note, "snapshot: ", entries, " entries, ");
+    format_flt(note, out.len / 1000.0, 1);
+    format(note, " KB from ", (html_bytes + 500) / 1000, " KB of HTML; parse ");
+    format_flt(note, cost.parse, 1);
+    note.append(" + style ");
+    format_flt(note, cost.style, 1);
+    note.append(" + text ");
+    format_flt(note, cost.measure, 1);
+    note.append(" + layout ");
+    format_flt(note, ms(t0, t1), 1);
+    note.append(" + tree ");
+    format_flt(note, ms(t1, t2), 1);
+    note.append(" ms\n");
+    write_stderr(note);
 }
 
 // Scrolls down the page and back for 10 s at a brisk flick's speed, a frame
