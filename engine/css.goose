@@ -68,7 +68,19 @@ let P_Z_INDEX: i32 = 53;
 let P_OVERFLOW_X: i32 = 54;
 let P_OVERFLOW_Y: i32 = 55;
 let P_TEXT_OVERFLOW: i32 = 56;
-let NPROPS: i64 = 57;
+let P_FLEX_DIRECTION: i32 = 57;
+let P_FLEX_WRAP: i32 = 58;
+let P_JUSTIFY_CONTENT: i32 = 59;
+let P_ALIGN_ITEMS: i32 = 60;
+let P_ALIGN_SELF: i32 = 61;
+let P_ALIGN_CONTENT: i32 = 62;
+let P_FLEX_GROW: i32 = 63;
+let P_FLEX_SHRINK: i32 = 64;
+let P_FLEX_BASIS: i32 = 65;
+let P_ORDER: i32 = 66;
+let P_ROW_GAP: i32 = 67;
+let P_COLUMN_GAP: i32 = 68;
+let NPROPS: i64 = 69;
 let P_CUSTOM: i32 = -2;   // a custom property, --name, which the cascade keeps apart
 
 // Kinds of value.
@@ -129,6 +141,22 @@ let K_FIXED: i32 = 38;
 let K_VISIBLE: i32 = 39;
 let K_HIDDEN: i32 = 40;         // overflow: clip, auto and scroll too, since nothing scrolls inside a page yet
 let K_ELLIPSIS: i32 = 41;
+let K_FLEX: i32 = 42;
+let K_ROW: i32 = 43;
+let K_ROW_REVERSE: i32 = 44;
+let K_COLUMN: i32 = 45;
+let K_COLUMN_REVERSE: i32 = 46;
+let K_WRAP: i32 = 47;
+let K_WRAP_REVERSE: i32 = 48;
+let K_FLEX_START: i32 = 49;     // start and self-start too
+let K_FLEX_END: i32 = 50;       // end and self-end too
+let K_SPACE_BETWEEN: i32 = 51;
+let K_SPACE_AROUND: i32 = 52;
+let K_SPACE_EVENLY: i32 = 53;
+let K_STRETCH: i32 = 54;
+let K_CONTENT: i32 = 55;
+let K_INLINE_BLOCK: i32 = 56;
+let K_INLINE_FLEX: i32 = 57;
 
 // Font families, as the platform layer's text functions number them.
 let FAMILY_SANS: i32 = 0;
@@ -241,6 +269,13 @@ struct Style {
     z: i32, z_auto: i32,                 // z-index, and whether it is auto
     clips: i32,                          // bit 0 overflow-x, bit 1 overflow-y isn't visible; either cuts its content at its padding box
     ellipsis: i32,                       // text-overflow: ellipsis
+    // Flex containers: direction, wrap, and how they align their items along and across lines.
+    flex_dir: i32, flex_wrap: i32, justify: i32, align_items: i32, align_content: i32,
+    row_gap: f32, col_gap: f32, gap_pct: i32, // gap_pct: bit 0 row, bit 1 column, percentages
+    // Flex items: align-self, flex-grow, flex-shrink, order, and flex-basis:
+    // basis_kind K_AUTO, K_CONTENT, or 1 for a length, 2 for a percentage.
+    align_self: i32, grow: f32, shrink: f32, order: i32, basis: f32, basis_kind: i32,
+    min_w_auto: i32, min_h_auto: i32,    // min-width and min-height are auto, which a flex item turns into its content's
 }
 
 // One box-shadow. Blurred ones aren't drawn (docs/adr/0010: the interface's
@@ -271,7 +306,11 @@ fn root_style() -> Style {
                    rad_tl: 0.0, rad_tr: 0.0, rad_br: 0.0, rad_bl: 0.0, rad_pct: 0,
                    shadows: [no_shadow(), no_shadow()], shadow_count: 0, opacity: 1.0, alpha: 1.0,
                    position: K_STATIC, top: 0.0, right: 0.0, bottom: 0.0, left: 0.0, inset_auto: 15, inset_pct: 0,
-                   z: 0, z_auto: 1, clips: 0, ellipsis: 0 };
+                   z: 0, z_auto: 1, clips: 0, ellipsis: 0,
+                   flex_dir: K_ROW, flex_wrap: K_NOWRAP, justify: K_NORMAL, align_items: K_NORMAL, align_content: K_NORMAL,
+                   row_gap: 0.0, col_gap: 0.0, gap_pct: 0,
+                   align_self: K_AUTO, grow: 0.0, shrink: 1.0, order: 0, basis: 0.0, basis_kind: K_AUTO,
+                   min_w_auto: 1, min_h_auto: 1 };
 }
 
 // ------------------------------------------------------------------ parsing
@@ -767,6 +806,9 @@ fn longhands(name: const u8[:], out: i32[>..]&) {
     else if name == "border-radius" { out.append([P_RAD_TL, P_RAD_TR, P_RAD_BR, P_RAD_BL]); }
     else if name == "inset" { out.append([P_TOP, P_RIGHT, P_BOTTOM, P_LEFT]); }
     else if name == "overflow" { out.append([P_OVERFLOW_X, P_OVERFLOW_Y]); }
+    else if name == "flex" { out.append([P_FLEX_GROW, P_FLEX_SHRINK, P_FLEX_BASIS]); }
+    else if name == "flex-flow" { out.append([P_FLEX_DIRECTION, P_FLEX_WRAP]); }
+    else if name == "gap" || name == "grid-gap" { out.append([P_ROW_GAP, P_COLUMN_GAP]); }
     else if name == "background" { out.push(P_BG); }
     else if name == "list-style" { out.push(P_LIST); }
     else if name == "text-decoration" || name == "text-decoration-line" { out.push(P_DECO); }
@@ -875,6 +917,42 @@ fn add_font(value: const u8[:], important: i32, out: Decl[>..]&) {
 }
 
 // Whether a word of the font shorthand is its size: a length, or a size keyword.
+// The flex shorthand (CSS Flexbox 1 §7.1): none is 0 0 auto, auto 1 1 auto,
+// initial 0 1 auto; otherwise a grow and a shrink factor and a basis, any of
+// them left out: a number alone means a basis of 0%, which in a column of
+// auto height is its content's size, as browsers have it.
+fn add_flex(value: const u8[:], important: i32, out: Decl[>..]&) {
+    var grow: f64 = 1.0;
+    var shrink: f64 = 1.0;
+    var basis: u8[>..] = [];
+    basis.append("0%");
+    if value == "none" || value == "auto" || value == "initial" {
+        grow = if value == "auto" { 1.0 } else { 0.0 };
+        shrink = if value == "none" { 0.0 } else { 1.0 };
+        basis.clear();
+        basis.append("auto");
+    } else {
+        var numbers = 0;
+        each_word(value) {
+            let n, is_number = parse_flt(it);
+            if is_number && numbers < 2 && (it[it.len - 1] < 'a' || it[it.len - 1] > 'z') && it[it.len - 1] != '%' {
+                if numbers == 0 { grow = n; } else { shrink = n; }
+                numbers += 1;
+            } else {
+                basis.clear();
+                basis.append(it);
+            }
+        };
+    }
+    var number: u8[>..] = [];
+    format_flt(number, grow, 4);
+    add_value(P_FLEX_GROW, number[..], important, out);
+    number.clear();
+    format_flt(number, shrink, 4);
+    add_value(P_FLEX_SHRINK, number[..], important, out);
+    add_value(P_FLEX_BASIS, basis[..], important, out);
+}
+
 fn is_font_size(w: const u8[:]) -> bool {
     if w == "xx-small" || w == "x-small" || w == "small" || w == "medium" || w == "large" || w == "x-large"
         || w == "xx-large" || w == "smaller" || w == "larger" { return true; }
@@ -943,6 +1021,23 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
             else if name == "border-color" { add_value(side_prop(side, P_BT_COLOR, P_BR_COLOR, P_BB_COLOR, P_BL_COLOR), v, important, out); }
             else { add_value(side_prop(side, P_RAD_TL, P_RAD_TR, P_RAD_BR, P_RAD_BL), v, important, out); }
         }
+        return;
+    }
+    if name == "flex" { add_flex(value, important, out); return; }
+    if name == "flex-flow" {
+        each_word(value) {
+            let k = keyword(it);
+            if k == K_ROW || k == K_ROW_REVERSE || k == K_COLUMN || k == K_COLUMN_REVERSE { add_value(P_FLEX_DIRECTION, it, important, out); }
+            else if k == K_NOWRAP || k == K_WRAP || k == K_WRAP_REVERSE { add_value(P_FLEX_WRAP, it, important, out); }
+        };
+        return;
+    }
+    if name == "gap" || name == "grid-gap" {
+        // row, then column; one value is both.
+        let parts = words(value);
+        guard parts.len >= 1 && parts.len <= 2;
+        add_value(P_ROW_GAP, parts[0], important, out);
+        add_value(P_COLUMN_GAP, parts[parts.len - 1], important, out);
         return;
     }
     if name == "inset" || name == "overflow" {
@@ -1070,6 +1165,14 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
         push_decl(out, d);
         return;
     }
+    if prop == P_FLEX_GROW || prop == P_FLEX_SHRINK || prop == P_ORDER {
+        let n, ok = parse_flt(value);
+        guard ok && n >= (if prop == P_ORDER { -1000000.0 } else { 0.0 }) && n <= 1000000.0;
+        d.kind = V_NUMBER;
+        d.num = n as f32;
+        push_decl(out, d);
+        return;
+    }
     if prop == P_Z_INDEX {
         let n, ok = parse_int(value);
         if ok { d.kind = V_NUMBER; d.num = clamp(n, -1000000000, 1000000000); push_decl(out, d); return; }
@@ -1167,6 +1270,12 @@ fn property_id(n: const u8[:]) -> i32 {
     if n == "bottom" { return P_BOTTOM; } if n == "left" { return P_LEFT; }
     if n == "overflow-x" { return P_OVERFLOW_X; } if n == "overflow-y" { return P_OVERFLOW_Y; }
     if n == "text-overflow" { return P_TEXT_OVERFLOW; }
+    if n == "flex-direction" { return P_FLEX_DIRECTION; } if n == "flex-wrap" { return P_FLEX_WRAP; }
+    if n == "justify-content" { return P_JUSTIFY_CONTENT; } if n == "align-items" { return P_ALIGN_ITEMS; }
+    if n == "align-self" { return P_ALIGN_SELF; } if n == "align-content" { return P_ALIGN_CONTENT; }
+    if n == "flex-grow" { return P_FLEX_GROW; } if n == "flex-shrink" { return P_FLEX_SHRINK; }
+    if n == "flex-basis" { return P_FLEX_BASIS; } if n == "order" { return P_ORDER; }
+    if n == "row-gap" || n == "grid-row-gap" { return P_ROW_GAP; } if n == "column-gap" || n == "grid-column-gap" { return P_COLUMN_GAP; }
     return -1;
 }
 
@@ -1188,9 +1297,16 @@ fn keyword(v: const u8[:]) -> i32 {
     if v == "static" { return K_STATIC; } if v == "relative" || v == "sticky" { return K_RELATIVE; }
     if v == "absolute" { return K_ABSOLUTE; } if v == "fixed" { return K_FIXED; } if v == "visible" { return K_VISIBLE; }
     if v == "hidden" || v == "clip" || v == "scroll" { return K_HIDDEN; } if v == "ellipsis" { return K_ELLIPSIS; }
-    // Display values we lay out as one of the three we know.
-    if v == "inline-block" || v == "inline-flex" || v == "inline-grid" || v == "inline-table" || v == "table-cell" { return K_INLINE; }
-    if v == "flex" || v == "grid" || v == "table" || v == "table-row" || v == "table-row-group" || v == "table-header-group"
+    if v == "flex" { return K_FLEX; } if v == "row" { return K_ROW; } if v == "row-reverse" { return K_ROW_REVERSE; }
+    if v == "column" { return K_COLUMN; } if v == "column-reverse" { return K_COLUMN_REVERSE; }
+    if v == "wrap" { return K_WRAP; } if v == "wrap-reverse" { return K_WRAP_REVERSE; }
+    if v == "flex-start" || v == "self-start" { return K_FLEX_START; } if v == "flex-end" || v == "self-end" { return K_FLEX_END; }
+    if v == "space-between" { return K_SPACE_BETWEEN; } if v == "space-around" { return K_SPACE_AROUND; }
+    if v == "space-evenly" { return K_SPACE_EVENLY; } if v == "stretch" { return K_STRETCH; } if v == "content" { return K_CONTENT; }
+    if v == "inline-block" { return K_INLINE_BLOCK; } if v == "inline-flex" { return K_INLINE_FLEX; }
+    // Display values we lay out as one of those we know.
+    if v == "inline-grid" || v == "inline-table" || v == "table-cell" { return K_INLINE; }
+    if v == "grid" || v == "table" || v == "table-row" || v == "table-row-group" || v == "table-header-group"
         || v == "table-footer-group" || v == "table-caption" || v == "flow-root" || v == "contents" { return K_BLOCK; }
     return -1;
 }
@@ -1651,8 +1767,13 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> St
     if s.bb_style == K_NONE { s.bb = 0.0; }
     if s.bl_style == K_NONE { s.bl = 0.0; }
     s.alpha = parent.alpha * s.opacity;
-    // An absolute or fixed box is a block, whatever its display (CSS 2.2 §9.7).
-    if (s.position == K_ABSOLUTE || s.position == K_FIXED) && s.display == K_INLINE { s.display = K_BLOCK; }
+    // An absolute or fixed box is a block, whatever its display (CSS 2.2 §9.7),
+    // and so is a flex item (CSS Flexbox 1 §4): inline and inline-block
+    // become block, inline-flex flex.
+    if s.position == K_ABSOLUTE || s.position == K_FIXED || parent.display == K_FLEX || parent.display == K_INLINE_FLEX {
+        if s.display == K_INLINE || s.display == K_INLINE_BLOCK { s.display = K_BLOCK; }
+        else if s.display == K_INLINE_FLEX { s.display = K_FLEX; }
+    }
     w.customs.resize(mark);
     w.prio.resize(mark);
     return s;
@@ -1994,7 +2115,10 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
     let p = dc.prop;
     if dc.kind == V_INHERIT { inherit_value(s, parent, p); return; }
     let k = dc.num as i32;
-    if p == P_DISPLAY { if dc.kind == V_KEYWORD && (k == K_NONE || k == K_BLOCK || k == K_INLINE || k == K_LIST_ITEM) { s.display = k; } }
+    if p == P_DISPLAY {
+        if dc.kind == V_KEYWORD && (k == K_NONE || k == K_BLOCK || k == K_INLINE || k == K_LIST_ITEM || k == K_FLEX
+                                    || k == K_INLINE_BLOCK || k == K_INLINE_FLEX) { s.display = k; }
+    }
     else if p == P_COLOR { s.color = if dc.color == CURRENT_COLOR { parent.color } else { dc.color }; }
     else if p == P_BG { s.bg = if dc.color == CURRENT_COLOR { s.color } else { dc.color }; }
     else if p == P_FONT_SIZE {
@@ -2053,8 +2177,8 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
         var pct: f32 = -1.0;
         if dc.kind == V_LENGTH { if dc.unit == U_PCT { pct = dc.num; v = -1.0; } else { v = max(px(dc, s, parent), 0.0); } }
         if p == P_HEIGHT { s.height = v; s.height_pct = pct; }
-        else if p == P_MIN_WIDTH { s.min_width = max(v, 0.0); s.min_width_pct = pct; }
-        else if p == P_MIN_HEIGHT { s.min_height = max(v, 0.0); s.min_height_pct = pct; }
+        else if p == P_MIN_WIDTH { s.min_width = max(v, 0.0); s.min_width_pct = pct; s.min_w_auto = if dc.kind == V_LENGTH { 0 } else { 1 }; }
+        else if p == P_MIN_HEIGHT { s.min_height = max(v, 0.0); s.min_height_pct = pct; s.min_h_auto = if dc.kind == V_LENGTH { 0 } else { 1 }; }
         else { s.max_height = v; s.max_height_pct = pct; }
     }
     else if p == P_BOX_SIZING { s.border_box = if k == K_BORDER_BOX { 1 } else { 0 }; }
@@ -2101,6 +2225,33 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
         s.clips = if k == K_HIDDEN || k == K_AUTO { s.clips | bit } else { s.clips & ~bit };
     }
     else if p == P_TEXT_OVERFLOW { s.ellipsis = if k == K_ELLIPSIS { 1 } else { 0 }; }
+    else if p == P_FLEX_DIRECTION { if k == K_ROW || k == K_ROW_REVERSE || k == K_COLUMN || k == K_COLUMN_REVERSE { s.flex_dir = k; } }
+    else if p == P_FLEX_WRAP { if k == K_NOWRAP || k == K_WRAP || k == K_WRAP_REVERSE { s.flex_wrap = k; } }
+    else if p == P_JUSTIFY_CONTENT || p == P_ALIGN_ITEMS || p == P_ALIGN_SELF || p == P_ALIGN_CONTENT {
+        // start and end (which text-align calls left and right) are flex-start and flex-end here.
+        let a = if k == K_LEFT { K_FLEX_START } else if k == K_RIGHT { K_FLEX_END } else { k };
+        guard dc.kind == V_KEYWORD && (a == K_NORMAL || a == K_FLEX_START || a == K_FLEX_END || a == K_CENTER || a == K_STRETCH
+              || a == K_BASELINE || a == K_SPACE_BETWEEN || a == K_SPACE_AROUND || a == K_SPACE_EVENLY || a == K_AUTO) else { return; }
+        if p == P_JUSTIFY_CONTENT { s.justify = a; } else if p == P_ALIGN_ITEMS { s.align_items = a; }
+        else if p == P_ALIGN_SELF { s.align_self = a; } else { s.align_content = a; }
+    }
+    else if p == P_FLEX_GROW { s.grow = dc.num; }
+    else if p == P_FLEX_SHRINK { s.shrink = dc.num; }
+    else if p == P_ORDER { s.order = dc.num as i32; }
+    else if p == P_FLEX_BASIS {
+        if dc.kind == V_LENGTH {
+            s.basis_kind = if dc.unit == U_PCT { 2 } else { 1 };
+            s.basis = if dc.unit == U_PCT { dc.num } else { max(px(dc, s, parent), 0.0) };
+        } else {
+            s.basis_kind = if k == K_CONTENT { K_CONTENT } else { K_AUTO };
+        }
+    }
+    else if p == P_ROW_GAP || p == P_COLUMN_GAP {
+        let bit: i32 = if p == P_ROW_GAP { 1 } else { 2 };
+        let v = if dc.kind == V_LENGTH { if dc.unit == U_PCT { dc.num } else { max(px(dc, s, parent), 0.0) } } else { 0.0 };
+        if p == P_ROW_GAP { s.row_gap = v; } else { s.col_gap = v; }
+        s.gap_pct = if dc.kind == V_LENGTH && dc.unit == U_PCT { s.gap_pct | bit } else { s.gap_pct & ~bit };
+    }
 }
 
 // ------------------------------------------------------------------ Tusk's own style sheet
