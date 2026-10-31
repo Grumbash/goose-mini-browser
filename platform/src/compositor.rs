@@ -30,11 +30,19 @@ use crate::{ERR_ARGUMENT, ERR_METAL, ERR_NO_DEVICE, ERR_NOT_MAIN_THREAD, GSlice,
 // Display item kinds; engine/layout.goose mirrors these numbers.
 pub const ITEM_RECT: i32 = 1;
 pub const ITEM_TEXT: i32 = 2;
+pub const ITEM_BOX: i32 = 3;
+
+// A box item's border style.
+pub const BORDER_SOLID: i32 = 0;
+pub const BORDER_DASHED: i32 = 1;
 
 const LAYERS: usize = 2; // 0: the page, scrolled; 1: the overlay, fixed
 
 /// One display item, laid out as Goose's `struct DItem`: positions in points,
-/// a text item's y on its baseline and its text a span of the text buffer.
+/// a text item's y on its baseline and its text a span of the text buffer. A
+/// box is a rectangle with rounded corners (radii from the top left,
+/// clockwise) filled with `color`, and borders inside its edge in one colour
+/// and style: `border` points wide at the top, the others as they say.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct DItem {
@@ -49,16 +57,33 @@ pub struct DItem {
     pub text: i32,
     pub text_len: i32,
     pub node: i32,
+    pub rad_tl: f32,
+    pub rad_tr: f32,
+    pub rad_br: f32,
+    pub rad_bl: f32,
+    pub border: f32,
+    pub border_color: u32,
+    pub border_style: i32,
+    pub border_right: f32,
+    pub border_bottom: f32,
+    pub border_left: f32,
 }
 
 /// One quad, in device pixels: solid when `uv[2]` is 0, otherwise the atlas
-/// mask at `uv` (in texels) times `color`, which is premultiplied.
+/// mask at `uv` (in texels) times `color`, which is premultiplied. A box
+/// (`border[2]` 1) is drawn by distance from its rounded edge: `radii` from
+/// the top left, clockwise, and borders `widths` wide (top, right, bottom,
+/// left) in `border_color`, dashed when `border[1]` is 1, over its fill.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Instance {
     pub rect: [f32; 4],
     pub uv: [f32; 4],
     pub color: [f32; 4],
+    pub radii: [f32; 4],
+    pub border: [f32; 4],
+    pub border_color: [f32; 4],
+    pub widths: [f32; 4],
 }
 
 #[repr(C)]
@@ -71,9 +96,13 @@ const SHADERS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-struct Instance { float4 rect; float4 uv; float4 color; };
+struct Instance { float4 rect; float4 uv; float4 color; float4 radii; float4 border; float4 border_color; float4 widths; };
 struct Uniforms { float2 viewport; float2 scroll; };
-struct Out { float4 position [[position]]; float2 uv; float4 color; float textured; };
+struct Out {
+    float4 position [[position]];
+    float2 uv; float4 color; float textured;
+    float2 local; float2 size; float4 radii; float4 border; float4 border_color; float4 widths;
+};
 
 vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
                        const device Instance* instances [[buffer(0)]],
@@ -86,7 +115,24 @@ vertex Out quad_vertex(uint v [[vertex_id]], uint i [[instance_id]],
     o.uv = q.uv.xy + corner * q.uv.zw;
     o.color = q.color;
     o.textured = q.uv.z > 0.0 ? 1.0 : 0.0;
+    o.local = corner * q.rect.zw;
+    o.size = q.rect.zw;
+    o.radii = q.radii;
+    o.border = q.border;
+    o.border_color = q.border_color;
+    o.widths = q.widths;
     return o;
+}
+
+// The signed distance from p (from the top left) to the edge of a rectangle
+// `size` big with corner radii r (top left, top right, bottom right, bottom
+// left): negative inside.
+float rounded_rect(float2 p, float2 size, float4 r) {
+    float2 half_size = size * 0.5;
+    float2 c = p - half_size;
+    float rad = c.x < 0.0 ? (c.y < 0.0 ? r.x : r.w) : (c.y < 0.0 ? r.y : r.z);
+    float2 q = abs(c) - half_size + rad;
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - rad;
 }
 
 fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[texture(0)]]) {
@@ -94,7 +140,38 @@ fragment float4 quad_fragment(Out in [[stage_in]], texture2d<float> atlas [[text
         constexpr sampler s(coord::pixel, filter::nearest, address::clamp_to_edge);
         return in.color * atlas.sample(s, in.uv).r;
     }
-    return in.color;
+    if (in.border.z < 0.5) {
+        return in.color;
+    }
+    // A box: covered inside its rounded edge, its borders between that edge
+    // and the padding edge (each side's width in, corners less the wider
+    // border), each blended over a pixel.
+    float d = rounded_rect(in.local, in.size, in.radii);
+    float outer = clamp(0.5 - d, 0.0, 1.0);
+    float4 w = in.widths;
+    if (max(max(w.x, w.y), max(w.z, w.w)) <= 0.0) {
+        return in.color * outer;
+    }
+    float2 inner_size = in.size - float2(w.w + w.y, w.x + w.z);
+    float4 inner_radii = max(in.radii - float4(max(w.x, w.w), max(w.x, w.y), max(w.z, w.y), max(w.z, w.w)), 0.0);
+    float inner = 0.0;
+    if (inner_size.x > 0.0 && inner_size.y > 0.0) {
+        inner = clamp(0.5 - rounded_rect(in.local - float2(w.w, w.x), inner_size, inner_radii), 0.0, 1.0);
+    }
+    float ring = max(outer - inner, 0.0);
+    float dash = 1.0;
+    if (in.border.y > 0.5) {
+        // Dashes along the nearest edge, three of its widths long, gaps as long.
+        float2 p = in.local;
+        bool side = min(p.x, in.size.x - p.x) < min(p.y, in.size.y - p.y);
+        float along = side ? p.y : p.x;
+        float width = side ? (p.x < in.size.x * 0.5 ? w.w : w.y) : (p.y < in.size.y * 0.5 ? w.x : w.z);
+        float len = max(width * 3.0, 4.0);
+        dash = fmod(along, len * 2.0) < len ? 1.0 : 0.0;
+    }
+    // The fill runs under the borders: it shows through a translucent one
+    // and between dashes.
+    return in.border_color * (ring * dash) + in.color * (inner + ring * (1.0 - in.border_color.a * dash));
 }
 "#;
 
@@ -441,9 +518,20 @@ fn premultiplied(c: u32) -> [f32; 4] {
     [channel(16), channel(8), channel(0), a]
 }
 
+/// The rectangle of an item at `scale`, in device pixels, its edges on whole
+/// pixels; a hairline still shows, never less than one pixel.
+fn snapped(x: f32, y: f32, w: f32, h: f32, scale: f64) -> [f32; 4] {
+    let x0 = (x as f64 * scale).round();
+    let y0 = (y as f64 * scale).round();
+    let x1 = ((x + w) as f64 * scale).round().max(x0 + 1.0);
+    let y1 = ((y + h) as f64 * scale).round().max(y0 + 1.0);
+    [x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32]
+}
+
 /// Turns display items into instances at `scale` device pixels per point. Rect
-/// edges snap to whole pixels; each glyph goes to the whole pixel left of its
-/// pen position, with the rest taken by one of the atlas's subpixel phases.
+/// and box edges snap to whole pixels; each glyph goes to the whole pixel left
+/// of its pen position, with the rest taken by one of the atlas's subpixel
+/// phases.
 pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut Vec<Instance>) {
     let mut glyphs = Vec::new();
     for &item in items {
@@ -465,15 +553,49 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
             if !(w > 0.0 && h > 0.0) {
                 continue;
             }
-            let x0 = (x as f64 * scale).round();
-            let y0 = (y as f64 * scale).round();
-            // A hairline still shows: never less than one device pixel.
-            let x1 = ((x + w) as f64 * scale).round().max(x0 + 1.0);
-            let y1 = ((y + h) as f64 * scale).round().max(y0 + 1.0);
             out.push(Instance {
-                rect: [x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32],
+                rect: snapped(x, y, w, h, scale),
+                color,
+                ..Default::default()
+            });
+        } else if kind == ITEM_BOX {
+            if !(w > 0.0 && h > 0.0) {
+                continue;
+            }
+            let s = scale as f32;
+            let DItem {
+                rad_tl,
+                rad_tr,
+                rad_br,
+                rad_bl,
+                border,
+                border_color,
+                border_style,
+                border_right,
+                border_bottom,
+                border_left,
+                ..
+            } = item;
+            // A border thinner than a device pixel still shows, one pixel wide.
+            let width = |b: f32| if b > 0.0 { (b * s).max(1.0) } else { 0.0 };
+            let dashed = if border_style == BORDER_DASHED {
+                1.0
+            } else {
+                0.0
+            };
+            out.push(Instance {
+                rect: snapped(x, y, w, h, scale),
                 uv: [0.0; 4],
                 color,
+                radii: [rad_tl * s, rad_tr * s, rad_br * s, rad_bl * s],
+                border: [0.0, dashed, 1.0, 0.0],
+                border_color: premultiplied(border_color),
+                widths: [
+                    width(border),
+                    width(border_right),
+                    width(border_bottom),
+                    width(border_left),
+                ],
             });
         } else if kind == ITEM_TEXT {
             let (Ok(start), Ok(len)) = (usize::try_from(start), usize::try_from(text_len)) else {
@@ -512,6 +634,7 @@ pub fn build(items: &[DItem], text: &[u8], scale: f64, t: &mut Text, out: &mut V
                     ],
                     uv: [e.x as f32, e.y as f32, e.w as f32, e.h as f32],
                     color,
+                    ..Default::default()
                 });
             }
         }
@@ -688,11 +811,166 @@ mod tests {
         }
     }
 
+    /// A box: `w` × `h` points at (x, y), every corner rounded by `radius`,
+    /// with a border `border` wide.
+    #[allow(clippy::too_many_arguments)]
+    fn boxed(
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: u32,
+        radius: f32,
+        border: f32,
+        border_color: u32,
+        style: i32,
+    ) -> DItem {
+        DItem {
+            kind: ITEM_BOX,
+            x,
+            y,
+            w,
+            h,
+            color,
+            rad_tl: radius,
+            rad_tr: radius,
+            rad_br: radius,
+            rad_bl: radius,
+            border,
+            border_color,
+            border_style: style,
+            border_right: border,
+            border_bottom: border,
+            border_left: border,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn items_match_the_goose_layout() {
-        assert_eq!(std::mem::size_of::<DItem>(), 44);
+        assert_eq!(std::mem::size_of::<DItem>(), 84);
         assert_eq!(std::mem::align_of::<DItem>(), 1);
         assert_eq!(std::mem::size_of::<GpFrameStats>(), 28);
+        // The shader reads instances as seven float4s.
+        assert_eq!(std::mem::size_of::<Instance>(), 112);
+    }
+
+    /// The BGRA pixels of `items` drawn offscreen on white, `w` × `h` at one
+    /// pixel a point; None without a Metal device.
+    fn drawn(items: &[DItem], w: usize, h: usize) -> Option<Vec<u8>> {
+        MTLCreateSystemDefaultDevice()?;
+        let pixels = with_compositor(|c| {
+            c.set_layer(0, items, b"", 1.0)?;
+            c.set_layer(1, &[], b"", 1.0)?;
+            c.render_pixels(w, h, 0.0, 0xFFFF_FFFF)
+        })
+        .unwrap();
+        Some(pixels)
+    }
+
+    #[test]
+    fn boxes_round_their_corners_and_draw_their_borders() {
+        // A circle 16 across, red, with a blue border 2 wide.
+        let item = boxed(
+            0.0,
+            0.0,
+            16.0,
+            16.0,
+            0xFFFF_0000,
+            8.0,
+            2.0,
+            0xFF00_00FF,
+            BORDER_SOLID,
+        );
+        let Some(p) = drawn(&[item], 16, 16) else {
+            eprintln!("no Metal device here: boxes aren't checked");
+            return;
+        };
+        let at = |x: usize, y: usize| &p[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4];
+        assert_eq!(at(0, 0), [255, 255, 255, 255]); // outside the circle: the background
+        assert_eq!(at(15, 15), [255, 255, 255, 255]);
+        assert_eq!(at(8, 8), [0, 0, 255, 255]); // the middle: the fill (BGRA)
+        let edge = at(8, 0); // on the top edge: the border
+        assert!(edge[0] > 200 && edge[2] < 60, "{edge:?}");
+    }
+
+    #[test]
+    fn dashed_borders_alternate_along_an_edge() {
+        // 40 × 10, no fill, a dashed border 2 wide: dashes 6 long, gaps 6.
+        let item = boxed(
+            0.0,
+            0.0,
+            40.0,
+            10.0,
+            0,
+            0.0,
+            2.0,
+            0xFF00_0000,
+            BORDER_DASHED,
+        );
+        let Some(p) = drawn(&[item], 40, 10) else {
+            eprintln!("no Metal device here: dashes aren't checked");
+            return;
+        };
+        let at = |x: usize, y: usize| &p[(y * 40 + x) * 4..(y * 40 + x) * 4 + 4];
+        assert_eq!(at(14, 0), [0, 0, 0, 255]); // a dash
+        assert_eq!(at(20, 0), [255, 255, 255, 255]); // a gap
+        assert_eq!(at(20, 5), [255, 255, 255, 255]); // inside: no fill
+    }
+
+    #[test]
+    fn dashes_run_along_the_nearest_edge() {
+        // 60 × 6, dashed 2 wide: dashes 6 long. Near the end of a long edge the
+        // dashes still run along it (x 55 is in a gap), not down the short one.
+        let item = boxed(0.0, 0.0, 60.0, 6.0, 0, 0.0, 2.0, 0xFF00_0000, BORDER_DASHED);
+        let Some(p) = drawn(&[item], 60, 6) else {
+            eprintln!("no Metal device here: dashes aren't checked");
+            return;
+        };
+        let at = |x: usize, y: usize| &p[(y * 60 + x) * 4..(y * 60 + x) * 4 + 4];
+        assert_eq!(at(55, 0), [255, 255, 255, 255]); // a gap
+        assert_eq!(at(50, 0), [0, 0, 0, 255]); // a dash
+        assert_eq!(at(0, 3), [0, 0, 0, 255]); // the short side, a dash
+    }
+
+    #[test]
+    fn borders_differ_by_side_and_the_fill_runs_under_them() {
+        // A tab: red, top corners rounded 8, blue borders 2 wide except along
+        // the bottom. Then a square of red under a half-transparent blue border.
+        let mut tab = boxed(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            0xFFFF_0000,
+            8.0,
+            2.0,
+            0xFF00_00FF,
+            BORDER_SOLID,
+        );
+        (tab.rad_br, tab.rad_bl, tab.border_bottom) = (0.0, 0.0, 0.0);
+        let under = boxed(
+            20.0,
+            0.0,
+            10.0,
+            10.0,
+            0xFFFF_0000,
+            0.0,
+            2.0,
+            0x8000_00FF,
+            BORDER_SOLID,
+        );
+        let Some(p) = drawn(&[tab, under], 30, 20) else {
+            eprintln!("no Metal device here: borders aren't checked");
+            return;
+        };
+        let at = |x: usize, y: usize| &p[(y * 30 + x) * 4..(y * 30 + x) * 4 + 4];
+        assert_eq!(at(0, 0), [255, 255, 255, 255]); // the rounded corner, away
+        assert_eq!(at(10, 0), [255, 0, 0, 255]); // the top border, blue (BGRA)
+        assert_eq!(at(10, 19), [0, 0, 255, 255]); // no bottom border: the fill
+        assert_eq!(at(0, 19), [255, 0, 0, 255]); // the left border, square below
+        let both = at(20, 5); // red under half blue
+        assert!(both[0] > 100 && both[2] > 100 && both[1] < 30, "{both:?}");
     }
 
     #[test]
