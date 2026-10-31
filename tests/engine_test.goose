@@ -69,7 +69,11 @@ fn test_html() {
 }
 
 // The computed style of the first element called `name`, as text.
-fn style_of(src: const u8[:], name: const u8[:]) -> u8[>..] {
+fn style_of(src: const u8[:], name: const u8[:]) -> u8[>..] { return style_at(src, name, 0, false); }
+
+// The computed style of the k-th element (from 0) called `name`: what
+// style_of shows, or its font when `font`.
+fn style_at(src: const u8[:], name: const u8[:], k: i64, font: bool) -> u8[>..] {
     var nodes: Node[>..] = [];
     var attrs: Attr[>..] = [];
     var bytes: u8[>..] = [];
@@ -80,27 +84,239 @@ fn style_of(src: const u8[:], name: const u8[:]) -> u8[>..] {
     var classes: Span[>..] = [];
     var decls: Decl[>..] = [];
     var sbytes: u8[>..] = [];
-    let sh = Sheet { rules: rules, comps: comps, classes: classes, decls: decls, bytes: sbytes };
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
     var out: u8[>..] = [];
+    var seen: i64 = 0;
     for n, i in nodes {
-        if n.kind == NODE_ELEMENT && node_name(d, i as i32) == name {
-            let st = styles[i];
-            format(out, "display=", st.display, " size=");
+        guard n.kind == NODE_ELEMENT && node_name(d, i as i32) == name else { continue; }
+        if seen < k { seen += 1; continue; }
+        let st = styles[i];
+        if font {
+            format(out, "italic=", st.italic, " bold=", st.bold, " size=");
             format_flt(out, st.font_size, 1);
-            format(out, " bold=", st.bold, " italic=", st.italic, " color=");
-            format_uint(out, st.color, 16, 8, '0');
-            out.append(" mt=");
-            format_flt(out, st.mt, 1);
-            out.append(" ml=");
-            format_flt(out, st.ml, 1);
-            format(out, " auto_ml=", st.auto_ml);
+            out.append(" lh=");
+            format_flt(out, line_height(st), 1);
+            format(out, " family=", st.family);
             return out;
         }
+        format(out, "display=", st.display, " size=");
+        format_flt(out, st.font_size, 1);
+        format(out, " bold=", st.bold, " italic=", st.italic, " color=");
+        format_uint(out, st.color, 16, 8, '0');
+        out.append(" mt=");
+        format_flt(out, st.mt, 1);
+        out.append(" ml=");
+        format_flt(out, st.ml, 1);
+        format(out, " auto_ml=", st.auto_ml);
+        return out;
     }
     return out;
+}
+
+// Element `name`'s display and color once styled again, into a fresh array,
+// as a document styled a second time is.
+fn restyled(src: const u8[:], name: const u8[:]) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes };
+    load_sheets(d, sh);
+    var first: Style[>..] = [];
+    compute_styles(d, sh, first);
+    var styles: Style[>..] = [];
+    compute_styles(d, sh, styles);
+    var out: u8[>..] = [];
+    for n, i in nodes {
+        guard n.kind == NODE_ELEMENT && node_name(d, i as i32) == name else { continue; }
+        format(out, "display=", styles[i].display, " color=");
+        format_uint(out, styles[i].color, 16, 8, '0');
+        return out;
+    }
+    return out;
+}
+
+// How many bytes of substituted custom properties styling `src` keeps.
+fn var_bytes_of(src: const u8[:]) -> i64 {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes };
+    load_sheets(d, sh);
+    var styles: Style[>..] = [];
+    compute_styles(d, sh, styles);
+    return var_bytes.len;
+}
+
+// The tree under <body> once styled: the ::before and ::after the cascade
+// made are in it.
+fn styled_tree(src: const u8[:]) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes };
+    load_sheets(d, sh);
+    var styles: Style[>..] = [];
+    compute_styles(d, sh, styles);
+    compute_styles(d, sh, styles);           // styled twice, nothing is made twice
+    var out: u8[>..] = [];
+    dump_tree(d, 3, 0, out);                 // node 3 is <body>
+    return out;
+}
+
+fn test_css_interface() {
+    // Variables: from :root, in a shorthand, a fallback, a missing one (the
+    // property inherits), one through another, a cycle (the fallback), and
+    // an ancestor's own overriding the root's.
+    let vars = """
+        <style>:root { --fg: #ff0000; --gap: 6px; --a: var(--b); --b: #00ff00; --x: var(--y); --y: var(--x) }
+        p { color: var(--fg); margin: var(--gap) 0 } b { color: var(--nope, #0000ff) } i { color: var(--nope) }
+        em { color: var(--a) } u { color: var(--x, #123456) } div { --fg: #00ffff }</style>
+        <p>x <b>b</b> <i>i</i> <em>e</em> <u>u</u></p><div><p>inner</p></div>
+        """;
+    check("var() from :root, in the margin shorthand too",
+          style_at(vars, "p", 0, false), "display=1 size=17.0 bold=0 italic=0 color=ffff0000 mt=6.0 ml=0.0 auto_ml=0");
+    check("var() falls back", style_at(vars, "b", 0, false), "display=2 size=17.0 bold=1 italic=0 color=ff0000ff mt=0.0 ml=0.0 auto_ml=0");
+    check("a missing variable leaves the property inherited",
+          style_at(vars, "i", 0, false), "display=2 size=17.0 bold=0 italic=1 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check("a variable through another", style_at(vars, "em", 0, false), "display=2 size=17.0 bold=0 italic=1 color=ff00ff00 mt=0.0 ml=0.0 auto_ml=0");
+    check("a cycle takes the fallback", style_at(vars, "u", 0, false), "display=2 size=17.0 bold=0 italic=0 color=ff123456 mt=0.0 ml=0.0 auto_ml=0");
+    check("an ancestor's variable overrides the root's",
+          style_at(vars, "p", 1, false), "display=1 size=17.0 bold=0 italic=0 color=ff00ffff mt=6.0 ml=0.0 auto_ml=0");
+
+    // As CSS has them: a chain longer than eight, every property in a cycle
+    // invalid (so the var()'s own fallback, not the one inside the cycle),
+    // inherit and initial, and var( in a string, which is only text.
+    let rules = """
+        <style>:root { --c1: var(--c2); --c2: var(--c3); --c3: var(--c4); --c4: var(--c5); --c5: var(--c6);
+        --c6: var(--c7); --c7: var(--c8); --c8: var(--c9); --c9: #ff0000; --a: var(--b, #00ff00); --b: var(--a); --i: 7px }
+        p { color: var(--c1) } b { color: var(--a, #0000ff) } i { --i: inherit; margin-left: var(--i) }
+        em { --i: initial; margin-left: var(--i, 2px) } u::before { content: "var(--i)" }</style>
+        <p>x <b>b</b> <i>i</i> <em>e</em> <u>u</u></p>
+        """;
+    check("a chain of nine variables", style_at(rules, "p", 0, false), "display=1 size=17.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check("a cycle makes all of its variables invalid",
+          style_at(rules, "b", 0, false), "display=2 size=17.0 bold=1 italic=0 color=ff0000ff mt=0.0 ml=0.0 auto_ml=0");
+    check("inherit takes the parent's variable", style_at(rules, "i", 0, false), "display=2 size=17.0 bold=0 italic=1 color=ffff0000 mt=0.0 ml=7.0 auto_ml=0");
+    check("initial makes a variable invalid", style_at(rules, "em", 0, false), "display=2 size=17.0 bold=0 italic=1 color=ffff0000 mt=0.0 ml=2.0 auto_ml=0");
+    check("var( in a string is text", styled_tree("""<style>:root { --i: 7px } u::before { content: "var(--i)" }</style><u>u</u>"""),
+          "body\n  u\n    ::before\n      \"var(--i)\"\n    \"u\"\n");
+
+    // Each variable using the one before ten times: from the fifth on they pass
+    // the cap and are invalid, so styling stays small.
+    var laughs: u8[>..] = [];
+    laughs.append("<style>:root { --v0: x;");
+    for lv in 1..8 {
+        format(laughs, " --v", lv, ":");
+        for r in 10 { format(laughs, " var(--v", lv - 1, ")"); }
+        laughs.append(";");
+    }
+    laughs.append(" } p { color: var(--v7) }</style><p>x</p>");
+    check("variables that multiply stop at the cap", if var_bytes_of(laughs[..]) < 100000 { "small" } else { "huge" }, "small");
+
+    // The font shorthand, then a longhand after it; one without a size is ignored.
+    let fonts = """
+        <style>h1 { font: italic 600 20px/1.5 "Barlow Condensed", Georgia, serif }
+        h2 { font: 12px monospace; font-weight: bold } h3 { font: bold }</style><h1>a</h1><h2>b</h2><h3>c</h3>
+        """;
+    check("the font shorthand", style_at(fonts, "h1", 0, true), "italic=1 bold=1 size=20.0 lh=30.0 family=1");
+    check("a longhand after the shorthand wins", style_at(fonts, "h2", 0, true), "italic=0 bold=1 size=12.0 lh=14.4 family=2");
+    check("a font with no size is ignored", style_at(fonts, "h3", 0, true), "italic=0 bold=1 size=20.4 lh=26.5 family=0");
+
+    // ::before and ::after, made once; :first-child still sees the first real child.
+    let gen = """<style>p.q::before { content: "> "; color: #ff0000 } p.q::after { content: "" } p:before { content: none } p.q span:first-child { color: #00ff00 } p.q span::after { content: "\41 B" }</style><p class=q><span>s</span> quote</p><p>plain</p>""";
+    check("::before and ::after", styled_tree(gen),
+          "body\n  p class=\"q\"\n    ::before\n      \"> \"\n    span\n      \"s\"\n      ::after\n        \"AB\"\n    \" quote\"\n    ::after\n  p\n    \"plain\"\n");
+    check("::before takes its rule's style", style_at(gen, "::before", 0, false),
+          "display=2 size=17.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check(":first-child doesn't count a ::before", style_at(gen, "span", 0, false),
+          "display=2 size=17.0 bold=0 italic=0 color=ff00ff00 mt=0.0 ml=0.0 auto_ml=0");
+    // Strings joined and curly quotes, alt text after a '/' left out, and a
+    // counter, not supported yet, makes nothing.
+    check("content joins strings and leaves alt text out",
+          styled_tree("""<style>p::before { content: "a" 'b' open-quote } p::after { content: close-quote "*" / "star" } i::before { content: counter(c) "." }</style><p>x</p><i>y</i>"""),
+          "body\n  p\n    ::before\n      \"ab“\"\n    \"x\"\n    ::after\n      \"”*\"\n  i\n    \"y\"\n");
+    check("styled again into a fresh array, a ::before keeps its style",
+          restyled("""<style>p::before { content: "g"; color: #ff0000 }</style><p>x</p>""", "::before"), "display=2 color=ffff0000");
+
+    // :nth-child, attribute selectors and :root.
+    let sel = """
+        <style>:root { font-size: 10px } li:nth-child(2n+1) { color: #ff0000 } li:nth-child(even) { color: #0000ff }
+        li:nth-child(-n+1) { font-weight: bold } [data-act] { margin-left: 3px } a[href^="http"] { color: #00ff00 }
+        [data-k~=two] { margin-top: 2px } [lang|=en] { font-style: italic } [data-act=no] { margin-left: 9px }</style>
+        <ul><li>1</li><li>2</li><li>3</li></ul><span data-act=x>s</span><a href="https://x">a</a>
+        <b data-k="one two">b</b><span lang=en-GB>e</span>
+        """;
+    check(":nth-child(2n+1) and (-n+1)", style_at(sel, "li", 0, false), "display=3 size=10.0 bold=1 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check(":nth-child(even)", style_at(sel, "li", 1, false), "display=3 size=10.0 bold=0 italic=0 color=ff0000ff mt=0.0 ml=0.0 auto_ml=0");
+    check(":nth-child(2n+1), the third", style_at(sel, "li", 2, false), "display=3 size=10.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check("[attr], and [attr=value] that doesn't match",
+          style_at(sel, "span", 0, false), "display=2 size=10.0 bold=0 italic=0 color=ff1c1c1c mt=0.0 ml=3.0 auto_ml=0");
+    check("[attr^=value]", style_at(sel, "a", 0, false), "display=2 size=10.0 bold=0 italic=0 color=ff00ff00 mt=0.0 ml=0.0 auto_ml=0");
+    check("[attr~=word]", style_at(sel, "b", 0, false), "display=2 size=10.0 bold=1 italic=0 color=ff1c1c1c mt=2.0 ml=0.0 auto_ml=0");
+    check("[attr|=value]", style_at(sel, "span", 1, false), "display=2 size=10.0 bold=0 italic=1 color=ff1c1c1c mt=0.0 ml=0.0 auto_ml=0");
+
+    // Every class's rules, however many classes there are, split on HTML
+    // whitespace as has_class splits them (a form feed too); [attr~=word] the same.
+    var many: u8[>..] = [];
+    many.append("<style>.c69 { color: #ff0000 } [data-k~=b] { margin-left: 4px }</style><p class=\"");
+    for k in 70 { format(many, "c", k, " "); }
+    many.append("\">x</p><b class=\"a");
+    many.push(12);
+    many.append("c69\" data-k=\"a");
+    many.push(12);
+    many.append("b\">y</b>");
+    check("a rule for the seventieth class", style_at(many[..], "p", 0, false), "display=1 size=17.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check("classes and [attr~=word] split on a form feed",
+          style_at(many[..], "b", 0, false), "display=2 size=17.0 bold=1 italic=0 color=ffff0000 mt=0.0 ml=4.0 auto_ml=0");
+
+    // What CSS calls invalid is dropped: a '>' with no compound after it,
+    // before it, or between two; a space inside a sign and its n, or between
+    // a number and its n; a second sign before b. A b too big counts as a
+    // billion, so -n+99999999999 matches every li.
+    let bad = """<style>p > { color: #ff0000 } > p { color: #ff0000 } p > > i { color: #ff0000 } li:nth-child(- n + 3) { color: #ff0000 } li:nth-child(2 n) { color: #ff0000 } li:nth-child(n+-99999999999) { color: #ff0000 } li:nth-child(-n+99999999999) { font-weight: bold }</style><p>x <i>i</i></p><ul><li>a</li><li>b</li></ul>""";
+    check("a dangling '>' drops the selector", style_at(bad, "p", 0, false), "display=1 size=17.0 bold=0 italic=0 color=ff1c1c1c mt=0.0 ml=0.0 auto_ml=0");
+    check("loose an+b is dropped, and a big b is a billion",
+          style_at(bad, "li", 1, false), "display=3 size=17.0 bold=1 italic=0 color=ff1c1c1c mt=0.0 ml=0.0 auto_ml=0");
 }
 
 fn test_css() {
@@ -161,7 +377,11 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
     var classes: Span[>..] = [];
     var decls: Decl[>..] = [];
     var sbytes: u8[>..] = [];
-    let sh = Sheet { rules: rules, comps: comps, classes: classes, decls: decls, bytes: sbytes };
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -352,6 +572,7 @@ fn test_page() {
 fn main() {
     test_html();
     test_css();
+    test_css_interface();
     test_layout();
     test_snapshot();
     test_page();
