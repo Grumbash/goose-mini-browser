@@ -24,6 +24,7 @@ import engine.html;
 import engine.css;
 import engine.layout;
 import engine.snapshot;
+import engine.hit;
 
 struct Event { kind: i32, code: i32, x: f64, y: f64, w: f64, h: f64 }
 
@@ -59,6 +60,7 @@ extern "tusk_platform" {
     fn tp_frames() -> i64;
     fn tp_close() -> i32;
     fn tp_wake(token: i32) -> i32;
+    fn tp_set_cursor(kind: i32) -> i32;
 }
 
 // Event kinds, as numbered in platform/src/lib.rs.
@@ -68,6 +70,12 @@ let EV_RESIZE: i32 = 2;
 let EV_KEY: i32 = 3;
 let EV_SCROLL: i32 = 5;
 let EV_WAKE: i32 = 6;
+let EV_MOUSE_MOVE: i32 = 8;
+let EV_MOUSE_LEAVE: i32 = 9;
+
+// Pointer shapes, as numbered in platform/src/lib.rs.
+let CURSOR_ARROW: i32 = 0;
+let CURSOR_POINTER: i32 = 1;
 
 // macOS virtual key codes and modifier flags.
 let KEY_Q: i32 = 12;
@@ -152,10 +160,11 @@ fn measure_page(P: Page) {
 }
 
 // Lays the page out `width` points wide, for a view `view_h` points high, and
-// hands the display list to the compositor. Returns the page's height.
-fn show_page(P: Page, width: f32, view_h: f32, scale: f32, cost: Cost&) -> f32 {
+// hands the display list to the compositor; `items` keeps it, for what is
+// under the pointer. Returns the page's height.
+fn show_page(P: Page, items: DItem[>..<]&, width: f32, view_h: f32, scale: f32, cost: Cost&) -> f32 {
     var boxes: Rect[>..] = [];
-    var items: DItem[>..<] = [];
+    items.resize(0);
     var flex: FlexItem[>..<] = [];
     var atoms: i32[>..<] = [];
     var measured: Measured[>..] = [];
@@ -359,7 +368,8 @@ fn main() {
             return;
         }
         let scale: f32 = 2.0;
-        let page_h = show_page(P, shot_w, shot_h, scale, cost);
+        var items: DItem[>..<] = [];
+        let page_h = show_page(P, items, shot_w, shot_h, scale, cost);
         show_bar(P, path[name_start..], cost, shot_w, shot_h + BAR_H, scale);
         let y = clamp_scroll(at, page_h, shot_h);
         place_page(y, shot_w, shot_h);
@@ -401,6 +411,11 @@ fn main() {
     var scroll: f32 = 0.0;
     var settle = false;      // a frame has been drawn since the bar last weighed the page
     var woken = false;
+    var items: DItem[>..<] = [];   // the page's display list as laid out last
+    var bounds: f32[>..<] = [];    // where its items are, for hit tests: made at the first after a layout
+    var bounded = false;
+    var pointer_x: f32 = -1.0;     // where the pointer is over the content, or -1 off it
+    var pointer_y: f32 = -1.0;
     var e = Event { kind: 0, code: 0, x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
     var quit = false;
     while !quit {
@@ -423,6 +438,7 @@ fn main() {
         let before = scroll;
         var relayout = false;
         var resized = false;
+        var moved = false;
         loop {
             if e.kind == EV_CLOSE { quit = true; }
             else if e.kind == EV_RESIZE {
@@ -436,6 +452,16 @@ fn main() {
             } else if e.kind == EV_SCROLL {
                 let dy = e.y as f32;
                 scroll -= if e.code == 1 { dy } else { dy * WHEEL_LINE };
+                pointer_x = e.w as f32;
+                pointer_y = e.h as f32;
+                moved = true;
+            } else if e.kind == EV_MOUSE_MOVE {
+                pointer_x = e.x as f32;
+                pointer_y = e.y as f32;
+                moved = true;
+            } else if e.kind == EV_MOUSE_LEAVE {
+                pointer_x = -1.0;
+                pointer_y = -1.0;
             } else if e.kind == EV_KEY {
                 let mods = e.x as i64;
                 let page = height - BAR_H - 40.0;
@@ -455,7 +481,10 @@ fn main() {
             guard tp_next_event(0, e) == 0 && e.kind != EV_NONE else { break; }
         }
         if quit { break; }
-        if relayout { page_h = show_page(P, width, height - BAR_H, scale, cost); }
+        if relayout {
+            page_h = show_page(P, items, width, height - BAR_H, scale, cost);
+            bounded = false;
+        }
         // The bar sits at the window's bottom edge: it moves with any resize.
         if resized { show_bar(P, path[name_start..], cost, width, height, scale); }
         scroll = clamp_scroll(scroll, page_h, height - BAR_H);
@@ -464,6 +493,22 @@ fn main() {
             place_page(scroll, width, height - BAR_H);
             tp_render(bg);
             settle = true;
+        }
+        // Over a link the pointer is a hand, and over the bar an arrow. What is
+        // under it changes when it moves, and when the page moves under it;
+        // off the window (a scroll's momentum goes on after it leaves) the
+        // cursor isn't ours.
+        let inside = pointer_x >= 0.0 && pointer_x < width && pointer_y >= 0.0 && pointer_y < height;
+        if inside && (moved || relayout || scroll != before) {
+            var link: i32 = -1;
+            if pointer_y < height - BAR_H {
+                if !bounded {
+                    hit_bounds(items[..], fonts[..], bounds);
+                    bounded = true;
+                }
+                link = link_at(d, node_at(items[..], fonts[..], bounds[..], pointer_x, pointer_y + scroll));
+            }
+            tp_set_cursor(if link >= 0 { CURSOR_POINTER } else { CURSOR_ARROW });
         }
         if mode == MODE_SCROLL_TEST {
             scroll_test(page_h, width, height, bg);

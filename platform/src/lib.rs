@@ -22,10 +22,12 @@ use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use objc2::rc::{Retained, autoreleasepool};
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::runtime::AnyObject;
+use objc2::{AllocAnyThread, ClassType, MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSEventMask,
-    NSEventModifierFlags, NSEventType, NSWindow, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEvent,
+    NSEventMask, NSEventModifierFlags, NSEventType, NSTrackingArea, NSTrackingAreaOptions,
+    NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
@@ -43,19 +45,23 @@ pub(crate) const ERR_ARGUMENT: i32 = -4;
 pub(crate) const ERR_NO_DEVICE: i32 = -5;
 pub(crate) const ERR_PANIC: i32 = -100;
 
-// Event kinds; the Goose side mirrors these numbers.
+// Event kinds; the Goose side mirrors these numbers. Pointer positions are in
+// points from the content's top left; modifier flags are AppKit's.
 const EV_NONE: i32 = 0; // the wait timed out
 const EV_CLOSE: i32 = 1;
 const EV_RESIZE: i32 = 2; // w, h: content size in points; x: backing scale
 const EV_KEY: i32 = 3; // code: macOS virtual key code; x: the modifier flags
-const EV_MOUSE: i32 = 4; // x, y: points from the top-left; code: button
-const EV_SCROLL: i32 = 5; // x, y: scroll deltas; code: 1 for points (trackpads), 0 for lines (wheels)
+const EV_MOUSE: i32 = 4; // a button went down over the content: x, y; code: button (0 left, 1 right, 2 middle, 3 on others); w: modifiers; h: clicks
+const EV_SCROLL: i32 = 5; // x, y: deltas; code: 1 for points (trackpads), 0 for lines (wheels); w, h: the pointer
 const EV_WAKE: i32 = 6; // code: the token passed to tp_wake
+const EV_MOUSE_UP: i32 = 7; // that button went up: as EV_MOUSE; one for each EV_MOUSE, none without
+const EV_MOUSE_MOVE: i32 = 8; // the pointer moved: x, y; code: the buttons of EV_MOUSEs still held (bit b for button b); w: modifiers
+const EV_MOUSE_LEAVE: i32 = 9; // the pointer left the content
 
 /// One input event, laid out as Goose's `struct Event { kind: i32, code: i32,
 /// x: f64, y: f64, w: f64, h: f64 }`.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct GpEvent {
     pub kind: i32,
     pub code: i32,
@@ -124,8 +130,11 @@ struct Platform {
     scale: f64,
     refresh_hz: f64,
     open: bool,
-    pending: VecDeque<GpEvent>,
+    pending: VecDeque<(GpEvent, u64)>, // each with its scroll phase (see queue)
     frames: i64,
+    tracking: Retained<NSTrackingArea>, // the content's, whose exit is the pointer leaving
+    pressed: u32,   // the buttons whose presses Goose was given, bit b for button b
+    at: (f64, f64), // where the pointer was last, in the content
 }
 
 thread_local! {
@@ -215,6 +224,21 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
         // Layer-hosting view: the layer is set before wantsLayer.
         view.setLayer(Some(&**layer));
         view.setWantsLayer(true);
+        // The pointer's moves and its leaving, whichever app is active: hover
+        // follows the pointer as it does in other browsers.
+        let tracking = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                NSRect::ZERO,
+                NSTrackingAreaOptions::MouseEnteredAndExited
+                    | NSTrackingAreaOptions::MouseMoved
+                    | NSTrackingAreaOptions::ActiveAlways
+                    | NSTrackingAreaOptions::InVisibleRect,
+                Some(AsRef::<AnyObject>::as_ref(&*view)),
+                None,
+            )
+        };
+        view.addTrackingArea(&tracking);
 
         window.makeKeyAndOrderFront(None);
         app.activate();
@@ -225,13 +249,14 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
         // The first event is the window's size and scale, so the page is laid
         // out the same way on opening as after every resize.
         let mut pending = VecDeque::new();
-        pending.push_back(GpEvent {
+        let resize = GpEvent {
             kind: EV_RESIZE,
             x: scale,
             w: width,
             h: height,
             ..Default::default()
-        });
+        };
+        pending.push_back((resize, 0));
         PLATFORM.with(|cell| {
             *cell.borrow_mut() = Some(Platform {
                 app,
@@ -243,6 +268,9 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
                 open: true,
                 pending,
                 frames: 0,
+                tracking,
+                pressed: 0,
+                at: (-1.0, -1.0),
             })
         });
         Ok(0)
@@ -264,37 +292,11 @@ pub extern "C" fn tp_next_event(timeout_ms: i64, out: *mut GpEvent) -> i32 {
                 NSDate::dateWithTimeIntervalSinceNow(timeout_ms as f64 / 1000.0)
             };
             loop {
-                if let Some(e) = p.pending.pop_front() {
+                if let Some((e, _)) = p.pending.pop_front() {
                     unsafe { out.write_unaligned(e) };
                     return Ok(0);
                 }
-                // Events Tusk doesn't translate (mouse-ups, drags, gestures) are
-                // consumed here too: release what each one autoreleases before
-                // the next, rather than when the whole wait ends.
-                let got = autoreleasepool(|_| {
-                    let next = unsafe {
-                        p.app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                            NSEventMask::Any,
-                            Some(&until),
-                            NSDefaultRunLoopMode,
-                            true,
-                        )
-                    };
-                    let Some(ev) = next else { return false };
-                    let translated = translate(p, &ev);
-                    // Our own wake events and key presses stop here: AppKit would
-                    // beep at keys no responder handles.
-                    let kind = ev.r#type();
-                    if kind != NSEventType::ApplicationDefined && kind != NSEventType::KeyDown {
-                        p.app.sendEvent(&ev);
-                    }
-                    check_window(p);
-                    if let Some(e) = translated {
-                        p.pending.push_back(e);
-                    }
-                    true
-                });
-                if !got {
+                if !take(p, &until) {
                     unsafe {
                         out.write_unaligned(GpEvent {
                             kind: EV_NONE,
@@ -303,12 +305,106 @@ pub extern "C" fn tp_next_event(timeout_ms: i64, out: *mut GpEvent) -> i32 {
                     };
                     return Ok(0);
                 }
+                // And what is already waiting behind it, so that a burst of
+                // moves or scrolls reaches Goose as one.
+                let now = NSDate::distantPast();
+                for _ in 0..MAX_TAKEN {
+                    if !take(p, &now) {
+                        break;
+                    }
+                }
             }
         })
     })
 }
 
-fn translate(p: &Platform, ev: &NSEvent) -> Option<GpEvent> {
+/// The most events taken at once beyond the first: a bound, should AppKit
+/// keep making them as fast as they are taken.
+const MAX_TAKEN: usize = 256;
+
+/// Takes AppKit's next event, waiting until `until` for one; lets AppKit
+/// handle it, and queues what Goose gets of it. False when none came.
+fn take(p: &mut Platform, until: &NSDate) -> bool {
+    // Events Tusk doesn't translate (gestures, key-ups) are consumed here
+    // too: release what each one autoreleases before the next, rather than
+    // when the whole wait ends.
+    autoreleasepool(|_| {
+        let next = unsafe {
+            p.app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::Any,
+                Some(until),
+                NSDefaultRunLoopMode,
+                true,
+            )
+        };
+        let Some(ev) = next else { return false };
+        let translated = translate(p, &ev);
+        // Our own wake events and key presses stop here: AppKit would beep
+        // at keys no responder handles.
+        let kind = ev.r#type();
+        if kind != NSEventType::ApplicationDefined && kind != NSEventType::KeyDown {
+            p.app.sendEvent(&ev);
+        }
+        check_window(p);
+        if let Some(e) = translated {
+            let phase = if kind == NSEventType::ScrollWheel {
+                ev.phase().0 as u64 | (ev.momentumPhase().0 as u64) << 32
+            } else {
+                0
+            };
+            queue(&mut p.pending, e, phase);
+        }
+        // A press can start a loop of AppKit's own (a menu, a window drag)
+        // that keeps its release: Goose gets the release of each press it
+        // was given whose button is up now, unless that is still to come.
+        let pressing = [
+            NSEventType::LeftMouseDown,
+            NSEventType::RightMouseDown,
+            NSEventType::OtherMouseDown,
+        ];
+        if p.pressed != 0 && pressing.contains(&kind) {
+            let held = NSEvent::pressedMouseButtons() as u32;
+            for button in 0..32 {
+                let bit = 1u32 << button;
+                if p.pressed & bit == 0 || held & bit != 0 || release_waiting(p, button) {
+                    continue;
+                }
+                p.pressed &= !bit;
+                let up = GpEvent {
+                    kind: EV_MOUSE_UP,
+                    code: button,
+                    x: p.at.0,
+                    y: p.at.1,
+                    ..Default::default()
+                };
+                queue(&mut p.pending, up, 0);
+            }
+        }
+        true
+    })
+}
+
+/// Whether AppKit holds a release of `button` still to be taken.
+fn release_waiting(p: &Platform, button: i32) -> bool {
+    let mask = match button {
+        0 => NSEventMask::LeftMouseUp,
+        1 => NSEventMask::RightMouseUp,
+        _ => NSEventMask::OtherMouseUp,
+    };
+    let now = NSDate::distantPast();
+    unsafe {
+        p.app
+            .nextEventMatchingMask_untilDate_inMode_dequeue(
+                mask,
+                Some(&now),
+                NSDefaultRunLoopMode,
+                false,
+            )
+            .is_some()
+    }
+}
+
+fn translate(p: &mut Platform, ev: &NSEvent) -> Option<GpEvent> {
     let kind = ev.r#type();
     if kind == NSEventType::ApplicationDefined {
         return Some(GpEvent {
@@ -318,40 +414,123 @@ fn translate(p: &Platform, ev: &NSEvent) -> Option<GpEvent> {
         });
     }
     if kind == NSEventType::KeyDown {
-        let modifiers = ev.modifierFlags().0 as f64;
         return Some(GpEvent {
             kind: EV_KEY,
             code: ev.keyCode() as i32,
-            x: modifiers,
+            x: ev.modifierFlags().0 as f64,
             ..Default::default()
         });
     }
-    if kind == NSEventType::LeftMouseDown || kind == NSEventType::RightMouseDown {
-        let at = ev.locationInWindow();
-        let button = if kind == NSEventType::LeftMouseDown {
-            0
-        } else {
-            1
-        };
-        return Some(GpEvent {
-            kind: EV_MOUSE,
-            code: button,
-            x: at.x,
-            y: p.size.1 - at.y,
+    let modifiers = ev.modifierFlags().0 as f64;
+    let at = ev.locationInWindow();
+    let (x, y) = (at.x, p.size.1 - at.y);
+    if kind == NSEventType::MouseExited {
+        // Only the content's own area: AppKit's, round the traffic lights or
+        // a tooltip, aren't its edge.
+        let ours = ev
+            .trackingArea()
+            .is_some_and(|a| Retained::as_ptr(&a) == Retained::as_ptr(&p.tracking));
+        return ours.then(|| GpEvent {
+            kind: EV_MOUSE_LEAVE,
             ..Default::default()
         });
     }
     if kind == NSEventType::ScrollWheel {
-        let precise = ev.hasPreciseScrollingDeltas() as i32;
         return Some(GpEvent {
             kind: EV_SCROLL,
-            code: precise,
+            code: ev.hasPreciseScrollingDeltas() as i32,
             x: ev.scrollingDeltaX(),
             y: ev.scrollingDeltaY(),
-            ..Default::default()
+            w: x,
+            h: y,
         });
     }
-    None
+    let (event, button) = pointer(kind, ev.buttonNumber())?;
+    p.at = (x, y);
+    let e = GpEvent {
+        kind: event,
+        code: button,
+        x,
+        y,
+        w: modifiers,
+        h: if event == EV_MOUSE_MOVE {
+            0.0
+        } else {
+            ev.clickCount() as f64
+        },
+    };
+    route(&mut p.pressed, p.size, e)
+}
+
+/// The pointer event an AppKit mouse event is, and its button; a mouse's
+/// other buttons are numbered from 2 (`number`).
+fn pointer(kind: NSEventType, number: isize) -> Option<(i32, i32)> {
+    let other = number.clamp(2, 31) as i32;
+    Some(match kind {
+        NSEventType::LeftMouseDown => (EV_MOUSE, 0),
+        NSEventType::RightMouseDown => (EV_MOUSE, 1),
+        NSEventType::OtherMouseDown => (EV_MOUSE, other),
+        NSEventType::LeftMouseUp => (EV_MOUSE_UP, 0),
+        NSEventType::RightMouseUp => (EV_MOUSE_UP, 1),
+        NSEventType::OtherMouseUp => (EV_MOUSE_UP, other),
+        NSEventType::MouseMoved
+        | NSEventType::LeftMouseDragged
+        | NSEventType::RightMouseDragged
+        | NSEventType::OtherMouseDragged => (EV_MOUSE_MOVE, 0),
+        _ => return None,
+    })
+}
+
+/// What Goose gets of pointer event `e` (its code the button), in a content
+/// `size` big, given the buttons whose presses it was given (`pressed`,
+/// kept up to date): a press only over the content, since the title bar and
+/// the edges a window is resized by are AppKit's; a release only of a press
+/// it was given; a move with the buttons of those still held.
+fn route(pressed: &mut u32, size: (f64, f64), e: GpEvent) -> Option<GpEvent> {
+    let bit = 1u32 << e.code;
+    let code = match e.kind {
+        EV_MOUSE => {
+            if !(e.x >= 0.0 && e.y >= 0.0 && e.x < size.0 && e.y < size.1) {
+                return None;
+            }
+            *pressed |= bit;
+            e.code
+        }
+        EV_MOUSE_UP => {
+            if *pressed & bit == 0 {
+                return None;
+            }
+            *pressed &= !bit;
+            e.code
+        }
+        _ => *pressed as i32,
+    };
+    Some(GpEvent { code, ..e })
+}
+
+/// Adds event `e` to the ones waiting for Goose. A move replaces a move just
+/// before it, and a scroll is added to a scroll of the same kind and `phase`
+/// (a trackpad gesture's, and its momentum's) just before it, so a burst of
+/// either costs Goose one hit test or one place.
+fn queue(pending: &mut VecDeque<(GpEvent, u64)>, e: GpEvent, phase: u64) {
+    if let Some((last, last_phase)) = pending.back_mut() {
+        if e.kind == EV_MOUSE_MOVE && last.kind == EV_MOUSE_MOVE {
+            *last = e;
+            return;
+        }
+        if e.kind == EV_SCROLL
+            && last.kind == EV_SCROLL
+            && e.code == last.code
+            && phase == *last_phase
+        {
+            last.x += e.x;
+            last.y += e.y;
+            last.w = e.w;
+            last.h = e.h;
+            return;
+        }
+    }
+    pending.push_back((e, phase));
 }
 
 /// After AppKit has handled an event: notice a closed window or a new size.
@@ -361,10 +540,11 @@ fn check_window(p: &mut Platform) {
     let closed = !p.window.isVisible() && !p.window.isMiniaturized() && !p.app.isHidden();
     if p.open && closed {
         p.open = false;
-        p.pending.push_back(GpEvent {
+        let close = GpEvent {
             kind: EV_CLOSE,
             ..Default::default()
-        });
+        };
+        p.pending.push_back((close, 0));
         return;
     }
     let Some(view) = p.window.contentView() else {
@@ -381,13 +561,14 @@ fn check_window(p: &mut Platform) {
             p.layer
                 .setDrawableSize(CGSize::new(size.0 * scale, size.1 * scale));
         }
-        p.pending.push_back(GpEvent {
+        let resize = GpEvent {
             kind: EV_RESIZE,
             x: scale,
             w: size.0,
             h: size.1,
             ..Default::default()
-        });
+        };
+        p.pending.push_back((resize, 0));
     }
 }
 
@@ -459,6 +640,62 @@ pub extern "C" fn tp_frames() -> i64 {
     }
 }
 
+// Pointer shapes for tp_set_cursor; the Goose side mirrors these numbers.
+const CURSOR_ARROW: i32 = 0;
+const CURSOR_POINTER: i32 = 1; // a pointing hand, over a link
+const CURSOR_TEXT: i32 = 2;
+const CURSOR_GRAB: i32 = 3;
+const CURSOR_GRABBING: i32 = 4;
+const CURSOR_RESIZE_ACROSS: i32 = 5;
+const CURSOR_RESIZE_DOWN: i32 = 6;
+const CURSOR_CROSSHAIR: i32 = 7;
+const CURSOR_NOT_ALLOWED: i32 = 8;
+
+/// Shows pointer shape `kind` (CURSOR_) over the window. Setting the shape
+/// already shown does nothing, so Goose may call it on every move. What is
+/// shown is asked of AppKit, which sets the arrow on its own at times (after
+/// a resize from the window's edge, on activation).
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_set_cursor(kind: i32) -> i32 {
+    guarded(|| {
+        with_platform(|_| {
+            let cursor = match kind {
+                CURSOR_ARROW => NSCursor::arrowCursor(),
+                CURSOR_POINTER => NSCursor::pointingHandCursor(),
+                CURSOR_TEXT => NSCursor::IBeamCursor(),
+                CURSOR_GRAB => NSCursor::openHandCursor(),
+                CURSOR_GRABBING => NSCursor::closedHandCursor(),
+                CURSOR_RESIZE_ACROSS => resize_cursor(true),
+                CURSOR_RESIZE_DOWN => resize_cursor(false),
+                CURSOR_CROSSHAIR => NSCursor::crosshairCursor(),
+                CURSOR_NOT_ALLOWED => NSCursor::operationNotAllowedCursor(),
+                _ => return Err(ERR_ARGUMENT),
+            };
+            if Retained::as_ptr(&NSCursor::currentCursor()) != Retained::as_ptr(&cursor) {
+                cursor.set();
+            }
+            Ok(0)
+        })
+    })
+}
+
+/// The cursor for moving a divider across (or down): macOS 15's, or before
+/// it the one that one replaced, which an older AppKit has instead.
+#[allow(deprecated)]
+fn resize_cursor(across: bool) -> Retained<NSCursor> {
+    let newer = if across {
+        sel!(columnResizeCursor)
+    } else {
+        sel!(rowResizeCursor)
+    };
+    match (NSCursor::class().metaclass().responds_to(newer), across) {
+        (true, true) => NSCursor::columnResizeCursor(),
+        (true, false) => NSCursor::rowResizeCursor(),
+        (false, true) => NSCursor::resizeLeftRightCursor(),
+        (false, false) => NSCursor::resizeUpDownCursor(),
+    }
+}
+
 /// Closes the window and releases everything the platform layer holds.
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_close() -> i32 {
@@ -496,6 +733,107 @@ mod tests {
         assert_eq!(tp_next_event(0, &mut e), ERR_NOT_MAIN_THREAD);
         assert_eq!(tp_render(0xFFFF_FFFF), ERR_NOT_MAIN_THREAD);
         assert_eq!(tp_frames(), ERR_NOT_MAIN_THREAD as i64);
+        assert_eq!(tp_set_cursor(CURSOR_POINTER), ERR_NOT_MAIN_THREAD);
+    }
+
+    #[test]
+    fn moves_and_scrolls_coalesce_but_nothing_else_does() {
+        let mv = |x| GpEvent {
+            kind: EV_MOUSE_MOVE,
+            x,
+            ..Default::default()
+        };
+        let mut q = VecDeque::new();
+        queue(&mut q, mv(1.0), 0);
+        queue(&mut q, mv(2.0), 0);
+        assert_eq!((q.len(), q[0].0.x), (1, 2.0));
+        let press = GpEvent {
+            kind: EV_MOUSE,
+            ..Default::default()
+        };
+        queue(&mut q, press, 0);
+        queue(&mut q, mv(3.0), 0);
+        assert_eq!(q.len(), 3);
+        let scroll = |dx, dy, code, w, h| GpEvent {
+            kind: EV_SCROLL,
+            code,
+            x: dx,
+            y: dy,
+            w,
+            h,
+        };
+        let mut q = VecDeque::new();
+        queue(&mut q, scroll(1.0, -2.0, 1, 4.0, 10.0), 2);
+        queue(&mut q, scroll(2.0, -3.0, 1, 5.0, 12.0), 2);
+        let s = q[0].0;
+        assert_eq!((q.len(), s.x, s.y, s.w, s.h), (1, 3.0, -5.0, 5.0, 12.0));
+        // A wheel's lines don't add to a trackpad's points, nor a gesture's
+        // end to its middle.
+        queue(&mut q, scroll(0.0, 1.0, 0, 5.0, 12.0), 2);
+        assert_eq!(q.len(), 2);
+        queue(&mut q, scroll(0.0, 1.0, 0, 5.0, 12.0), 4);
+        assert_eq!(q.len(), 3);
+    }
+
+    #[test]
+    fn mouse_events_map_to_pointer_events() {
+        assert_eq!(pointer(NSEventType::LeftMouseDown, 0), Some((EV_MOUSE, 0)));
+        assert_eq!(
+            pointer(NSEventType::RightMouseUp, 1),
+            Some((EV_MOUSE_UP, 1))
+        );
+        assert_eq!(pointer(NSEventType::OtherMouseDown, 3), Some((EV_MOUSE, 3)));
+        assert_eq!(
+            pointer(NSEventType::OtherMouseUp, 4),
+            Some((EV_MOUSE_UP, 4))
+        );
+        assert_eq!(pointer(NSEventType::LeftMouseUp, 0), Some((EV_MOUSE_UP, 0)));
+        for moved in [
+            NSEventType::MouseMoved,
+            NSEventType::LeftMouseDragged,
+            NSEventType::RightMouseDragged,
+            NSEventType::OtherMouseDragged,
+        ] {
+            assert_eq!(pointer(moved, 0), Some((EV_MOUSE_MOVE, 0)));
+        }
+        assert_eq!(pointer(NSEventType::KeyDown, 0), None);
+    }
+
+    #[test]
+    fn presses_pair_with_releases_and_moves_carry_the_buttons_held() {
+        let size = (100.0, 50.0);
+        let at = |kind, code, x, y| GpEvent {
+            kind,
+            code,
+            x,
+            y,
+            ..Default::default()
+        };
+        let mut pressed = 0u32;
+        // Off the content (the title bar, the edges a window is resized by):
+        // no press, and so no release or held button either.
+        for (x, y) in [(10.0, -5.0), (-1.0, 10.0), (100.0, 10.0), (10.0, 50.0)] {
+            assert_eq!(route(&mut pressed, size, at(EV_MOUSE, 0, x, y)), None);
+        }
+        assert_eq!(
+            route(&mut pressed, size, at(EV_MOUSE_UP, 0, 10.0, 10.0)),
+            None
+        );
+        let moved = route(&mut pressed, size, at(EV_MOUSE_MOVE, 0, 10.0, 10.0));
+        assert_eq!(moved.map(|e| e.code), Some(0));
+        // Over it: both buttons held, then the right one up.
+        let down = route(&mut pressed, size, at(EV_MOUSE, 0, 0.0, 0.0));
+        assert_eq!(down.map(|e| (e.kind, e.code)), Some((EV_MOUSE, 0)));
+        route(&mut pressed, size, at(EV_MOUSE, 1, 10.0, 10.0)).unwrap();
+        let dragged = route(&mut pressed, size, at(EV_MOUSE_MOVE, 0, 300.0, -40.0));
+        assert_eq!(dragged.map(|e| (e.code, e.x, e.y)), Some((3, 300.0, -40.0)));
+        let up = route(&mut pressed, size, at(EV_MOUSE_UP, 1, 300.0, -40.0));
+        assert_eq!(up.map(|e| (e.kind, e.code)), Some((EV_MOUSE_UP, 1)));
+        assert_eq!(
+            route(&mut pressed, size, at(EV_MOUSE_UP, 1, 0.0, 0.0)),
+            None
+        );
+        assert_eq!(pressed, 1);
     }
 
     #[test]
