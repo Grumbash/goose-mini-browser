@@ -1,0 +1,3 @@
+// Sidecar for ui_test.goose: layout measures text through the platform
+// layer, built by `cargo build --release` in ../platform.
+dylibs_macos = ["tusk_platform=../platform/target/release/tusk_platform"];

@@ -40,16 +40,21 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 ```bash
 GOOSE_BIN=/path/to/goose ./app/build.sh   # the platform layer (cargo), then the app (goose build)
 ./app/tusk                                # the saved Focaccia article (tests/pages/)
+./app/tusk a.html b.html                  # a tab each; ⌘1 to ⌘9 show one
 ./app/tusk --scroll-test                  # scrolls it for 10 s and prints what the frames cost
 ./app/tusk --screenshot out.png           # draws the window offscreen into a PNG, no window
-./app/tusk --screenshot out.png --size 1200x760 tests/pages/window.html   # the design's window, at its size
+./app/tusk --screenshot out.png --dev-tab network   # with the dev panel's Network open
+./app/tusk --screenshot out.png --bare --size 960x694   # the page alone, to check the engine
+./app/tusk --screenshot out.png tests/pages/window.html   # the design's window as a page
 ./app/tusk snapshot page.html             # the page as a tree for agents (docs/adr/0007)
 goose tests/engine_test.goose             # the engine's checks (after ./app/build.sh)
 ```
 
-The bar along the bottom shows the page's weight: its size, its nodes, what
-parsing, styling, text, layout and paint took, and the process's memory,
-weighed again 5 s after the last frame.
+Tusk draws its own interface (docs/adr/0010), the design's focus view: the
+bar with the board and the address, the page with its header, the dev panel
+(the page's line, then Console, Network, Elements, Frames and Oil), and the
+bottom panel with the boar's bay, the window's oil, CPU and frames, and the
+hand of boards. A load over 400 ms sends the boar running along a rail.
 Space, Page Up/Down, the arrows, Home and End scroll; ⌘Q quits.
 
 Not yet: images and video, the network (local files only), JavaScript, links

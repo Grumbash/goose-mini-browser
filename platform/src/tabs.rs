@@ -37,7 +37,8 @@ pub const MSG_QUIT: i32 = 4;
 
 /// What a tab's display list came with, laid out as Goose's `struct
 /// FrameInfo`: the page's height, its canvas colour, its size in nodes and
-/// bytes, and what each stage of showing it took, in milliseconds.
+/// bytes, what each stage of showing it took, in milliseconds, the backing
+/// scale it is for, and how long reading its file took.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameInfo {
@@ -50,6 +51,7 @@ pub struct FrameInfo {
     pub measure: f32,
     pub layout: f32,
     pub scale: f32,
+    pub read: f32,
 }
 
 /// A reply waiting for the main thread, as Goose's `struct ReplyHead` sees
@@ -386,7 +388,7 @@ mod tests {
     #[test]
     fn structs_match_the_goose_layout() {
         assert_eq!(std::mem::size_of::<TabMsg>(), 16);
-        assert_eq!(std::mem::size_of::<FrameInfo>(), 36);
+        assert_eq!(std::mem::size_of::<FrameInfo>(), 40);
         assert_eq!(std::mem::size_of::<ReplyHead>(), 16);
     }
 

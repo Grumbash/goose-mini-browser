@@ -1,6 +1,7 @@
 # Tusk's checks on Apple silicon (docs/adr/0002): the platform layer's tests
-# and lints, the engine's checks, the app's build, a snapshot of the M1 page,
-# and a screenshot of it drawn offscreen where the runner has a Metal device.
+# and lints, the engine's checks, the app's build, snapshots of the M1 page
+# and of a page nested 600 deep, and a screenshot of the window drawn
+# offscreen where the runner has a Metal device.
 name: Tusk
 
 on:
@@ -65,6 +66,10 @@ jobs:
         run: |
           "$GOOSE_BIN" tests/engine_test.goose
 
+      - name: Interface checks
+        run: |
+          "$GOOSE_BIN" tests/ui_test.goose
+
       - name: Snapshot of the M1 page
         run: |
           ./app/tusk snapshot tests/pages/focaccia.html > snapshot.txt
@@ -75,7 +80,7 @@ jobs:
           ./app/tusk snapshot tests/pages/deep.html > deep.txt
           grep -q 'turned clips' deep.txt
 
-      - name: Screenshot of the M1 page, drawn offscreen
+      - name: Screenshot of the window, drawn offscreen
         run: |
           rc=0
           ./app/tusk --screenshot focaccia.png || rc=$?

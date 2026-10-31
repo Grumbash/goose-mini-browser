@@ -18,6 +18,10 @@ if ! "$GOOSE_BIN" --version 2>/dev/null | grep -q "$GOOSE_PIN"; then
 fi
 
 (cd ../platform && cargo build --release)
+# New files, not old ones written over: macOS keeps a file's code signature
+# while a running Tusk has it open, and kills a new Tusk that loads the
+# changed contents.
+rm -f libtusk_platform.dylib tusk
 cp ../platform/target/release/libtusk_platform.dylib .
 "$GOOSE_BIN" build tusk.goose
 
