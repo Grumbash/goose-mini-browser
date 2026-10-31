@@ -1327,7 +1327,7 @@ pub extern "C" fn tp_set_layer(
         // Goose's floats needn't be aligned: copied out one by one.
         let n = paths.count().ok_or(ERR_ARGUMENT)?;
         let paths: Vec<f32> = (0..n).map(|i| unsafe { paths.get(i) }).collect();
-        if !(0..MAX_LAYERS as i32).contains(&layer) || !(scale > 0.0 && scale <= 8.0) {
+        if !((0..MAX_LAYERS as i32).contains(&layer) && scale > 0.0 && scale <= 8.0) {
             return Err(ERR_ARGUMENT);
         }
         with_compositor(|c| c.set_layer(layer as usize, items, text, &paths, scale as f64))?;
