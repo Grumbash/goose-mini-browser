@@ -737,6 +737,10 @@ mod tests {
 
     #[test]
     fn a_frame_draws_its_layers_offscreen() {
+        if MTLCreateSystemDefaultDevice().is_none() {
+            eprintln!("no Metal device here: the offscreen frame isn't checked");
+            return;
+        }
         let pixels = with_compositor(|c| {
             c.set_layer(0, &[rect(2.0, 2.0, 4.0, 4.0, 0xFFFF_0000)], b"", 1.0)?;
             c.set_layer(1, &[rect(0.0, 0.0, 1.0, 1.0, 0xFF00_00FF)], b"", 1.0)?;

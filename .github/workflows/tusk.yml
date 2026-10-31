@@ -1,0 +1,92 @@
+# Tusk's checks on Apple silicon (docs/adr/0002): the platform layer's tests
+# and lints, the engine's checks, the app's build, a snapshot of the M1 page,
+# and a screenshot of it drawn offscreen where the runner has a Metal device.
+name: Tusk
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      GOOSE_PIN: cce94b919d27458856ae2685974049eac78debcf  # docs/adr/0001
+      RUST_TOOLCHAIN: "1.99.1"  # pinned, so a new release's lints can't fail a run
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Where Goose lives
+        run: echo "GOOSE_BIN=$HOME/goose/build/goose" >> "$GITHUB_ENV"
+
+      - name: Cache the Goose compiler
+        id: goose
+        uses: actions/cache@v6
+        with:
+          path: ~/goose
+          key: goose-${{ env.GOOSE_PIN }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build Goose at the pinned commit
+        if: steps.goose.outputs.cache-hit != 'true'
+        run: |
+          git init ~/goose
+          cd ~/goose
+          git fetch --depth 1 https://github.com/aardappel/goose.git "$GOOSE_PIN"
+          git checkout --detach FETCH_HEAD
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j "$(sysctl -n hw.ncpu)"
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --component rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Cache Rust builds
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            platform/target
+          key: cargo-${{ env.RUST_TOOLCHAIN }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('platform/Cargo.lock') }}
+
+      - name: Platform layer (fmt, clippy, tests)
+        working-directory: platform
+        run: |
+          cargo fmt --check
+          cargo clippy --release --all-targets -- -D warnings
+          cargo test --release
+
+      - name: Build the app
+        run: ./app/build.sh
+
+      - name: Engine checks
+        run: |
+          "$GOOSE_BIN" tests/engine_test.goose
+
+      - name: Snapshot of the M1 page
+        run: |
+          ./app/tusk snapshot tests/pages/focaccia.html > snapshot.txt
+          grep -q 'heading "Etymology" \[level=2\]' snapshot.txt
+
+      - name: Screenshot of the M1 page, drawn offscreen
+        run: |
+          rc=0
+          ./app/tusk --screenshot focaccia.png || rc=$?
+          if [ "$rc" = 3 ]; then
+            echo "::notice::No Metal device on this runner: the screenshot is skipped."
+            exit 0
+          fi
+          test "$rc" = 0
+          # A blank window compresses to a few KB; the article is hundreds.
+          test "$(stat -f %z focaccia.png)" -gt 100000
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: tusk-m1
+          path: |
+            snapshot.txt
+            focaccia.png
+          if-no-files-found: ignore
