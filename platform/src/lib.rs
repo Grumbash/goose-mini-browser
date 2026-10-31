@@ -13,42 +13,43 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod cg;
+pub mod compositor;
+mod memory;
 pub mod text;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSEventMask,
     NSEventModifierFlags, NSEventType, NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGSize;
+use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
-use objc2_metal::{
-    MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLLoadAction, MTLPixelFormat,
-    MTLRenderPassDescriptor, MTLStoreAction,
-};
-use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
+use objc2_metal::MTLPixelFormat;
+use objc2_quartz_core::{CAMetalLayer, kCAGravityTopLeft};
+
+use compositor::with_compositor;
 
 // Error codes returned to Goose. Zero or positive means success.
 pub(crate) const ERR_NOT_MAIN_THREAD: i32 = -1;
 pub(crate) const ERR_NOT_OPEN: i32 = -2;
 pub(crate) const ERR_METAL: i32 = -3;
 pub(crate) const ERR_ARGUMENT: i32 = -4;
+pub(crate) const ERR_NO_DEVICE: i32 = -5;
 pub(crate) const ERR_PANIC: i32 = -100;
 
 // Event kinds; the Goose side mirrors these numbers.
 const EV_NONE: i32 = 0; // the wait timed out
 const EV_CLOSE: i32 = 1;
 const EV_RESIZE: i32 = 2; // w, h: content size in points; x: backing scale
-const EV_KEY: i32 = 3; // code: macOS virtual key code
+const EV_KEY: i32 = 3; // code: macOS virtual key code; x: the modifier flags
 const EV_MOUSE: i32 = 4; // x, y: points from the top-left; code: button
-const EV_SCROLL: i32 = 5; // x, y: scroll deltas in points
+const EV_SCROLL: i32 = 5; // x, y: scroll deltas; code: 1 for points (trackpads), 0 for lines (wheels)
 const EV_WAKE: i32 = 6; // code: the token passed to tp_wake
 
 /// One input event, laid out as Goose's `struct Event { kind: i32, code: i32,
@@ -119,9 +120,9 @@ struct Platform {
     app: Retained<NSApplication>,
     window: Retained<NSWindow>,
     layer: Retained<CAMetalLayer>,
-    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     size: (f64, f64),
     scale: f64,
+    refresh_hz: f64,
     open: bool,
     pending: VecDeque<GpEvent>,
     frames: i64,
@@ -133,8 +134,10 @@ thread_local! {
 }
 
 /// Runs `f`, turning a panic into ERR_PANIC so it never unwinds into Goose.
+/// What Cocoa autoreleases during the call is released when it returns:
+/// Tusk runs its own event loop, so no run loop drains a pool for it.
 pub(crate) fn guarded(f: impl FnOnce() -> Result<i32, i32>) -> i32 {
-    match catch_unwind(AssertUnwindSafe(f)) {
+    match catch_unwind(AssertUnwindSafe(|| autoreleasepool(|_| f()))) {
         Ok(Ok(code)) => code,
         Ok(Err(code)) => code,
         Err(_) => ERR_PANIC,
@@ -187,8 +190,7 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
         window.setTitle(&NSString::from_str(&title));
         window.center();
 
-        let device = MTLCreateSystemDefaultDevice().ok_or(ERR_METAL)?;
-        let queue = device.newCommandQueue().ok_or(ERR_METAL)?;
+        let device = with_compositor(|c| Ok(c.device.clone()))?;
         let scale = window.backingScaleFactor();
         let layer = CAMetalLayer::new();
         unsafe {
@@ -201,6 +203,13 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
             layer.setOpaque(true);
             layer.setContentsScale(scale);
             layer.setDrawableSize(CGSize::new(width * scale, height * scale));
+            // While the window is resized live, the last frame stays put
+            // instead of stretching until the page is laid out again.
+            layer.setContentsGravity(kCAGravityTopLeft);
+            // Page colours are sRGB: tagging the layer makes the display
+            // convert them, instead of showing them as its own wider P3.
+            let srgb = CGColorSpace::with_name(Some(kCGColorSpaceSRGB));
+            layer.setColorspace(srgb.as_deref());
         }
         let view = window.contentView().ok_or(ERR_ARGUMENT)?;
         // Layer-hosting view: the layer is set before wantsLayer.
@@ -210,16 +219,29 @@ pub extern "C" fn tp_open(width: f64, height: f64, title: *const u8, title_len: 
         window.makeKeyAndOrderFront(None);
         app.activate();
 
+        let refresh_hz = window
+            .screen()
+            .map_or(60.0, |s| s.maximumFramesPerSecond() as f64);
+        // The first event is the window's size and scale, so the page is laid
+        // out the same way on opening as after every resize.
+        let mut pending = VecDeque::new();
+        pending.push_back(GpEvent {
+            kind: EV_RESIZE,
+            x: scale,
+            w: width,
+            h: height,
+            ..Default::default()
+        });
         PLATFORM.with(|cell| {
             *cell.borrow_mut() = Some(Platform {
                 app,
                 window,
                 layer,
-                queue,
                 size: (width, height),
                 scale,
+                refresh_hz,
                 open: true,
-                pending: VecDeque::new(),
+                pending,
                 frames: 0,
             })
         });
@@ -243,19 +265,36 @@ pub extern "C" fn tp_next_event(timeout_ms: i64, out: *mut GpEvent) -> i32 {
             };
             loop {
                 if let Some(e) = p.pending.pop_front() {
-                    // Goose packs its values without alignment (spec §3.2).
                     unsafe { out.write_unaligned(e) };
                     return Ok(0);
                 }
-                let next = unsafe {
-                    p.app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                        NSEventMask::Any,
-                        Some(&until),
-                        NSDefaultRunLoopMode,
-                        true,
-                    )
-                };
-                let Some(ev) = next else {
+                // Events Tusk doesn't translate (mouse-ups, drags, gestures) are
+                // consumed here too: release what each one autoreleases before
+                // the next, rather than when the whole wait ends.
+                let got = autoreleasepool(|_| {
+                    let next = unsafe {
+                        p.app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                            NSEventMask::Any,
+                            Some(&until),
+                            NSDefaultRunLoopMode,
+                            true,
+                        )
+                    };
+                    let Some(ev) = next else { return false };
+                    let translated = translate(p, &ev);
+                    // Our own wake events and key presses stop here: AppKit would
+                    // beep at keys no responder handles.
+                    let kind = ev.r#type();
+                    if kind != NSEventType::ApplicationDefined && kind != NSEventType::KeyDown {
+                        p.app.sendEvent(&ev);
+                    }
+                    check_window(p);
+                    if let Some(e) = translated {
+                        p.pending.push_back(e);
+                    }
+                    true
+                });
+                if !got {
                     unsafe {
                         out.write_unaligned(GpEvent {
                             kind: EV_NONE,
@@ -263,17 +302,6 @@ pub extern "C" fn tp_next_event(timeout_ms: i64, out: *mut GpEvent) -> i32 {
                         })
                     };
                     return Ok(0);
-                };
-                let translated = translate(p, &ev);
-                // Our own wake events and key presses stop here: AppKit would
-                // beep at keys no responder handles.
-                let kind = ev.r#type();
-                if kind != NSEventType::ApplicationDefined && kind != NSEventType::KeyDown {
-                    p.app.sendEvent(&ev);
-                }
-                check_window(p);
-                if let Some(e) = translated {
-                    p.pending.push_back(e);
                 }
             }
         })
@@ -290,9 +318,11 @@ fn translate(p: &Platform, ev: &NSEvent) -> Option<GpEvent> {
         });
     }
     if kind == NSEventType::KeyDown {
+        let modifiers = ev.modifierFlags().0 as f64;
         return Some(GpEvent {
             kind: EV_KEY,
             code: ev.keyCode() as i32,
+            x: modifiers,
             ..Default::default()
         });
     }
@@ -312,8 +342,10 @@ fn translate(p: &Platform, ev: &NSEvent) -> Option<GpEvent> {
         });
     }
     if kind == NSEventType::ScrollWheel {
+        let precise = ev.hasPreciseScrollingDeltas() as i32;
         return Some(GpEvent {
             kind: EV_SCROLL,
+            code: precise,
             x: ev.scrollingDeltaX(),
             y: ev.scrollingDeltaY(),
             ..Default::default()
@@ -359,37 +391,30 @@ fn check_window(p: &mut Platform) {
     }
 }
 
-/// Draws one frame cleared to the given colour and presents it. M0 only
-/// proves the path; the compositor replaces this in M1.
+/// Draws the layers (see `compositor`) into the window and presents them, the
+/// page scrolled by `scroll` points over a `background` of 0xAARRGGBB. Waits
+/// for a free drawable, which paces a run of frames to the display.
 #[unsafe(no_mangle)]
-pub extern "C" fn tp_present(r: f64, g: f64, b: f64) -> i32 {
+pub extern "C" fn tp_render(scroll: f32, background: u32) -> i32 {
     guarded(|| {
         with_platform(|p| {
             let drawable = unsafe { p.layer.nextDrawable() }.ok_or(ERR_METAL)?;
-            let texture = unsafe { drawable.texture() };
-            let pass = unsafe { MTLRenderPassDescriptor::renderPassDescriptor() };
-            unsafe {
-                let color = pass.colorAttachments().objectAtIndexedSubscript(0);
-                color.setTexture(Some(&*texture));
-                color.setLoadAction(MTLLoadAction::Clear);
-                color.setClearColor(MTLClearColor {
-                    red: r,
-                    green: g,
-                    blue: b,
-                    alpha: 1.0,
-                });
-                color.setStoreAction(MTLStoreAction::Store);
-            }
-            let commands = p.queue.commandBuffer().ok_or(ERR_METAL)?;
-            let encoder =
-                unsafe { commands.renderCommandEncoderWithDescriptor(&pass) }.ok_or(ERR_METAL)?;
-            encoder.endEncoding();
-            commands.presentDrawable(ProtocolObject::from_ref(&*drawable));
-            commands.commit();
+            // Read for every frame: the window may have moved to another screen.
+            p.refresh_hz = p
+                .window
+                .screen()
+                .map_or(p.refresh_hz, |s| s.maximumFramesPerSecond() as f64);
+            let (scale, refresh) = (p.scale, p.refresh_hz);
+            with_compositor(|c| c.present(&drawable, scroll as f64 * scale, background, refresh))?;
             p.frames += 1;
             Ok(0)
         })
     })
+}
+
+/// The refresh rate of the window's screen, or 0 with no window.
+pub(crate) fn refresh_hz() -> f64 {
+    PLATFORM.with(|cell| cell.borrow().as_ref().map_or(0.0, |p| p.refresh_hz))
 }
 
 /// Wakes the main thread's `tp_next_event` with an EV_WAKE carrying `token`.
@@ -424,6 +449,9 @@ pub extern "C" fn tp_wake(token: i64) -> i32 {
 /// Frames presented since the window opened. For the idle test.
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_frames() -> i64 {
+    if MainThreadMarker::new().is_none() {
+        return ERR_NOT_MAIN_THREAD as i64;
+    }
     match catch_unwind(|| PLATFORM.with(|cell| cell.borrow().as_ref().map_or(0, |p| p.frames))) {
         Ok(n) => n,
         Err(_) => ERR_PANIC as i64,
@@ -465,7 +493,8 @@ mod tests {
         );
         let mut e = GpEvent::default();
         assert_eq!(tp_next_event(0, &mut e), ERR_NOT_MAIN_THREAD);
-        assert_eq!(tp_present(0.0, 0.0, 0.0), ERR_NOT_MAIN_THREAD);
+        assert_eq!(tp_render(0.0, 0xFFFF_FFFF), ERR_NOT_MAIN_THREAD);
+        assert_eq!(tp_frames(), ERR_NOT_MAIN_THREAD as i64);
     }
 
     #[test]
