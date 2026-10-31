@@ -42,6 +42,7 @@ GOOSE_BIN=/path/to/goose ./app/build.sh   # the platform layer (cargo), then the
 ./app/tusk                                # the saved Focaccia article (tests/pages/)
 ./app/tusk --scroll-test                  # scrolls it for 10 s and prints what the frames cost
 ./app/tusk --screenshot out.png           # draws the window offscreen into a PNG, no window
+./app/tusk --screenshot out.png --size 1200x760 tests/pages/window.html   # the design's window, at its size
 ./app/tusk snapshot page.html             # the page as a tree for agents (docs/adr/0007)
 goose tests/engine_test.goose             # the engine's checks (after ./app/build.sh)
 ```

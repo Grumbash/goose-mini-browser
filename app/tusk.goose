@@ -5,8 +5,9 @@
 //
 //   tusk [page.html]                     open a page (the Focaccia article by default)
 //   tusk snapshot [page.html]            print the page as a tree for agents (docs/adr/0007)
-//   tusk --screenshot out.png [--at Y] [page.html]
-//                                        draw the window offscreen into a PNG; no window opens
+//   tusk --screenshot out.png [--at Y] [--size WxH] [page.html]
+//                                        draw the window offscreen into a PNG; no window opens;
+//                                        --size makes its page W × H points, the bar below
 //   tusk --scroll-test [page.html]       scroll the page for 10 s and print frame times
 //   tusk --idle-exit MS [page.html]      quit after MS of quiet (the idle test)
 //   tusk --wake-test                     a worker wakes the sleeping main thread (the M0 test)
@@ -122,9 +123,9 @@ fn measure_page(P: Page) {
     measure(L);
 }
 
-// Lays the page out `width` points wide and hands the display list to the
-// compositor. Returns the page's height.
-fn show_page(P: Page, width: f32, scale: f32, cost: Cost&) -> f32 {
+// Lays the page out `width` points wide, for a view `view_h` points high, and
+// hands the display list to the compositor. Returns the page's height.
+fn show_page(P: Page, width: f32, view_h: f32, scale: f32, cost: Cost&) -> f32 {
     var boxes: Rect[>..] = [];
     var items: DItem[>..<] = [];
     var flex: FlexItem[>..<] = [];
@@ -137,7 +138,7 @@ fn show_page(P: Page, width: f32, scale: f32, cost: Cost&) -> f32 {
                      fonts: P.fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
                      measured: measured, paths: paths, ids: ids, definite: definite };
     let t0 = clock_ns();
-    let height = layout_page(L, width, WINDOW_H - BAR_H);
+    let height = layout_page(L, width, view_h);
     let t1 = clock_ns();
     set_layer(LAYER_PAGE, items, P.text, paths, scale);
     cost.layout = ms(t0, t1);
@@ -213,7 +214,7 @@ thread_fn wake_after(ms: i64, token: i32) {
 }
 
 fn usage() {
-    write_stderr("usage: tusk [snapshot | --screenshot out.png [--at Y] | --scroll-test | --idle-exit MS | --wake-test] [page.html]\n");
+    write_stderr("usage: tusk [snapshot | --screenshot out.png [--at Y] [--size WxH] | --scroll-test | --idle-exit MS | --wake-test] [page.html]\n");
     exit(2);
 }
 
@@ -223,6 +224,9 @@ fn main() {
     var shot: u8[>..] = [];
     var at: f32 = 0.0;
     var has_at = false;
+    var shot_w = WINDOW_W;           // --size: the page's view in a screenshot, the bar below it
+    var shot_h = WINDOW_H - BAR_H;
+    var has_size = false;
     var idle_exit_ms: i64 = -1;
     let argv = args();
     var i: i64 = 1;
@@ -241,6 +245,16 @@ fn main() {
             guard ok else { usage(); return; }
             at = n as f32;
             has_at = true;
+        } else if a == "--size" && valued {
+            i += 1;
+            let x = find(argv[i], "x");
+            guard x > 0 else { usage(); return; }
+            let w, wok = parse_int(argv[i][..x]);
+            let h, hok = parse_int(argv[i][x + 1..]);
+            guard wok && hok && w >= 100 && w <= 4000 && h >= 100 && h <= 4000 else { usage(); return; }
+            shot_w = w;
+            shot_h = h;
+            has_size = true;
         } else if a == "--idle-exit" && valued {
             i += 1;
             let n, ok = parse_int(argv[i]);
@@ -251,7 +265,7 @@ fn main() {
         else { usage(); return; }
         i += 1;
     }
-    guard !has_at || mode == MODE_SCREENSHOT else { usage(); return; }
+    guard (!has_at && !has_size) || mode == MODE_SCREENSHOT else { usage(); return; }
     if path.len == 0 { path.append(str(resource_dir(), "../tests/pages/focaccia.html")); }
     // The fonts Tusk brings (Barlow Condensed, JetBrains Mono), before any text is measured.
     tp_register_fonts(str(resource_dir(), "fonts")[..]);
@@ -317,10 +331,10 @@ fn main() {
             return;
         }
         let scale: f32 = 2.0;
-        let page_h = show_page(P, WINDOW_W, scale, cost);
-        show_bar(P, path[name_start..], cost, WINDOW_W, WINDOW_H, scale);
-        let y = clamp_scroll(at, page_h, WINDOW_H - BAR_H);
-        let rc = tp_screenshot(shot, WINDOW_W, WINDOW_H, scale, y, bg);
+        let page_h = show_page(P, shot_w, shot_h, scale, cost);
+        show_bar(P, path[name_start..], cost, shot_w, shot_h + BAR_H, scale);
+        let y = clamp_scroll(at, page_h, shot_h);
+        let rc = tp_screenshot(shot, shot_w, shot_h + BAR_H, scale, y, bg);
         guard rc == 0 else {
             if rc == ERR_ARGUMENT {
                 write_stderr("tusk: no screenshot: the file can't be written\n");
@@ -412,7 +426,7 @@ fn main() {
             guard tp_next_event(0, e) == 0 && e.kind != EV_NONE else { break; }
         }
         if quit { break; }
-        if relayout { page_h = show_page(P, width, scale, cost); }
+        if relayout { page_h = show_page(P, width, height - BAR_H, scale, cost); }
         // The bar sits at the window's bottom edge: it moves with any resize.
         if resized { show_bar(P, path[name_start..], cost, width, height, scale); }
         scroll = clamp_scroll(scroll, page_h, height - BAR_H);
