@@ -195,8 +195,12 @@ fn breaks_out(p: Parser&, name: const u8[:], attr_start: i64) -> bool {
         || name == "table" || name == "tt" || name == "u" || name == "ul" || name == "var";
 }
 
-// The deepest the open elements go; Blink's parser stops at the same depth.
-let MAX_OPEN: i64 = 512;
+// The deepest the open elements go, as deep as Gecko lays out (Blink's
+// parser goes to 512). A page is laid out in a tab worker, whose stack is
+// 512 KB, and layout recurses once a level: nested inline blocks, the
+// costliest, overflowed it past 301 levels when measured, so 200 leaves
+// half as much again to spare (docs/adr/0010).
+let MAX_OPEN: i64 = 200;
 
 // Reads attributes up to and past the closing '>', and says whether a '/'
 // came just before it. HTML elements are void or not by name, whatever the

@@ -137,7 +137,7 @@ struct Line {
 // §5.2): down under 400, to 500 from 400 to 500, up over it; then whether it
 // is italic, and whether optional ligatures are off, as they are for
 // letter-spaced text (Text 3 §9.2).
-fn font_of(s: Style) -> i32 {
+fn font_of(s: const Style&) -> i32 {
     let w = s.weight;
     let hundreds = if w < 400 { max(w / 100, 1) } else if w == 400 { 4 } else if w <= 500 { 5 } else { min((w + 99) / 100, 10) };
     var f = s.family | (hundreds << 4);
@@ -146,7 +146,7 @@ fn font_of(s: Style) -> i32 {
     return f;
 }
 
-fn font_index(L: Layout, font: i32, size: f32) -> i32 {
+fn font_index(L: const Layout&, font: i32, size: f32) -> i32 {
     for f, i in L.fonts {
         if f.font == font && f.size == size { return i as i32; }
     }
@@ -169,12 +169,12 @@ fn font_index(L: Layout, font: i32, size: f32) -> i32 {
 // Measures the document's text: each rendered text node after white-space
 // processing, and each list item's marker. Runs once per document; layout at
 // any width afterwards reads what it found.
-fn measure(L: Layout) {
+fn measure(L: const Layout&) {
     while L.run_of.len < L.d.nodes.len { L.run_of.push(-1); }
     measure_children(L, 0);
 }
 
-recursive fn measure_children(L: Layout, n: i32) {
+recursive fn measure_children(L: const Layout&, n: i32) {
     var ordinal: i32 = 1;
     if is_element(L.d, n, "ol") {
         let v, has = attr_value(L.d, n, "start");
@@ -189,7 +189,7 @@ recursive fn measure_children(L: Layout, n: i32) {
         if node.kind == NODE_TEXT {
             add_text_run(L, c);
         } else if node.kind == NODE_ELEMENT && L.styles[c].display != K_NONE && L.styles[c].svg != 2 {
-            let s = L.styles[c];
+            let s .= L.styles[c];
             if s.display == K_LIST_ITEM {
                 add_marker_run(L, c, ordinal);
                 ordinal += 1;
@@ -202,8 +202,8 @@ recursive fn measure_children(L: Layout, n: i32) {
     }
 }
 
-fn add_text_run(L: Layout, n: i32) {
-    let s = L.styles[n];
+fn add_text_run(L: const Layout&, n: i32) {
+    let s .= L.styles[n];
     let start = L.text.len;
     let keep = s.ws == K_PRE || s.ws == K_PRE_WRAP;
     var last_space = false;
@@ -330,8 +330,8 @@ fn lower_of(cp: i32) -> i32 {
     return cp;
 }
 
-fn add_marker_run(L: Layout, li: i32, ordinal: i32) {
-    let s = L.styles[li];
+fn add_marker_run(L: const Layout&, li: i32, ordinal: i32) {
+    let s .= L.styles[li];
     guard s.list != K_NONE;
     let start = L.text.len;
     if s.list == K_DISC { push_utf8(L.text, 0x2022); }
@@ -348,14 +348,14 @@ fn add_marker_run(L: Layout, li: i32, ordinal: i32) {
 
 // The "…" that ends block n's lines when they are too long for it, in its
 // font, as its run.
-fn add_ellipsis_run(L: Layout, n: i32) {
+fn add_ellipsis_run(L: const Layout&, n: i32) {
     let start = L.text.len;
     push_utf8(L.text, 0x2026);
     add_run(L, n, L.styles[n], start);
 }
 
 // Measures the text appended to L.text since `start` as node n's run.
-fn add_run(L: Layout, n: i32, s: Style, start: i64) {
+fn add_run(L: const Layout&, n: i32, s: const Style&, start: i64) {
     let len = L.text.len - start;
     guard len > 0;
     let font = font_of(s);
@@ -428,7 +428,7 @@ fn roman_char(out: u8[>..]&, ch: u8, upper: bool) { out.push(if upper { ch - 32 
 // Returns the page's height. An absolute box with no positioned element
 // around it, and a fixed one, are placed on the first screen: `width` ×
 // `height` at the top of the page.
-fn layout_page(L: Layout, width: f32, height: f32) -> f32 {
+fn layout_page(L: const Layout&, width: f32, height: f32) -> f32 {
     while L.boxes.len < L.d.nodes.len { L.boxes.push(Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }); }
     while L.definite.len < L.d.nodes.len { L.definite.push(-1.0); }
     // The first screen is the root's containing block, its height definite.
@@ -480,21 +480,21 @@ fn layout_page(L: Layout, width: f32, height: f32) -> f32 {
     return page_h;
 }
 
-fn is_block_level(L: Layout, n: i32) -> bool {
+fn is_block_level(L: const Layout&, n: i32) -> bool {
     guard L.d.nodes[n].kind == NODE_ELEMENT else { return false; }
     let d = L.styles[n].display;
     return d == K_BLOCK || d == K_LIST_ITEM || d == K_FLEX;
 }
 
 // Whether element n lays its children out as flex items.
-fn is_flex(L: Layout, n: i32) -> bool {
+fn is_flex(L: const Layout&, n: i32) -> bool {
     let d = L.styles[n].display;
     return d == K_FLEX || d == K_INLINE_FLEX;
 }
 
 // An inline-block or inline-flex: on its line as one piece, laid out inside
 // as a block (place_atomic).
-fn is_atomic(L: Layout, n: i32) -> bool {
+fn is_atomic(L: const Layout&, n: i32) -> bool {
     guard L.d.nodes[n].kind == NODE_ELEMENT else { return false; }
     let d = L.styles[n].display;
     return d == K_INLINE_BLOCK || d == K_INLINE_FLEX || (d == K_INLINE && L.styles[n].svg == 1);
@@ -508,7 +508,12 @@ fn is_atomic(L: Layout, n: i32) -> bool {
 // shrink-to-fit), fitted inside 300 × 150; 300 × 150 without a ratio. Then
 // within its minimum and maximum width and height, at the same ratio when
 // both were auto.
-fn svg_size(L: Layout, n: i32, s: Style, avail: f32) -> f32, f32 {
+fn svg_size(L: const Layout&, n: i32, s: const Style&, avail: f32) -> f32, f32 {
+    return svg_size_of(L, n, s, avail, s.height, s.min_height, s.max_height);
+}
+
+// svg_size, with its height and its limits given (percentages resolved).
+fn svg_size_of(L: const Layout&, n: i32, s: const Style&, avail: f32, height: f32, min_height: f32, max_height: f32) -> f32, f32 {
     let hz = s.bl + s.pl + s.pr + s.br;
     let vt = s.bt + s.pt + s.pb + s.bb;
     let in_w: f32 = if s.border_box != 0 { hz } else { 0.0 };
@@ -517,15 +522,15 @@ fn svg_size(L: Layout, n: i32, s: Style, avail: f32) -> f32, f32 {
     if s.width >= 0.0 { w = max(s.width - in_w, 0.0); }
     else if s.width_pct >= 0.0 && avail >= 0.0 { w = max(avail * s.width_pct / 100.0 - in_w, 0.0); }
     var h: f32 = -1.0;
-    if s.height >= 0.0 { h = max(s.height - in_h, 0.0); }
+    if height >= 0.0 { h = max(height - in_h, 0.0); }
     var lo_w = max(s.min_width - in_w, 0.0);
     if s.min_width_pct >= 0.0 { lo_w = if avail >= 0.0 { max(avail * s.min_width_pct / 100.0 - in_w, 0.0) } else { 0.0 }; }
     var hi_w: f32 = NO_LIMIT;
     if s.max_width >= 0.0 { hi_w = max(s.max_width - in_w, 0.0); }
     else if s.max_width_pct >= 0.0 && avail >= 0.0 { hi_w = max(avail * s.max_width_pct / 100.0 - in_w, 0.0); }
-    let lo_h = max(s.min_height - in_h, 0.0);
+    let lo_h = max(min_height - in_h, 0.0);
     var hi_h: f32 = NO_LIMIT;
-    if s.max_height >= 0.0 { hi_h = max(s.max_height - in_h, 0.0); }
+    if max_height >= 0.0 { hi_h = max(max_height - in_h, 0.0); }
     // A minimum beats a maximum.
     hi_w = max(hi_w, lo_w);
     hi_h = max(hi_h, lo_h);
@@ -583,7 +588,7 @@ fn within(w: f32, h: f32, lo_w: f32, hi_w: f32, lo_h: f32, hi_h: f32) -> f32, f3
 
 // The paths inside <svg> n, whose content box is w × h at (x, y): items that
 // paint them, in order, their data in L.paths.
-fn svg_items(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) {
+fn svg_items(L: const Layout&, n: i32, x: f32, y: f32, w: f32, h: f32) {
     var painted: Painted[>..<] = [];
     if L.ids.len == 0 { index_ids(L.d, L.ids); }
     draw_svg(L.d, L.styles, L.ids, n, x, y, w, h, L.paths, painted);
@@ -599,12 +604,12 @@ fn svg_items(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) {
 }
 
 // A block-level element in the flow, which stacks below the one before.
-fn flow_block(L: Layout, n: i32) -> bool { return is_block_level(L, n) && !is_out(L, n); }
+fn flow_block(L: const Layout&, n: i32) -> bool { return is_block_level(L, n) && !is_out(L, n); }
 
 // Whether n is an element out of the flow, absolute or fixed: the flow only
 // notes in its box where it would have gone (its static position), and
 // place_box lays it out once the flow is done.
-fn is_out(L: Layout, n: i32) -> bool {
+fn is_out(L: const Layout&, n: i32) -> bool {
     guard L.d.nodes[n].kind == NODE_ELEMENT else { return false; }
     let p = L.styles[n].position;
     return p == K_ABSOLUTE || p == K_FIXED;
@@ -613,14 +618,14 @@ fn is_out(L: Layout, n: i32) -> bool {
 // Whether block n keeps its children's margins inside it, so that they don't
 // collapse with its own: the root, a box out of the flow, one that clips, a
 // flex container and a flex item, and an inline-block.
-fn keeps_margins(L: Layout, n: i32) -> bool {
+fn keeps_margins(L: const Layout&, n: i32) -> bool {
     let p = L.d.nodes[n].parent;
     return p == 0 || is_out(L, n) || clips_content(L, n) || is_flex(L, n) || is_atomic(L, n) || (p > 0 && is_flex(L, p));
 }
 
 // Whether n draws nothing: white space between blocks, a hidden element, or
 // an inline element with only such things in it.
-recursive fn is_blank(L: Layout, n: i32) -> bool {
+recursive fn is_blank(L: const Layout&, n: i32) -> bool {
     let node = L.d.nodes[n];
     if node.kind == NODE_ELEMENT {
         if L.styles[n].display == K_NONE || is_out(L, n) { return true; }
@@ -648,8 +653,8 @@ fn collapse(a: f32, b: f32) -> f32 {
 // with its own, while no border, padding or line comes between them. Empty
 // blocks on the way let the margins through. The root's margins don't
 // collapse with anything.
-recursive fn top_margin(L: Layout, n: i32) -> f32 {
-    let s = L.styles[n];
+recursive fn top_margin(L: const Layout&, n: i32) -> f32 {
+    let s .= L.styles[n];
     guard !keeps_margins(L, n) && s.bt == 0.0 && s.pt == 0.0 else { return s.mt; }
     var m = s.mt;
     var c = L.d.nodes[n].first;
@@ -669,8 +674,8 @@ recursive fn top_margin(L: Layout, n: i32) -> f32 {
 // of a parent's definite one included, and only blank content or empty
 // blocks. Its margins collapse through it (CSS 2.2 §8.3.1). A list item
 // isn't one: it still shows its marker.
-recursive fn is_empty_block(L: Layout, n: i32) -> bool {
-    let s = L.styles[n];
+recursive fn is_empty_block(L: const Layout&, n: i32) -> bool {
+    let s .= L.styles[n];
     let up = L.d.nodes[n].parent;
     let sized = up >= 0 && L.definite[up] > 0.0 && (s.height_pct > 0.0 || s.min_height_pct > 0.0);
     guard s.display == K_BLOCK && s.bt == 0.0 && s.pt == 0.0 && s.pb == 0.0 && s.bb == 0.0
@@ -691,31 +696,37 @@ recursive fn is_empty_block(L: Layout, n: i32) -> bool {
 // block that starts at x and is `avail` wide. Returns its border-box height,
 // its first baseline (-1 if it has no lines) and its bottom margin after
 // collapsing with its last child's.
-recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32, f32, f32 {
-    var s = L.styles[n];
+recursive fn layout_block(L: const Layout&, n: i32, x: f32, y: f32, avail: f32) -> f32, f32, f32 {
+    // Its style is read in place: this frame is on the stack once for every
+    // level of nesting, and a worker's stack is 512 KB.
+    let s .= L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;        // across, besides the content
     let vt = s.bt + s.pt + s.pb + s.bb;        // down, besides the content
     // A percentage height counts in the parent's content height when that is
     // definite (CSS 2.2 §10.5), and is auto otherwise; so do its limits.
     let up = L.d.nodes[n].parent;
     let cb_h: f32 = if up >= 0 { L.definite[up] } else { -1.0 };
+    var height = s.height;
+    var min_height = s.min_height;
+    var max_height = s.max_height;
     if cb_h >= 0.0 {
-        if s.height < 0.0 && s.height_pct >= 0.0 { s.height = cb_h * s.height_pct / 100.0; }
-        if s.min_height_pct >= 0.0 { s.min_height = cb_h * s.min_height_pct / 100.0; }
-        if s.max_height < 0.0 && s.max_height_pct >= 0.0 { s.max_height = cb_h * s.max_height_pct / 100.0; }
+        if height < 0.0 && s.height_pct >= 0.0 { height = cb_h * s.height_pct / 100.0; }
+        if s.min_height_pct >= 0.0 { min_height = cb_h * s.min_height_pct / 100.0; }
+        if max_height < 0.0 && s.max_height_pct >= 0.0 { max_height = cb_h * s.max_height_pct / 100.0; }
     }
-    L.definite[n] = if s.height >= 0.0 { content_height(s, 0.0, vt) } else { -1.0 };
+    L.definite[n] = if height >= 0.0 { fit_height(s, 0.0, vt, height, min_height, max_height) } else { -1.0 };
     // An <svg> is a replaced element: its size is its own, its content paths.
     let svg = s.svg == 1;
     var svg_h: f32 = 0.0;
+    var w: f32 = 0.0;
     if svg {
         // Its size, limits and percentages applied, is its box's.
-        let sw, sh = svg_size(L, n, s, avail);
-        s.width = sw + (if s.border_box != 0 { hz } else { 0.0 });
-        s.width_pct = -1.0;
+        let sw, sh = svg_size_of(L, n, s, avail, height, min_height, max_height);
+        w = limit_width(s, avail, hz, sw);
         svg_h = sh;
+    } else {
+        w = content_width(s, avail, hz);
     }
-    let w = content_width(s, avail, hz);
     var ml = s.ml;
     let room = avail - w - hz;
     if s.auto_ml != 0 && s.auto_mr != 0 { ml = max(room / 2.0, 0.0); }
@@ -726,11 +737,10 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
     // Its shadows, background and borders go under its content: their items
     // are kept here and written once its height is known.
     let paint_at = L.items.len;
-    var ps = s;
-    if paints_canvas(L, n) { ps.bg = 0; }
-    for k in box_paint_count(ps) { L.items.push(rect_item(n, bx, y, 0.0, 0.0, 0)); }
+    let canvas = paints_canvas(L, n);
+    for k in box_paint_count(s, canvas) { L.items.push(rect_item(n, bx, y, 0.0, 0.0, 0)); }
     let contained = keeps_margins(L, n);
-    let auto_height = s.height < 0.0 && s.min_height <= 0.0;
+    let auto_height = height < 0.0 && min_height <= 0.0;
     let absorb_bottom = !contained && s.bb == 0.0 && s.pb == 0.0 && auto_height;
     var inner: f32 = 0.0;
     var first: f32 = -1.0;
@@ -740,8 +750,8 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
     } else if is_flex(L, n) {
         // A height it has makes its items' room definite; percentages wait.
         var fh: f32 = -1.0;
-        if s.height >= 0.0 { fh = content_height(s, 0.0, vt); }
-        let lo, hi = height_limits(s);
+        if height >= 0.0 { fh = fit_height(s, 0.0, vt, height, min_height, max_height); }
+        let lo, hi = limits(s, min_height, max_height);
         let ih, ib = layout_flex(L, n, bx + s.bl + s.pl, y + s.bt + s.pt, w, fh, lo, hi);
         inner = ih;
         first = ib;
@@ -754,9 +764,9 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
     var ch = inner;
     var mb = s.mb;
     if absorb_bottom { mb = collapse(mb, trailing); } else { ch += trailing; }
-    ch = content_height(s, ch, vt);
+    ch = fit_height(s, ch, vt, height, min_height, max_height);
     let h = vt + ch;
-    box_paint(L, n, ps, paint_at, bx, y, bw, h);
+    box_paint(L, n, s, canvas, paint_at, bx, y, bw, h);
     if s.display == K_LIST_ITEM { paint_marker(L, n, bx + s.bl + s.pl, first); }
     if svg { svg_items(L, n, bx + s.bl + s.pl, y + s.bt + s.pt, w, ch); }
     L.boxes[n] = Rect { x: bx, y: y, w: bw, h: h };
@@ -766,7 +776,7 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
 // Whether element n's background is the canvas's, which the window is
 // cleared to instead of an item painting it: the root's, or the body's when
 // the root has none (CSS Backgrounds 3 §2.11.2).
-fn paints_canvas(L: Layout, n: i32) -> bool {
+fn paints_canvas(L: const Layout&, n: i32) -> bool {
     guard (L.styles[n].bg >> 24) != 0 else { return false; }
     let p = L.d.nodes[n].parent;
     if p == 0 { return true; }
@@ -776,11 +786,18 @@ fn paints_canvas(L: Layout, n: i32) -> bool {
 // A block's content width in a containing block `avail` wide: what its width
 // says, or what is left beside its margins, between its minimum and maximum.
 // `hz` is its padding and border across, which a border-box width includes.
-fn content_width(s: Style, avail: f32, hz: f32) -> f32 {
+fn content_width(s: const Style&, avail: f32, hz: f32) -> f32 {
     let inside: f32 = if s.border_box != 0 { hz } else { 0.0 };
     var w = avail - s.ml - s.mr - hz;
     if s.width >= 0.0 { w = s.width - inside; }
     else if s.width_pct >= 0.0 { w = avail * s.width_pct / 100.0 - inside; }
+    return limit_width(s, avail, hz, w);
+}
+
+// Content width w held between element s's minimum and maximum widths.
+fn limit_width(s: const Style&, avail: f32, hz: f32, content: f32) -> f32 {
+    let inside: f32 = if s.border_box != 0 { hz } else { 0.0 };
+    var w = content;
     var limit: f32 = -1.0;
     if s.max_width >= 0.0 { limit = max(s.max_width - inside, 0.0); }
     else if s.max_width_pct >= 0.0 { limit = max(avail * s.max_width_pct / 100.0 - inside, 0.0); }
@@ -794,17 +811,22 @@ fn content_width(s: Style, avail: f32, hz: f32) -> f32 {
 // says, between its minimum and maximum. `vt` is its padding and border down,
 // which a border-box height includes. Percentage heights wait for a
 // containing block of known height, so they count as auto for now.
-fn content_height(s: Style, needed: f32, vt: f32) -> f32 {
+fn content_height(s: const Style&, needed: f32, vt: f32) -> f32 {
+    return fit_height(s, needed, vt, s.height, s.min_height, s.max_height);
+}
+
+// content_height, with the height and its limits given (percentages resolved).
+fn fit_height(s: const Style&, needed: f32, vt: f32, height: f32, min_height: f32, max_height: f32) -> f32 {
     let inside: f32 = if s.border_box != 0 { vt } else { 0.0 };
     var h = needed;
-    if s.height >= 0.0 { h = s.height - inside; }
-    if s.max_height >= 0.0 && h > s.max_height - inside { h = s.max_height - inside; }
-    if h < s.min_height - inside { h = s.min_height - inside; }
+    if height >= 0.0 { h = height - inside; }
+    if max_height >= 0.0 && h > max_height - inside { h = max_height - inside; }
+    if h < min_height - inside { h = min_height - inside; }
     return max(h, 0.0);
 }
 
 // currentColor, a border's colour unless it has its own, is the text's.
-fn border_color(c: u32, s: Style) -> u32 { return if c == CURRENT_COLOR { s.color } else { c }; }
+fn border_color(c: u32, s: const Style&) -> u32 { return if c == CURRENT_COLOR { s.color } else { c }; }
 
 fn rect_item(n: i32, x: f32, y: f32, w: f32, h: f32, color: u32) -> DItem {
     return DItem { kind: ITEM_RECT, x: x, y: y, w: w, h: h, color: color, font: 0, size: 0.0, text: 0, text_len: 0, node: n,
@@ -827,7 +849,7 @@ fn text_item(n: i32, x: f32, y: f32, w: f32, color: u32, font: i32, size: f32, t
 }
 
 // A text item in style s: its font, size, colour and letter-spacing.
-fn styled_text(n: i32, x: f32, y: f32, w: f32, s: Style, text: i32, text_len: i32) -> DItem {
+fn styled_text(n: i32, x: f32, y: f32, w: f32, s: const Style&, text: i32, text_len: i32) -> DItem {
     var it = text_item(n, x, y, w, s.color, font_of(s), s.font_size, text, text_len);
     it.spacing = s.spacing;
     return it;
@@ -862,11 +884,11 @@ struct Sides { t: f32, r: f32, b: f32, l: f32 }
 
 fn even(w: f32) -> Sides { return Sides { t: w, r: w, b: w, l: w }; }
 
-fn any_radius(s: Style) -> bool { return s.rad_tl > 0.0 || s.rad_tr > 0.0 || s.rad_br > 0.0 || s.rad_bl > 0.0; }
+fn any_radius(s: const Style&) -> bool { return s.rad_tl > 0.0 || s.rad_tr > 0.0 || s.rad_br > 0.0 || s.rad_bl > 0.0; }
 
 // Element n's corner radii on a border box w × h: percentages of its shorter
 // side, fitted to the box.
-fn radii_of(s: Style, w: f32, h: f32) -> Radii {
+fn radii_of(s: const Style&, w: f32, h: f32) -> Radii {
     let side = min(w, h);
     var r = Radii { tl: s.rad_tl, tr: s.rad_tr, br: s.rad_br, bl: s.rad_bl };
     if (s.rad_pct & 1) != 0 { r.tl = s.rad_tl / 100.0 * side; }
@@ -907,13 +929,13 @@ fn shadow_radii(r: Radii, spread: f32, w: f32, h: f32) -> Radii {
 }
 
 // The radii of the padding box: each corner's less its wider border.
-fn inner_radii(r: Radii, s: Style) -> Radii {
+fn inner_radii(r: Radii, s: const Style&) -> Radii {
     return Radii { tl: max(r.tl - max(s.bt, s.bl), 0.0), tr: max(r.tr - max(s.bt, s.br), 0.0),
                    br: max(r.br - max(s.bb, s.br), 0.0), bl: max(r.bl - max(s.bb, s.bl), 0.0) };
 }
 
 // Side k's border (0 top, 1 right, 2 bottom, 3 left): its width, colour and style.
-fn side_border(s: Style, k: i64) -> f32, u32, i32 {
+fn side_border(s: const Style&, k: i64) -> f32, u32, i32 {
     if k == 0 { return s.bt, border_color(s.bt_color, s), s.bt_style; }
     if k == 1 { return s.br, border_color(s.br_color, s), s.br_style; }
     if k == 2 { return s.bb, border_color(s.bb_color, s), s.bb_style; }
@@ -924,7 +946,7 @@ fn side_border(s: Style, k: i64) -> f32, u32, i32 {
 // rounded or a border dashed, and the sides that have a border share its
 // colour and style (their widths may differ). Otherwise the background is
 // one item (a box if rounded) and each border a rect.
-fn one_box(s: Style) -> bool {
+fn one_box(s: const Style&) -> bool {
     var color: u32 = 0;
     var style: i32 = -1;
     var any = false;
@@ -940,7 +962,7 @@ fn one_box(s: Style) -> bool {
 }
 
 // What one_box's borders share: their colour, and whether they are dashed.
-fn shared_border(s: Style) -> u32, bool {
+fn shared_border(s: const Style&) -> u32, bool {
     for k in 4 {
         let w, c, st = side_border(s, k);
         if w > 0.0 { return c, st == K_DASHED; }
@@ -948,11 +970,13 @@ fn shared_border(s: Style) -> u32, bool {
     return 0, false;
 }
 
-// How many items box_paint writes for a block styled s: known before its
-// height is, so they can be reserved under its content.
-fn box_paint_count(s: Style) -> i64 {
+// How many items box_paint writes for a block styled s, its background left
+// out when it is the canvas's: known before its height is, so they can be
+// reserved under its content.
+fn box_paint_count(s: const Style&, canvas: bool) -> i64 {
     var n: i64 = 0;
-    let hides = (s.bg >> 24) == 255 || any_radius(s);
+    let fill = if canvas { 0 } else { s.bg };
+    let hides = (fill >> 24) == 255 || any_radius(s);
     for k in s.shadow_count {
         let sd = s.shadows[k];
         guard sd.blur == 0.0 else { continue; }
@@ -974,7 +998,7 @@ fn box_paint_count(s: Style) -> i64 {
             if sd.spread - sd.ox > 0.0 { n += 1; }
         }
     }
-    let bg = (s.bg >> 24) != 0;
+    let bg = (fill >> 24) != 0;
     if one_box(s) { return n + 1; }
     n += 1;    // its background, or else a hit item
     if s.bt > 0.0 && (border_color(s.bt_color, s) >> 24) != 0 { n += 1; }
@@ -994,11 +1018,12 @@ fn box_paint_count(s: Style) -> i64 {
 // (or the box is rounded, which it then doesn't always), else strips round
 // it. Inset shadows with an offset are straight bars, their corners left
 // square.
-fn box_paint(L: Layout, n: i32, s: Style, at: i64, x: f32, y: f32, w: f32, h: f32) {
+fn box_paint(L: const Layout&, n: i32, s: const Style&, canvas: bool, at: i64, x: f32, y: f32, w: f32, h: f32) {
     var k = at;
+    let fill = if canvas { 0 } else { s.bg };
     let r = radii_of(s, w, h);
     let rounded = any_radius(s);
-    let hides = (s.bg >> 24) == 255 || rounded;
+    let hides = (fill >> 24) == 255 || rounded;
     for j in s.shadow_count {
         let sd = s.shadows[s.shadow_count - 1 - j];
         guard sd.blur == 0.0 && sd.inset == 0 else { continue; }
@@ -1031,10 +1056,10 @@ fn box_paint(L: Layout, n: i32, s: Style, at: i64, x: f32, y: f32, w: f32, h: f3
     }
     if one_box(s) {
         let c, dashed = shared_border(s);
-        L.items[k] = box_item(n, x, y, w, h, s.bg, r, Sides { t: s.bt, r: s.br, b: s.bb, l: s.bl }, c, dashed);
+        L.items[k] = box_item(n, x, y, w, h, fill, r, Sides { t: s.bt, r: s.br, b: s.bb, l: s.bl }, c, dashed);
         k += 1;
-    } else if (s.bg >> 24) != 0 {
-        L.items[k] = if rounded { box_item(n, x, y, w, h, s.bg, r, even(0.0), 0, false) } else { rect_item(n, x, y, w, h, s.bg) };
+    } else if (fill >> 24) != 0 {
+        L.items[k] = if rounded { box_item(n, x, y, w, h, fill, r, even(0.0), 0, false) } else { rect_item(n, x, y, w, h, fill) };
         k += 1;    } else {
         var hit = box_item(n, x, y, w, h, 0, r, even(0.0), 0, false);
         hit.kind = ITEM_HIT;
@@ -1089,7 +1114,7 @@ fn fade(c: u32, a: f32) -> u32 {
 // taken its first child's top margin as its own. Returns the height, the first
 // baseline (-1 if none) and the last child's bottom margin, which the caller
 // places or collapses with n's.
-recursive fn layout_children(L: Layout, n: i32, x: f32, y: f32, w: f32, absorbed_top: bool) -> f32, f32, f32 {
+recursive fn layout_children(L: const Layout&, n: i32, x: f32, y: f32, w: f32, absorbed_top: bool) -> f32, f32, f32 {
     var cy = y;
     var margin: f32 = 0.0;       // the margin below the last block, not yet placed
     var at_top = absorbed_top;   // nothing placed yet whose margin could separate
@@ -1149,8 +1174,8 @@ recursive fn layout_children(L: Layout, n: i32, x: f32, y: f32, w: f32, absorbed
 // Lays the inline nodes from `from` up to `to` (a sibling, or -1) into lines
 // in the content box of their parent block. Returns the lines' height and the
 // first baseline.
-fn layout_lines(L: Layout, parent: i32, from: i32, to: i32, x: f32, y: f32, w: f32) -> f32, f32 {
-    let s = L.styles[parent];
+fn layout_lines(L: const Layout&, parent: i32, from: i32, to: i32, x: f32, y: f32, w: f32) -> f32, f32 {
+    let s .= L.styles[parent];
     // font_index may add a font: take its index before indexing L.fonts.
     let fi = font_index(L, font_of(s), s.font_size);
     let f = L.fonts[fi];
@@ -1172,14 +1197,14 @@ fn layout_lines(L: Layout, parent: i32, from: i32, to: i32, x: f32, y: f32, w: f
     return line.y - y, line.first_baseline;
 }
 
-recursive fn flow_node(L: Layout, line: Line&, n: i32) {
+recursive fn flow_node(L: const Layout&, line: Line&, n: i32) {
     let node = L.d.nodes[n];
     if node.kind == NODE_TEXT { flow_text(L, line, n); return; }
     guard node.kind == NODE_ELEMENT && L.styles[n].display != K_NONE;
     if is_out(L, n) { static_position(L, n, line.left + line.x, line.y); return; }
     if is_atomic(L, n) { place_atomic(L, line, n); return; }
     if node_name(L.d, n) == "br" { close_line(L, line, true); return; }
-    let s = L.styles[n];
+    let s .= L.styles[n];
     // A block inside inline content gets lines of its own; its margins and
     // markers wait for block-in-inline splitting.
     let own_lines = flow_block(L, n);
@@ -1203,11 +1228,11 @@ recursive fn flow_node(L: Layout, line: Line&, n: i32) {
 // that runs on into the next text without a space (a link and its comma, a
 // word and its citation) moves to the next line whole, and so does text
 // that mustn't wrap.
-fn flow_text(L: Layout, line: Line&, n: i32) {
+fn flow_text(L: const Layout&, line: Line&, n: i32) {
     let r = L.run_of[n];
     guard r >= 0;
     let run = L.runs[r];
-    let s = L.styles[n];
+    let s .= L.styles[n];
     let f = L.fonts[run.font];
     let wraps = s.ws == K_NORMAL || s.ws == K_PRE_WRAP;
     let collapsible = s.ws == K_NORMAL || s.ws == K_NOWRAP;
@@ -1275,11 +1300,11 @@ fn flow_text(L: Layout, line: Line&, n: i32) {
 
 // How far above its line's baseline text node n sits: the shifts of the
 // superscripts and subscripts it is in, up to its block.
-fn raise_of(L: Layout, n: i32) -> f32 {
+fn raise_of(L: const Layout&, n: i32) -> f32 {
     var raise: f32 = 0.0;
     var e = L.d.nodes[n].parent;
     while e >= 0 && L.d.nodes[e].kind == NODE_ELEMENT && !is_block_level(L, e) && !is_atomic(L, e) {
-        let s = L.styles[e];
+        let s .= L.styles[e];
         if s.valign == K_SUPER { raise += s.font_size * 0.45; }
         else if s.valign == K_SUB { raise -= s.font_size * 0.2; }
         e = L.d.nodes[e].parent;
@@ -1289,7 +1314,7 @@ fn raise_of(L: Layout, n: i32) -> f32 {
 
 // The width of what follows text node n with no break opportunity between:
 // the next text up to its first space, and on through texts with none.
-fn glued_after(L: Layout, n: i32) -> f32 {
+fn glued_after(L: const Layout&, n: i32) -> f32 {
     var w: f32 = 0.0;
     var m = next_inline_text(L, n);
     while m >= 0 {
@@ -1311,7 +1336,7 @@ fn glued_after(L: Layout, n: i32) -> f32 {
 // The next text node after n on the same lines, or -1 where a block, a <br>
 // or a table cell or list item comes first: those end the line or allow a
 // break.
-fn next_inline_text(L: Layout, n: i32) -> i32 {
+fn next_inline_text(L: const Layout&, n: i32) -> i32 {
     var at = n;
     var enter = false;
     loop {
@@ -1332,13 +1357,13 @@ fn next_inline_text(L: Layout, n: i32) -> i32 {
 }
 
 // Cells and list items laid out inline: their edges allow a break.
-fn ends_unit(L: Layout, e: i32) -> bool {
+fn ends_unit(L: const Layout&, e: i32) -> bool {
     let t = node_name(L.d, e);
     return t == "td" || t == "th" || t == "li";
 }
 
 // The index after the character that starts at byte i of a run's text.
-fn next_char(L: Layout, t: i32, i: i32, end: i32) -> i32 {
+fn next_char(L: const Layout&, t: i32, i: i32, end: i32) -> i32 {
     var k = i + 1;
     while k < end && (L.text[t + k] & 0xC0) == 0x80 { k += 1; }
     return k;
@@ -1355,7 +1380,7 @@ fn place(line: Line&, w: f32, space: bool, trailing: f32, above: f32, below: f32
 
 // Paints bytes [from, to) of a run as one text item at x on the current line,
 // with its decoration. Until the line closes, y is relative to its baseline.
-fn emit_text(L: Layout, line: Line&, run: Run, s: Style, from: i32, to: i32, x: f32, raise: f32) {
+fn emit_text(L: const Layout&, line: Line&, run: Run, s: const Style&, from: i32, to: i32, x: f32, raise: f32) {
     let c = run.caret;
     L.items.push(styled_text(run.node, line.left + x, -raise, L.carets[c + to] - L.carets[c + from], s, run.start + from, to - from));
     guard s.deco == K_UNDERLINE || s.deco == K_LINE_THROUGH;
@@ -1370,7 +1395,7 @@ fn emit_text(L: Layout, line: Line&, run: Run, s: Style, from: i32, to: i32, x: 
 
 // Ends the current line: sets its items on its baseline, aligns them, and
 // starts the next line below. An empty line takes no room unless forced (<br>).
-fn close_line(L: Layout, line: Line&, forced: bool) {
+fn close_line(L: const Layout&, line: Line&, forced: bool) {
     if line.content || forced {
         let baseline = line.y + line.ascent;
         var used = line.x - (if line.space { line.trailing } else { 0.0 });
@@ -1405,7 +1430,7 @@ fn close_line(L: Layout, line: Line&, forced: bool) {
 // text-overflow): the text up to the last character that fits with the
 // ellipsis after it; what is past that is dropped. Returns the line's new
 // width. Its items are still relative to its baseline, x from the page.
-fn ellipsize(L: Layout, line: Line&) -> f32 {
+fn ellipsize(L: const Layout&, line: Line&) -> f32 {
     let er = L.runs[line.ellipsis];
     let ew = L.carets[er.caret + er.len] - L.carets[er.caret];
     let limit = line.left + max(line.width - ew, 0.0);
@@ -1445,7 +1470,7 @@ fn ellipsize(L: Layout, line: Line&) -> f32 {
         cut_w = L.items[k].w;
         end_x = max(end_x, it.x + cut_w);
     }
-    let s = L.styles[er.node];
+    let s .= L.styles[er.node];
     L.items.push(styled_text(er.node, end_x, 0.0, ew, s, er.start, er.len));
     return end_x + ew - line.left;
 }
@@ -1457,8 +1482,8 @@ fn ellipsize(L: Layout, line: Line&) -> f32 {
 // wraps, and a line may break after it. Its items wait on the line, relative
 // to its baseline like text, and its boxes go on L.atoms until close_line
 // moves them too.
-recursive fn place_atomic(L: Layout, line: Line&, n: i32) {
-    let s = L.styles[n];
+recursive fn place_atomic(L: const Layout&, line: Line&, n: i32) {
+    let s .= L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;
     let inside: f32 = if s.border_box != 0 { hz } else { 0.0 };
     var w: f32 = 0.0;
@@ -1493,11 +1518,11 @@ recursive fn place_atomic(L: Layout, line: Line&, n: i32) {
 }
 
 // A list item's marker, outside its content box, on its first line.
-fn paint_marker(L: Layout, li: i32, content_x: f32, baseline: f32) {
+fn paint_marker(L: const Layout&, li: i32, content_x: f32, baseline: f32) {
     let r = L.run_of[li];
     guard r >= 0 && baseline >= 0.0;
     let run = L.runs[r];
-    let s = L.styles[li];
+    let s .= L.styles[li];
     let w = L.carets[run.caret + run.len] - L.carets[run.caret];
     L.items.push(styled_text(li, content_x - w - s.font_size * 0.45, baseline, w, s, run.start, run.len));
 }
@@ -1522,10 +1547,10 @@ fn first_line(a: Rect, b: Rect) -> Rect {
     return union(a, b);
 }
 
-fn grow_box(L: Layout, n: i32, r: Rect) { L.boxes[n] = first_line(L.boxes[n], r); }
+fn grow_box(L: const Layout&, n: i32, r: Rect) { L.boxes[n] = first_line(L.boxes[n], r); }
 
 // An inline element's box is the first line of what it contains.
-recursive fn inline_boxes(L: Layout, n: i32) -> Rect {
+recursive fn inline_boxes(L: const Layout&, n: i32) -> Rect {
     var b = L.boxes[n];
     let inline = L.d.nodes[n].kind == NODE_ELEMENT && !is_block_level(L, n) && !is_atomic(L, n) && L.styles[n].display != K_NONE;
     var c = L.d.nodes[n].first;
@@ -1542,7 +1567,7 @@ recursive fn inline_boxes(L: Layout, n: i32) -> Rect {
 
 // Notes (x, y) as the static position of n if it is out of the flow, else of
 // those out of the flow in it, until lines place them better.
-recursive fn note_static(L: Layout, n: i32, x: f32, y: f32) {
+recursive fn note_static(L: const Layout&, n: i32, x: f32, y: f32) {
     guard L.d.nodes[n].kind == NODE_ELEMENT && L.styles[n].display != K_NONE;
     if is_out(L, n) {
         static_position(L, n, x, y);
@@ -1557,11 +1582,11 @@ recursive fn note_static(L: Layout, n: i32, x: f32, y: f32) {
 
 // Notes where out-of-flow element n would have gone in the flow (its static
 // position), for place_box: in its box, which has no size yet.
-fn static_position(L: Layout, n: i32, x: f32, y: f32) { L.boxes[n] = Rect { x: x, y: y, w: 0.0, h: 0.0 }; }
+fn static_position(L: const Layout&, n: i32, x: f32, y: f32) { L.boxes[n] = Rect { x: x, y: y, w: 0.0, h: 0.0 }; }
 
 // Lays out the absolute and fixed elements under n in document order, so
 // that one is placed before those inside it, whose containing block it may be.
-recursive fn place_positioned(L: Layout, n: i32, width: f32, height: f32) {
+recursive fn place_positioned(L: const Layout&, n: i32, width: f32, height: f32) {
     var c = L.d.nodes[n].first;
     while c >= 0 {
         if L.d.nodes[c].kind == NODE_ELEMENT && L.styles[c].display != K_NONE && L.styles[c].svg != 2 {
@@ -1579,8 +1604,8 @@ recursive fn place_positioned(L: Layout, n: i32, width: f32, height: f32) {
 // content's, unless top and bottom stretch it, and a box hung from its bottom
 // moves up once its height is known. layout_block lays it out with its style
 // briefly saying the width and height worked out here.
-fn place_box(L: Layout, e: i32, vw: f32, vh: f32) {
-    let s = L.styles[e];
+fn place_box(L: const Layout&, e: i32, vw: f32, vh: f32) {
+    let s .= L.styles[e];
     let cb = containing_block(L, e, vw, vh);
     let stat = L.boxes[e];
     let auto_t = (s.inset_auto & 1) != 0;
@@ -1661,38 +1686,56 @@ fn place_box(L: Layout, e: i32, vw: f32, vh: f32) {
 // -2 as its content needs, whatever its height says; either way between `lo`
 // and `hi` (content box; hi -1: no limit). Returns its border-box height
 // and its first baseline (-1 if none).
-recursive fn layout_sized(L: Layout, c: i32, x: f32, y: f32, w: f32, h: f32, lo: f32, hi: f32) -> f32, f32 {
-    let s = L.styles[c];
+recursive fn layout_sized(L: const Layout&, c: i32, x: f32, y: f32, w: f32, h: f32, lo: f32, hi: f32) -> f32, f32 {
+    // Its style is held to that size while it is laid out, then put back:
+    // only the fields that change are kept aside, so the recursion through
+    // here holds a few numbers, not two styles.
+    let s .= L.styles[c];
     let vt = s.bt + s.pt + s.pb + s.bb;
-    var o = s;
-    o.width = w; o.width_pct = -1.0; o.min_width = 0.0; o.min_width_pct = -1.0; o.max_width = -1.0; o.max_width_pct = -1.0;
-    o.ml = 0.0; o.mr = 0.0; o.auto_ml = 0; o.auto_mr = 0; o.border_box = 0;
-    if h >= 0.0 { o.height = h; }
-    else if h == -1.0 && s.height >= 0.0 { o.height = max(s.height - (if s.border_box != 0 { vt } else { 0.0 }), 0.0); }
-    else { o.height = -1.0; }
-    o.height_pct = -1.0;
-    o.min_height = if h >= 0.0 { 0.0 } else { max(lo, 0.0) };
-    o.max_height = if h >= 0.0 { -1.0 } else { hi };
-    o.min_height_pct = -1.0;
-    o.max_height_pct = -1.0;
-    L.styles[c] = o;
-    let bh, base, mb = layout_block(L, c, x, y, w + s.bl + s.pl + s.pr + s.br);
-    L.styles[c] = s;
+    let hz = s.bl + s.pl + s.pr + s.br;
+    let width = s.width; let width_pct = s.width_pct;
+    let min_width = s.min_width; let min_width_pct = s.min_width_pct;
+    let max_width = s.max_width; let max_width_pct = s.max_width_pct;
+    let ml = s.ml; let mr = s.mr; let auto_ml = s.auto_ml; let auto_mr = s.auto_mr; let border_box = s.border_box;
+    let height = s.height; let height_pct = s.height_pct;
+    let min_height = s.min_height; let min_height_pct = s.min_height_pct;
+    let max_height = s.max_height; let max_height_pct = s.max_height_pct;
+    s.width = w; s.width_pct = -1.0; s.min_width = 0.0; s.min_width_pct = -1.0; s.max_width = -1.0; s.max_width_pct = -1.0;
+    s.ml = 0.0; s.mr = 0.0; s.auto_ml = 0; s.auto_mr = 0; s.border_box = 0;
+    if h >= 0.0 { s.height = h; }
+    else if h == -1.0 && height >= 0.0 { s.height = max(height - (if border_box != 0 { vt } else { 0.0 }), 0.0); }
+    else { s.height = -1.0; }
+    s.height_pct = -1.0;
+    s.min_height = if h >= 0.0 { 0.0 } else { max(lo, 0.0) };
+    s.max_height = if h >= 0.0 { -1.0 } else { hi };
+    s.min_height_pct = -1.0;
+    s.max_height_pct = -1.0;
+    let bh, base, mb = layout_block(L, c, x, y, w + hz);
+    s.width = width; s.width_pct = width_pct; s.min_width = min_width; s.min_width_pct = min_width_pct;
+    s.max_width = max_width; s.max_width_pct = max_width_pct;
+    s.ml = ml; s.mr = mr; s.auto_ml = auto_ml; s.auto_mr = auto_mr; s.border_box = border_box;
+    s.height = height; s.height_pct = height_pct; s.min_height = min_height; s.min_height_pct = min_height_pct;
+    s.max_height = max_height; s.max_height_pct = max_height_pct;
     return bh, base;
 }
 
 // Element s's own min-height and max-height, content box (max -1: none).
-fn height_limits(s: Style) -> f32, f32 {
+fn height_limits(s: const Style&) -> f32, f32 {
+    return limits(s, s.min_height, s.max_height);
+}
+
+// height_limits, with the limits given (percentages resolved).
+fn limits(s: const Style&, min_height: f32, max_height: f32) -> f32, f32 {
     let inside: f32 = if s.border_box != 0 { s.bt + s.pt + s.pb + s.bb } else { 0.0 };
-    return max(s.min_height - inside, 0.0), if s.max_height >= 0.0 { max(s.max_height - inside, 0.0) } else { -1.0 };
+    return max(min_height - inside, 0.0), if max_height >= 0.0 { max(max_height - inside, 0.0) } else { -1.0 };
 }
 
 // What out-of-flow element e is placed against: the padding box of its
 // containing element, or the first screen when there is none.
-fn containing_block(L: Layout, e: i32, vw: f32, vh: f32) -> Rect {
+fn containing_block(L: const Layout&, e: i32, vw: f32, vh: f32) -> Rect {
     let a = containing_element(L, e);
     guard a > 0 else { return Rect { x: 0.0, y: 0.0, w: vw, h: vh }; }
-    let s = L.styles[a];
+    let s .= L.styles[a];
     let b = L.boxes[a];
     return Rect { x: b.x + s.bl, y: b.y + s.bt, w: max(b.w - s.bl - s.br, 0.0), h: max(b.h - s.bt - s.bb, 0.0) };
 }
@@ -1700,7 +1743,7 @@ fn containing_block(L: Layout, e: i32, vw: f32, vh: f32) -> Rect {
 // The element out-of-flow element e is placed against, or 0 for the first
 // screen: an absolute box's nearest positioned or transformed element, a
 // fixed box's nearest transformed one.
-fn containing_element(L: Layout, e: i32) -> i32 {
+fn containing_element(L: const Layout&, e: i32) -> i32 {
     let fixed = L.styles[e].position == K_FIXED;
     var a = L.d.nodes[e].parent;
     while a > 0 && !transforms(L, a) && (fixed || L.styles[a].position == K_STATIC) { a = L.d.nodes[a].parent; }
@@ -1710,7 +1753,7 @@ fn containing_element(L: Layout, e: i32) -> i32 {
 fn inset_px(v: f32, pct: bool, base: f32) -> f32 { return if pct { v / 100.0 * base } else { v }; }
 
 // Moves the boxes of n and everything in it by (dx, dy).
-recursive fn shift_boxes(L: Layout, n: i32, dx: f32, dy: f32) {
+recursive fn shift_boxes(L: const Layout&, n: i32, dx: f32, dy: f32) {
     L.boxes[n].x += dx;
     L.boxes[n].y += dy;
     var c = L.d.nodes[n].first;
@@ -1722,7 +1765,7 @@ recursive fn shift_boxes(L: Layout, n: i32, dx: f32, dy: f32) {
 
 // The lowest bottom edge of an absolute box that nothing clips, which the
 // page must reach down to.
-fn positioned_bottom(L: Layout) -> f32 {
+fn positioned_bottom(L: const Layout&) -> f32 {
     var bottom: f32 = 0.0;
     for n in L.d.nodes.len {
         guard L.d.nodes[n].kind == NODE_ELEMENT && L.styles[n].position == K_ABSOLUTE && L.boxes[n].h > 0.0 else { continue; }
@@ -1733,7 +1776,7 @@ fn positioned_bottom(L: Layout) -> f32 {
 
 // Whether an element that clips cuts element n, through the elements its
 // containing blocks are, as clip_items walks them.
-fn is_clipped(L: Layout, n: i32) -> bool {
+fn is_clipped(L: const Layout&, n: i32) -> bool {
     var e = n;
     loop {
         let up = clip_parent(L, e);
@@ -1745,24 +1788,24 @@ fn is_clipped(L: Layout, n: i32) -> bool {
 
 // The next element up whose overflow could cut node e: its parent, or an
 // out-of-flow box's containing element (none, 0, for the first screen).
-fn clip_parent(L: Layout, e: i32) -> i32 {
+fn clip_parent(L: const Layout&, e: i32) -> i32 {
     if is_out(L, e) { return containing_element(L, e); }
     return L.d.nodes[e].parent;
 }
 
 // Whether element n cuts what is in it: its overflow isn't visible, and it
 // holds blocks (overflow doesn't apply to inline boxes).
-fn clips_content(L: Layout, n: i32) -> bool {
+fn clips_content(L: const Layout&, n: i32) -> bool {
     return L.styles[n].clips != 0 && is_box(L.styles[n]);
 }
 
 // Whether a styled element is a box that overflow and transforms apply to:
 // not an inline box, though an <svg> on a line is one, being replaced.
-fn is_box(s: Style) -> bool { return s.display != K_INLINE || s.svg == 1; }
+fn is_box(s: const Style&) -> bool { return s.display != K_INLINE || s.svg == 1; }
 
 // Moves each relatively positioned element, and everything in it, by its
 // offsets (CSS 2.2 §9.4.3): the items they paint and their boxes.
-fn shift_relative(L: Layout) {
+fn shift_relative(L: const Layout&) {
     for k in L.items.len {
         let n = L.items[k].node;
         guard n >= 0 else { continue; }
@@ -1782,20 +1825,20 @@ fn shift_relative(L: Layout) {
 // bottom), percentages of their parent's content box. A fixed box inside one
 // moves only with those around its containing element, when a transformed
 // one is it.
-fn relative_offset(L: Layout, n: i32) -> f32, f32 {
+fn relative_offset(L: const Layout&, n: i32) -> f32, f32 {
     var dx: f32 = 0.0;
     var dy: f32 = 0.0;
     var e = n;
     while e > 0 {
         if L.d.nodes[e].kind == NODE_ELEMENT {
-            let s = L.styles[e];
+            let s .= L.styles[e];
             if s.position == K_FIXED {
                 e = containing_element(L, e);
                 continue;
             }
             if s.position == K_RELATIVE {
                 let p = L.d.nodes[e].parent;
-                let ps = L.styles[p];
+                let ps .= L.styles[p];
                 let pb = L.boxes[p];
                 let cw = max(pb.w - ps.bl - ps.pl - ps.pr - ps.br, 0.0);
                 let ch = max(pb.h - ps.bt - ps.pt - ps.pb - ps.bb, 0.0);
@@ -1822,8 +1865,8 @@ struct Widths { min: f32, max: f32, line: f32, word: f32, space: f32, start: boo
 // Element n's border box across at its min-content and max-content widths
 // (CSS Sizing 3), for shrink-to-fit: its width if it has one, else what its
 // content needs, within its min-width and max-width.
-recursive fn content_widths(L: Layout, n: i32) -> f32, f32 {
-    let s = L.styles[n];
+recursive fn content_widths(L: const Layout&, n: i32) -> f32, f32 {
+    let s .= L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;
     let inside: f32 = if s.border_box != 0 { 0.0 } else { hz };
     if s.svg == 1 {
@@ -1846,8 +1889,8 @@ recursive fn content_widths(L: Layout, n: i32) -> f32, f32 {
 
 // Element n's border box across at the min-content and max-content widths
 // of what is in it, whatever width it says it has.
-recursive fn inner_widths(L: Layout, n: i32) -> f32, f32 {
-    let s = L.styles[n];
+recursive fn inner_widths(L: const Layout&, n: i32) -> f32, f32 {
+    let s .= L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;
     if s.svg == 1 {
         // What is in an <svg> is drawn to its size.
@@ -1870,7 +1913,7 @@ recursive fn inner_widths(L: Layout, n: i32) -> f32, f32 {
 
 // Adds node n to the widths being gathered: text word by word, inline
 // elements with their margins and padding, and a block on lines of its own.
-recursive fn add_widths(L: Layout, n: i32, p: Widths&) {
+recursive fn add_widths(L: const Layout&, n: i32, p: Widths&) {
     let node = L.d.nodes[n];
     if node.kind == NODE_TEXT {
         let r = L.run_of[n];
@@ -1906,7 +1949,7 @@ recursive fn add_widths(L: Layout, n: i32, p: Widths&) {
     }
     guard node.kind == NODE_ELEMENT && L.styles[n].display != K_NONE && !is_out(L, n);
     if node_name(L.d, n) == "br" { end_widths(p); return; }
-    let s = L.styles[n];
+    let s .= L.styles[n];
     if is_atomic(L, n) {
         // One piece, with a chance to break on either side.
         let least, most = content_widths(L, n);
@@ -1963,7 +2006,7 @@ struct Paint { first: i32[>..]&, count: i32[>..]&, by_node: i32[>..]&, order: i3
 // stacking context; one with z-index auto paints its own content at its
 // place, while what is positioned inside it joins the context around it.
 // Opacity doesn't start one here (each item is faded on its own).
-fn stack(L: Layout) {
+fn stack(L: const Layout&) {
     var first: i32[>..] = [];
     var count: i32[>..] = [];
     for n in L.d.nodes.len { first.push(0); count.push(0); }
@@ -1998,7 +2041,7 @@ fn stack(L: Layout) {
 
 // An element's z-index, which only positioned boxes and flex items have (CSS
 // 2.2 §9.9.1, Flexbox 1 §4.3): 0 for the others, and for auto.
-fn z_index(L: Layout, e: i32) -> i32 {
+fn z_index(L: const Layout&, e: i32) -> i32 {
     let p = L.d.nodes[e].parent;
     if L.styles[e].position != K_STATIC || (p >= 0 && is_flex(L, p)) { return L.styles[e].z; }
     return 0;
@@ -2006,16 +2049,16 @@ fn z_index(L: Layout, e: i32) -> i32 {
 
 // Whether a styled element starts a stacking context of its own: a
 // positioned one with a z-index, a fixed one, and a transformed one.
-fn stacks(s: Style) -> bool {
+fn stacks(s: const Style&) -> bool {
     return s.position == K_FIXED || (s.position != K_STATIC && s.z_auto == 0) || (s.xf_count > 0 && is_box(s));
 }
 
-fn emit_own(P: Paint, n: i32) {
+fn emit_own(P: const Paint&, n: i32) {
     for k in P.first[n]..P.first[n] + P.count[n] { P.order.push(P.by_node[k]); }
 }
 
 // Paints the stacking context of n, the document or an element that starts one.
-recursive fn paint_context(L: Layout, P: Paint, n: i32) {
+recursive fn paint_context(L: const Layout&, P: const Paint&, n: i32) {
     emit_own(P, n);
     let mark = P.scratch.len;
     gather(L, P, n);
@@ -2028,7 +2071,7 @@ recursive fn paint_context(L: Layout, P: Paint, n: i32) {
     paint_flow(L, P, n);
     for i in mark..end {
         let e = P.scratch[i];
-        let s = L.styles[e];
+        let s .= L.styles[e];
         if !stacks(s) {
             emit_own(P, e);
             paint_flow(L, P, e);
@@ -2042,11 +2085,11 @@ recursive fn paint_context(L: Layout, P: Paint, n: i32) {
 
 // Collects in P.scratch the positioned elements in n's stacking context, in
 // document order: not those inside one that starts its own.
-recursive fn gather(L: Layout, P: Paint, n: i32) {
+recursive fn gather(L: const Layout&, P: const Paint&, n: i32) {
     var c = L.d.nodes[n].first;
     while c >= 0 {
         if L.d.nodes[c].kind == NODE_ELEMENT && L.styles[c].display != K_NONE && L.styles[c].svg != 2 {
-            let s = L.styles[c];
+            let s .= L.styles[c];
             if s.position != K_STATIC || stacks(s) { P.scratch.push(c); }
             if !stacks(s) { gather(L, P, c); }
         }
@@ -2056,7 +2099,7 @@ recursive fn gather(L: Layout, P: Paint, n: i32) {
 
 // Sorts P.scratch[a..b] by z-index, document order kept among equals: a
 // merge sort, merging into room above b.
-fn sort_by_z(L: Layout, P: Paint, a: i64, b: i64) {
+fn sort_by_z(L: const Layout&, P: const Paint&, a: i64, b: i64) {
     let n = b - a;
     guard n > 1;
     for i in n { P.scratch.push(0); }
@@ -2088,7 +2131,7 @@ fn sort_by_z(L: Layout, P: Paint, a: i64, b: i64) {
 }
 
 // Paints what is in n and isn't positioned, in document order.
-recursive fn paint_flow(L: Layout, P: Paint, n: i32) {
+recursive fn paint_flow(L: const Layout&, P: const Paint&, n: i32) {
     var c = L.d.nodes[n].first;
     while c >= 0 {
         let node = L.d.nodes[c];
@@ -2114,7 +2157,7 @@ recursive fn paint_flow(L: Layout, P: Paint, n: i32) {
 // marker, by the element itself too. An item with nothing left to show is
 // dropped; one wholly inside a square clip with no transform between needs
 // none.
-fn clip_items(L: Layout, mats: Mat[>..]&) {
+fn clip_items(L: const Layout&, mats: Mat[>..]&) {
     for k in L.items.len {
         let it = L.items[k];
         guard it.node >= 0 && it.kind != ITEM_NONE else { continue; }
@@ -2141,7 +2184,7 @@ fn clip_items(L: Layout, mats: Mat[>..]&) {
                     inner = up;
                     if mats.len > 0 { space = mats[up]; }
                 }
-                let s = L.styles[up];
+                let s .= L.styles[up];
                 let b = L.boxes[up];
                 var px0 = b.x + s.bl;
                 var py0 = b.y + s.bt;
@@ -2270,7 +2313,7 @@ struct FlexItem {
     lcross: f32, lpos: f32, lbase: f32, // its line's size across, start across, and the baseline its items line up on
 }
 
-fn flex_item(node: i32, last: i32, s: Style) -> FlexItem {
+fn flex_item(node: i32, last: i32, s: const Style&) -> FlexItem {
     let element = last == -2;
     return FlexItem { node: node, last: last, order: if element { s.order } else { 0 },
                       grow: if element { s.grow } else { 0.0 }, shrink: if element { s.shrink } else { 1.0 },
@@ -2287,8 +2330,8 @@ fn flex_item(node: i32, last: i32, s: Style) -> FlexItem {
 // dropping what that painted (measure_sized, which remembers), then laying it
 // out for real. Returns the height the items take and the container's first
 // baseline (-1 if none).
-recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32, hmin: f32, hmax: f32) -> f32, f32 {
-    let s = L.styles[n];
+recursive fn layout_flex(L: const Layout&, n: i32, x: f32, y: f32, w: f32, h: f32, hmin: f32, hmax: f32) -> f32, f32 {
+    let s .= L.styles[n];
     let row = s.flex_dir == K_ROW || s.flex_dir == K_ROW_REVERSE;
     let reverse = s.flex_dir == K_ROW_REVERSE || s.flex_dir == K_COLUMN_REVERSE;
     let single = s.flex_wrap == K_NOWRAP;
@@ -2406,7 +2449,7 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32, hmin
             let it = L.flex[i];
             sum += it.main + it.edge + it.margin;
             if it.last == -2 {
-                let cs = L.styles[it.node];
+                let cs .= L.styles[it.node];
                 autos += if row { cs.auto_ml + cs.auto_mr } else { cs.auto_mt + cs.auto_mb };
             }
         }
@@ -2428,7 +2471,7 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32, hmin
             var before: f32 = 0.0;
             var after: f32 = 0.0;
             if it.last == -2 {
-                let cs = L.styles[it.node];
+                let cs .= L.styles[it.node];
                 let m0 = if row { (if cs.auto_ml != 0 { share } else { cs.ml }) } else { (if cs.auto_mt != 0 { share } else { cs.mt }) };
                 let m1 = if row { (if cs.auto_mr != 0 { share } else { cs.mr }) } else { (if cs.auto_mb != 0 { share } else { cs.mb }) };
                 before = if reverse { m1 } else { m0 };
@@ -2464,7 +2507,7 @@ recursive fn layout_flex(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32, hmin
             let lh, lb = layout_lines(L, n, it.node, it.last, x + (if row { mpos } else { cp }), y + (if row { cp } else { mpos }), tw);
             got = lb;
         } else {
-            let cs = L.styles[it.node];
+            let cs .= L.styles[it.node];
             let m0 = if row { cs.mt } else { cs.ml };
             let m1 = if row { cs.mb } else { cs.mr };
             let a0 = if row { cs.auto_mt } else { cs.auto_ml };
@@ -2506,14 +2549,14 @@ fn clamp_size(v: f32, lo: f32, hi: f32) -> f32 {
 
 // A row item's height when it is a percentage of its container's, known
 // across (content box); else -1.
-fn pct_height(cs: Style, cross_size: f32) -> f32 {
+fn pct_height(cs: const Style&, cross_size: f32) -> f32 {
     guard cs.height < 0.0 && cs.height_pct >= 0.0 && cross_size >= 0.0 else { return -1.0; }
     let inside: f32 = if cs.border_box != 0 { cs.bt + cs.pt + cs.pb + cs.bb } else { 0.0 };
     return max(cross_size * cs.height_pct / 100.0 - inside, 0.0);
 }
 
 // The index after the last item on the line item a is on.
-fn line_end(L: Layout, a: i64, end: i64) -> i64 {
+fn line_end(L: const Layout&, a: i64, end: i64) -> i64 {
     var b = a;
     while b < end && L.flex[b].line == L.flex[a].line { b += 1; }
     return b;
@@ -2522,7 +2565,7 @@ fn line_end(L: Layout, a: i64, end: i64) -> i64 {
 // Pushes n's flex items onto L.flex, sorted by order (document order among
 // equals): its elements in the flow, and each run of text between them that
 // isn't blank. One out of the flow only notes its static position.
-fn collect_items(L: Layout, n: i32, x: f32, y: f32) {
+fn collect_items(L: const Layout&, n: i32, x: f32, y: f32) {
     let mark = L.flex.len;
     var c = L.d.nodes[n].first;
     while c >= 0 {
@@ -2559,7 +2602,7 @@ fn collect_items(L: Layout, n: i32, x: f32, y: f32) {
 
 // How item `it` of a container styled cs aligns across its line: its
 // align-self, else the container's align-items; normal is stretch.
-fn item_align(L: Layout, it: FlexItem, cs: Style) -> i32 {
+fn item_align(L: const Layout&, it: FlexItem, cs: const Style&) -> i32 {
     var a = cs.align_items;
     if it.last == -2 && L.styles[it.node].align_self != K_AUTO { a = L.styles[it.node].align_self; }
     return if a == K_NORMAL { K_STRETCH } else { a };
@@ -2570,7 +2613,7 @@ fn item_align(L: Layout, it: FlexItem, cs: Style) -> i32 {
 // min-width (min-height down a column) is auto and that doesn't clip can't
 // shrink below its content. Down a column, also its width: its own, else
 // stretched across, else fitted to its content.
-recursive fn size_item(L: Layout, i: i64, n: i32, row: bool, main_size: f32, cross_size: f32) {
+recursive fn size_item(L: const Layout&, i: i64, n: i32, row: bool, main_size: f32, cross_size: f32) {
     var it = L.flex[i];
     if it.last != -2 {
         // A run of text: its content's widths along a row; down a column, the
@@ -2597,7 +2640,7 @@ recursive fn size_item(L: Layout, i: i64, n: i32, row: bool, main_size: f32, cro
         return;
     }
     let c = it.node;
-    let s = L.styles[c];
+    let s .= L.styles[c];
     let hz = s.bl + s.pl + s.pr + s.br;
     let vt = s.bt + s.pt + s.pb + s.bb;
     it.edge = if row { hz } else { vt };
@@ -2674,7 +2717,7 @@ recursive fn size_item(L: Layout, i: i64, n: i32, row: bool, main_size: f32, cro
 // Flexbox 1 §9.7): room to spare goes to them by flex-grow, room short is
 // taken from them by flex-shrink times their base size. An item its min or
 // max size stops is frozen there, and the others flex again.
-fn resolve_flex(L: Layout, a: i64, b: i64, main_size: f32, gap: f32) {
+fn resolve_flex(L: const Layout&, a: i64, b: i64, main_size: f32, gap: f32) {
     let gaps = gap * (b - a - 1);
     var used = gaps;
     for i in a..b { used += L.flex[i].main + L.flex[i].edge + L.flex[i].margin; }
@@ -2729,7 +2772,7 @@ fn resolve_flex(L: Layout, a: i64, b: i64, main_size: f32, gap: f32) {
 
 // Item i's outer size across, and its first baseline from its outer edge:
 // along a row, laid out at its main size to see; down a column, its width.
-recursive fn cross_of(L: Layout, i: i64, n: i32, row: bool, cross_size: f32) {
+recursive fn cross_of(L: const Layout&, i: i64, n: i32, row: bool, cross_size: f32) {
     var it = L.flex[i];
     if it.last != -2 {
         if row {
@@ -2740,7 +2783,7 @@ recursive fn cross_of(L: Layout, i: i64, n: i32, row: bool, cross_size: f32) {
             it.cross = it.width;
         }
     } else {
-        let s = L.styles[it.node];
+        let s .= L.styles[it.node];
         if row {
             let bh, bl = measure_sized(L, it.node, it.main, pct_height(s, cross_size));
             it.cross = bh + s.mt + s.mb;
@@ -2759,7 +2802,7 @@ recursive fn cross_of(L: Layout, i: i64, n: i32, row: bool, cross_size: f32) {
 // that a nested flex container's items, measured again when the container is
 // laid out for real, aren't laid out again: without it the work doubled at
 // each level.
-recursive fn measure_sized(L: Layout, c: i32, w: f32, h: f32) -> f32, f32 {
+recursive fn measure_sized(L: const Layout&, c: i32, w: f32, h: f32) -> f32, f32 {
     while L.measured.len < L.d.nodes.len { L.measured.push(Measured { w: -1.0, h: 0.0, height: 0.0, baseline: -1.0 }); }
     let known = L.measured[c];
     if known.w == w && known.h == h { return known.height, known.baseline; }
@@ -2776,7 +2819,7 @@ recursive fn measure_sized(L: Layout, c: i32, w: f32, h: f32) -> f32, f32 {
 
 // The height and first baseline (from its top, -1 if none) of the run of
 // text from `from` up to `to` in n laid out `w` wide, painting nothing.
-fn measure_lines(L: Layout, n: i32, from: i32, to: i32, w: f32) -> f32, f32 {
+fn measure_lines(L: const Layout&, n: i32, from: i32, to: i32, w: f32) -> f32, f32 {
     let mark = L.items.len;
     let h, b = layout_lines(L, n, from, to, 0.0, 0.0, w);
     L.items.resize(mark);
@@ -2788,7 +2831,7 @@ fn measure_lines(L: Layout, n: i32, from: i32, to: i32, w: f32) -> f32, f32 {
     return h, b;
 }
 
-recursive fn clear_boxes(L: Layout, n: i32) {
+recursive fn clear_boxes(L: const Layout&, n: i32) {
     L.boxes[n] = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
     var c = L.d.nodes[n].first;
     while c >= 0 {
@@ -2800,8 +2843,8 @@ recursive fn clear_boxes(L: Layout, n: i32) {
 // A flex container's min-content and max-content widths, into p: along a
 // row its items side by side (a row that wraps needs only its widest at
 // min-content), down a column its widest item.
-recursive fn flex_widths(L: Layout, n: i32, p: Widths&) {
-    let s = L.styles[n];
+recursive fn flex_widths(L: const Layout&, n: i32, p: Widths&) {
+    let s .= L.styles[n];
     let row = s.flex_dir == K_ROW || s.flex_dir == K_ROW_REVERSE;
     let gap = if row && (s.gap_pct & 2) == 0 { s.col_gap } else { 0.0 };
     var count = 0;
@@ -2882,16 +2925,16 @@ fn is_axis_aligned(m: Mat) -> bool { return abs(m.b) < 0.000001 && abs(m.c) < 0.
 
 // Whether element n is transformed: it has a transform and is a block or an
 // inline-block (CSS Transforms 1 §3: an inline box isn't transformable).
-fn transforms(L: Layout, n: i32) -> bool {
+fn transforms(L: const Layout&, n: i32) -> bool {
     guard L.d.nodes[n].kind == NODE_ELEMENT else { return false; }
-    let s = L.styles[n];
+    let s .= L.styles[n];
     return s.xf_count > 0 && is_box(s) && s.display != K_NONE;
 }
 
 // Element n's transform about its origin, in page points: its functions in
 // order, percentages of its border box.
-fn element_matrix(L: Layout, n: i32) -> Mat {
-    let s = L.styles[n];
+fn element_matrix(L: const Layout&, n: i32) -> Mat {
+    let s .= L.styles[n];
     let b = L.boxes[n];
     let ox = b.x + (if (s.origin_pct & 1) != 0 { s.origin_x / 100.0 * b.w } else { s.origin_x });
     let oy = b.y + (if (s.origin_pct & 2) != 0 { s.origin_y / 100.0 * b.h } else { s.origin_y });
@@ -2919,7 +2962,7 @@ fn element_matrix(L: Layout, n: i32) -> Mat {
 
 // mats[n] for n and everything in it: what moves its content on the page,
 // m (its parent's) after its own transform.
-recursive fn node_matrices(L: Layout, n: i32, m: Mat, mats: Mat[>..]&) {
+recursive fn node_matrices(L: const Layout&, n: i32, m: Mat, mats: Mat[>..]&) {
     var own = m;
     if transforms(L, n) { own = mat_mul(m, element_matrix(L, n)); }
     mats[n] = own;
@@ -2934,7 +2977,7 @@ recursive fn node_matrices(L: Layout, n: i32, m: Mat, mats: Mat[>..]&) {
 // that its text stays on whole pixels, with its clip's matrix changed to
 // match; anything else goes to the compositor as its matrix. One flattened
 // to nothing is dropped.
-fn transform_items(L: Layout, mats: Mat[>..]&) {
+fn transform_items(L: const Layout&, mats: Mat[>..]&) {
     for k in L.items.len {
         let it = L.items[k];
         guard it.node >= 0 && it.kind != ITEM_NONE else { continue; }
@@ -2971,7 +3014,7 @@ fn clip_matrix(it: DItem) -> Mat {
 }
 
 // Sets item k's clip matrix; identity is all zeros.
-fn set_clip_matrix(L: Layout, k: i64, m: Mat) {
+fn set_clip_matrix(L: const Layout&, k: i64, m: Mat) {
     let none = is_identity(m);
     L.items[k].c_a = if none { 0.0 } else { m.a };
     L.items[k].c_b = if none { 0.0 } else { m.b };
@@ -2983,7 +3026,7 @@ fn set_clip_matrix(L: Layout, k: i64, m: Mat) {
 
 // The lowest bottom edge a transform takes an element's box to, where
 // nothing clips it: the page must reach down to it, as to an absolute box.
-fn transformed_bottom(L: Layout, mats: Mat[>..]&) -> f32 {
+fn transformed_bottom(L: const Layout&, mats: Mat[>..]&) -> f32 {
     var bottom: f32 = 0.0;
     for n in L.d.nodes.len {
         guard L.d.nodes[n].kind == NODE_ELEMENT && !is_identity(mats[n]) && L.boxes[n].h > 0.0 else { continue; }
@@ -2994,7 +3037,7 @@ fn transformed_bottom(L: Layout, mats: Mat[>..]&) -> f32 {
 
 // Each transformed node's box becomes the smallest one round where its
 // transform takes it, for hit testing and the snapshot.
-fn transform_boxes(L: Layout, mats: Mat[>..]&) {
+fn transform_boxes(L: const Layout&, mats: Mat[>..]&) {
     for n in L.boxes.len {
         let m = mats[n];
         guard !is_identity(m) else { continue; }

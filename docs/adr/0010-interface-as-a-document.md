@@ -18,8 +18,10 @@ may touch Metal (ADR 0005).
   laid out on the main thread, and again only when that state changes. Its CSS,
   icons and fonts live in `app/ui/`.
 - Every page runs in its own contained worker (`thread_spawn_contained`), which
-  owns the page's document. A worker sends its display list to the main thread as
-  one flat message, then wakes it with `tp_wake`.
+  owns the page's document. A worker hands its display list to the platform layer
+  once (`tp_post_frame`), and the main thread, woken by an event, moves it into the
+  page's layer without copying it again. Messages to a tab go to its own mailbox
+  there: Goose's queues are one per type, so they can't address one tab.
 - The interface marks where pages go (`data-slot`). The compositor draws each
   page as a layer at its slot, with an origin, a clip, a scale and a transform.
   Scrolling a page or dragging a card moves a layer; nothing is laid out again.

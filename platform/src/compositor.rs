@@ -428,6 +428,9 @@ struct Layer {
     items: Vec<DItem>,
     text: Vec<u8>,
     paths: Vec<f32>,
+    // Hidden when the atlas started again: its instances are gone, and it is
+    // built again the next time a frame shows it.
+    stale: bool,
 }
 
 pub struct Compositor {
@@ -509,6 +512,29 @@ impl Compositor {
         l.text.extend_from_slice(text);
         l.paths.clear();
         l.paths.extend_from_slice(paths);
+        self.build(layer, scale)
+    }
+
+    /// As set_layer, taking lists a tab worker handed over, without copying
+    /// them again.
+    pub fn set_layer_owned(
+        &mut self,
+        layer: usize,
+        items: Vec<DItem>,
+        text: Vec<u8>,
+        paths: Vec<f32>,
+        scale: f64,
+    ) -> Result<(), i32> {
+        let l = &mut self.layers[layer];
+        (l.items, l.text, l.paths) = (items, text, paths);
+        self.build(layer, scale)
+    }
+
+    /// Builds layer `layer`'s instances from its lists; when the atlas starts
+    /// again, every shown layer's too, and a hidden one is left stale, its
+    /// GPU buffer let go, for refresh to build when it shows. Then uploads
+    /// what changed.
+    fn build(&mut self, layer: usize, scale: f64) -> Result<(), i32> {
         self.scale = scale;
         let all = with_text(|t| {
             // Masks drawn for another backing scale are of no use now.
@@ -516,9 +542,7 @@ impl Compositor {
             let mut all = t.atlas.scale != scale;
             if all {
                 t.atlas = Atlas::new(scale);
-                for l in self.layers.iter_mut() {
-                    build_layer(l, scale, t);
-                }
+                rebuild_shown(&mut self.layers, layer, scale, t);
             } else {
                 build_layer(&mut self.layers[layer], scale, t);
             }
@@ -533,9 +557,7 @@ impl Compositor {
                     t.atlas.paths.tight = true;
                 }
                 all = true;
-                for l in self.layers.iter_mut() {
-                    build_layer(l, scale, t);
-                }
+                rebuild_shown(&mut self.layers, layer, scale, t);
             }
             upload_sheet(
                 &self.device,
@@ -551,9 +573,22 @@ impl Compositor {
             )?;
             Ok::<bool, i32>(all)
         })?;
+        // A stale layer has no instances, and so no buffer.
         for (i, l) in self.layers.iter_mut().enumerate() {
             if all || i == layer {
                 l.buffer = buffer_of(&self.device, &l.instances)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds the stale layers a frame will show: hidden when the atlas
+    /// started again, shown since.
+    fn refresh(&mut self) -> Result<(), i32> {
+        for i in 0..self.layers.len() {
+            let l = &self.layers[i];
+            if l.stale && l.place.shown != 0 {
+                self.build(i, self.scale)?;
             }
         }
         Ok(())
@@ -674,6 +709,7 @@ impl Compositor {
                 .max_gpu
                 .max(last.GPUEndTime() - last.GPUStartTime());
         }
+        self.refresh()?;
         let texture = unsafe { drawable.texture() };
         let commands = self.encode(&texture, background)?;
         commands.presentDrawable(ProtocolObject::from_ref(drawable));
@@ -687,7 +723,13 @@ impl Compositor {
 
     /// Draws a frame offscreen, `width` × `height` device pixels, and returns
     /// its pixels as BGRA rows.
-    fn render_pixels(&self, width: usize, height: usize, background: u32) -> Result<Vec<u8>, i32> {
+    fn render_pixels(
+        &mut self,
+        width: usize,
+        height: usize,
+        background: u32,
+    ) -> Result<Vec<u8>, i32> {
+        self.refresh()?;
         let desc = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
                 MTLPixelFormat::BGRA8Unorm,
@@ -796,6 +838,19 @@ fn uniforms(p: &Place, scale: f64, tw: usize, th: usize) -> Option<(Uniforms, MT
     Some((u, scissor))
 }
 
+/// Builds again, when the atlas starts again, layer `layer` and every shown
+/// one; the rest are left stale, without instances, until shown.
+fn rebuild_shown(layers: &mut [Layer], layer: usize, scale: f64, t: &mut Text) {
+    for (i, l) in layers.iter_mut().enumerate() {
+        if i == layer || l.place.shown != 0 {
+            build_layer(l, scale, t);
+        } else {
+            l.instances.clear();
+            l.stale = true;
+        }
+    }
+}
+
 /// Builds a layer's instances again from what it was last set to.
 fn build_layer(layer: &mut Layer, scale: f64, t: &mut Text) {
     let mut instances = std::mem::take(&mut layer.instances);
@@ -809,6 +864,7 @@ fn build_layer(layer: &mut Layer, scale: f64, t: &mut Text) {
         &mut instances,
     );
     layer.instances = instances;
+    layer.stale = false;
 }
 
 /// Uploads the rows of `sheet` written since the last upload into `texture`,
@@ -1205,7 +1261,7 @@ pub fn with_compositor<R>(f: impl FnOnce(&mut Compositor) -> Result<R, i32>) -> 
 /// Metal objects live on the main thread only (docs/adr/0005). Off it, the
 /// entry points here refuse rather than set up a second compositor, one the
 /// window never shows.
-fn on_main_thread() -> Result<(), i32> {
+pub(crate) fn on_main_thread() -> Result<(), i32> {
     MainThreadMarker::new()
         .map(|_| ())
         .ok_or(ERR_NOT_MAIN_THREAD)
@@ -2534,5 +2590,57 @@ mod tests {
                 .unwrap();
             assert!(worst <= 2, "{worst}");
         }
+    }
+
+    #[test]
+    fn hidden_layers_are_built_again_only_when_shown() {
+        // Eight layers of text, hidden; then the backing scale changes. Only
+        // the layer set, and the shown ones, are built at the new scale; the
+        // hidden ones let go of their buffers until a frame shows them.
+        if MTLCreateSystemDefaultDevice().is_none() {
+            return;
+        }
+        let words = b"The quick brown fox jumps over the lazy dog. ".repeat(4);
+        let items: Vec<DItem> = (0..10)
+            .map(|k| DItem {
+                kind: ITEM_TEXT,
+                x: 0.0,
+                y: 16.0 + 18.0 * k as f32,
+                color: 0xFF00_0000,
+                size: 15.0,
+                text: 0,
+                text_len: words.len() as i32,
+                ..Default::default()
+            })
+            .collect();
+        let hidden = Place {
+            shown: 0,
+            ..Place::default()
+        };
+        let (stale, built, shown) = with_compositor(|c| {
+            for n in 1..9 {
+                c.set_layer(n, &items, &words, &[], 2.0)?;
+                c.place(n, hidden);
+            }
+            c.set_layer(0, &[rect(0.0, 0.0, 1.0, 1.0, 0xFF00_0000)], b"", &[], 1.0)?;
+            c.place(0, Place::default());
+            let stale = (1..9).all(|n| {
+                let l = &c.layers[n];
+                l.stale && l.instances.is_empty() && l.buffer.is_none()
+            });
+            c.place(3, Place::default());
+            let p = c.render_pixels(200, 40, 0xFFFF_FFFF)?;
+            let l = &c.layers[3];
+            let built =
+                !l.stale && !l.instances.is_empty() && l.buffer.is_some() && c.layers[4].stale;
+            // Some of its text is on the target.
+            let shown = p.chunks(4).filter(|px| px[0] < 128).count();
+            c.place(3, hidden);
+            Ok((stale, built, shown))
+        })
+        .unwrap();
+        assert!(stale);
+        assert!(built);
+        assert!(shown > 50, "{shown} dark pixels");
     }
 }

@@ -70,6 +70,11 @@ jobs:
           ./app/tusk snapshot tests/pages/focaccia.html > snapshot.txt
           grep -q 'heading "Etymology" \[level=2\]' snapshot.txt
 
+      - name: A page nested 600 deep, laid out in a tab worker
+        run: |
+          ./app/tusk snapshot tests/pages/deep.html > deep.txt
+          grep -q 'turned clips' deep.txt
+
       - name: Screenshot of the M1 page, drawn offscreen
         run: |
           rc=0

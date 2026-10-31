@@ -1757,7 +1757,8 @@ fn compute_styles(d: Doc, sh: Sheet, styles: Style[>..]&) {
     var prio: i64[>..<] = [];
     var text: u8[>..<] = [];
     let w = Work { offsets: offsets, order: order, customs: customs, prio: prio, text: text };
-    compute_subtree(d, sh, styles, 0, root_style(), pseudo_rules[..], w);
+    let root = root_style();
+    compute_subtree(d, sh, styles, 0, root, pseudo_rules[..], w);
     viewport_overflow(d, styles);
 }
 
@@ -1833,7 +1834,7 @@ fn bucket_of(kind: u8, key: const u8[:]) -> i32 {
     return (h & 1023) as i32;               // BUCKETS is 1024
 }
 
-recursive fn compute_subtree(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, parent: Style, pseudo_rules: const i32[:], w: Work) {
+recursive fn compute_subtree(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, parent: const Style&, pseudo_rules: const i32[:], w: Work) {
     var s = parent;
     let element = d.nodes[n].kind == NODE_ELEMENT;
     if element {
@@ -1862,7 +1863,7 @@ recursive fn compute_subtree(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, par
 // Makes element n's ::before (`which` 1) or ::after (2), when the cascade
 // gives it content: an element named after it as n's first or last child,
 // holding the content as text, with its style already in `styles`.
-fn generate(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, s: Style, which: i32, w: Work) {
+fn generate(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, s: const Style&, which: i32, w: Work) {
     let name = if which == 1 { "::before" } else { "::after" };
     var ps = cascade(d, sh, n, s, which, w);
     // Styled again, a document keeps the ones it has and styles them again
@@ -1886,7 +1887,7 @@ fn generate(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, s: Style, which: i32
 // for each property the declaration with the highest (importance, origin,
 // specificity, order) wins. Custom properties win by name, and var() is
 // substituted before a declaration that waits on it applies.
-fn cascade(d: Doc, sh: Sheet, e: i32, parent: Style, pseudo: i32, w: Work) -> Style {
+fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work) -> Style {
     var win_prio: i64[NPROPS];
     var win: Decl[NPROPS];
     fill(win_prio[..], -1);
