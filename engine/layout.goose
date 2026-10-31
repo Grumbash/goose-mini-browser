@@ -7,10 +7,12 @@
 // into lines at spaces, and list items get markers. Positioned boxes are
 // placed once the flow is done, then everything is put in CSS's paint order
 // and cut to the boxes that clip it. Flex containers lay out their items;
-// inline-blocks sit on lines as one piece. Floats, grid, tables as grids and
-// inline backgrounds wait.
+// inline-blocks sit on lines as one piece. Transforms come last: a
+// translation moves items, anything else gives them a matrix. Floats, grid,
+// tables as grids and inline backgrounds wait.
 
 import std;
+import math;
 import .dom;
 import .css;
 
@@ -30,7 +32,11 @@ let BORDER_DASHED: i32 = 1;
 // filled with `color`, and borders inside its edge in one colour and style:
 // `border` wide at the top, the others as wide as they say. An item with a
 // clip (clip_w above 0) shows only inside that rectangle, its corners rounded
-// by clip_tl, clip_tr, clip_br and clip_bl.
+// by clip_tl, clip_tr, clip_br and clip_bl. A transformed item has a matrix
+// (m_a … m_f, as CSS's matrix() takes them, points to points; all 0: none),
+// and its clip one that takes its points to the clip's (c_a … c_f; all 0:
+// they are the same). A second clip (oclip_w above 0) cuts it square on the
+// page, after its transform.
 struct DItem {
     kind: i32,
     x: f32, y: f32, w: f32, h: f32,
@@ -43,6 +49,9 @@ struct DItem {
     border_right: f32, border_bottom: f32, border_left: f32,
     clip_x: f32, clip_y: f32, clip_w: f32, clip_h: f32,
     clip_tl: f32, clip_tr: f32, clip_br: f32, clip_bl: f32,
+    m_a: f32, m_b: f32, m_c: f32, m_d: f32, m_e: f32, m_f: f32,
+    c_a: f32, c_b: f32, c_c: f32, c_d: f32, c_e: f32, c_f: f32,
+    oclip_x: f32, oclip_y: f32, oclip_w: f32, oclip_h: f32,
 }
 
 struct Rect { x: f32, y: f32, w: f32, h: f32 }
@@ -280,19 +289,32 @@ fn layout_page(L: Layout, width: f32, height: f32) -> f32 {
     var positioned = false;
     var relative = false;
     var clips = false;
+    var transformed = false;
     for s, n in L.styles {
         guard L.d.nodes[n].kind == NODE_ELEMENT && s.display != K_NONE else { continue; }
         if s.position != K_STATIC { positioned = true; }
         if s.position == K_RELATIVE { relative = true; }
         if s.clips != 0 && s.display != K_INLINE { clips = true; }
+        if transforms(L, n as i32) { transformed = true; }
     }
     if positioned {
         place_positioned(L, 0, width, height);
         if relative { shift_relative(L); }
         page_h = max(page_h, positioned_bottom(L));
-        stack(L);
     }
-    if clips { clip_items(L); }
+    if positioned || transformed { stack(L); }
+    // Transforms, each node's with those of the elements around it.
+    var mats: Mat[>..] = [];
+    if transformed {
+        for n in L.d.nodes.len { mats.push(identity()); }
+        node_matrices(L, 0, identity(), mats);
+    }
+    if clips { clip_items(L, mats); }
+    if transformed {
+        transform_items(L, mats);
+        transform_boxes(L, mats);
+        page_h = max(page_h, transformed_bottom(L, mats));
+    }
     // Opacity: each item at its element's alpha, which already holds its
     // ancestors'. Overlapping items show through each other, where CSS would
     // flatten the element first.
@@ -514,7 +536,10 @@ fn rect_item(n: i32, x: f32, y: f32, w: f32, h: f32, color: u32) -> DItem {
     return DItem { kind: ITEM_RECT, x: x, y: y, w: w, h: h, color: color, font: 0, size: 0.0, text: 0, text_len: 0, node: n,
                    rad_tl: 0.0, rad_tr: 0.0, rad_br: 0.0, rad_bl: 0.0, border: 0.0, border_color: 0, border_style: BORDER_SOLID,
                    border_right: 0.0, border_bottom: 0.0, border_left: 0.0,
-                   clip_x: 0.0, clip_y: 0.0, clip_w: 0.0, clip_h: 0.0, clip_tl: 0.0, clip_tr: 0.0, clip_br: 0.0, clip_bl: 0.0 };
+                   clip_x: 0.0, clip_y: 0.0, clip_w: 0.0, clip_h: 0.0, clip_tl: 0.0, clip_tr: 0.0, clip_br: 0.0, clip_bl: 0.0,
+                   m_a: 0.0, m_b: 0.0, m_c: 0.0, m_d: 0.0, m_e: 0.0, m_f: 0.0,
+                   c_a: 0.0, c_b: 0.0, c_c: 0.0, c_d: 0.0, c_e: 0.0, c_f: 0.0,
+                   oclip_x: 0.0, oclip_y: 0.0, oclip_w: 0.0, oclip_h: 0.0 };
 }
 
 fn text_item(n: i32, x: f32, y: f32, w: f32, color: u32, font: i32, size: f32, text: i32, text_len: i32) -> DItem {
@@ -1364,21 +1389,23 @@ fn height_limits(s: Style) -> f32, f32 {
     return max(s.min_height - inside, 0.0), if s.max_height >= 0.0 { max(s.max_height - inside, 0.0) } else { -1.0 };
 }
 
-// What out-of-flow element e is placed against: the padding box of the
-// nearest positioned element around it, or the first screen when there is
-// none or e is fixed.
+// What out-of-flow element e is placed against: the padding box of its
+// containing element, or the first screen when there is none.
 fn containing_block(L: Layout, e: i32, vw: f32, vh: f32) -> Rect {
-    let a = positioned_ancestor(L, e);
-    guard a > 0 && L.styles[e].position == K_ABSOLUTE else { return Rect { x: 0.0, y: 0.0, w: vw, h: vh }; }
+    let a = containing_element(L, e);
+    guard a > 0 else { return Rect { x: 0.0, y: 0.0, w: vw, h: vh }; }
     let s = L.styles[a];
     let b = L.boxes[a];
     return Rect { x: b.x + s.bl, y: b.y + s.bt, w: max(b.w - s.bl - s.br, 0.0), h: max(b.h - s.bt - s.bb, 0.0) };
 }
 
-// The nearest positioned element around n, or 0 when there is none.
-fn positioned_ancestor(L: Layout, n: i32) -> i32 {
-    var a = L.d.nodes[n].parent;
-    while a > 0 && L.styles[a].position == K_STATIC { a = L.d.nodes[a].parent; }
+// The element out-of-flow element e is placed against, or 0 for the first
+// screen: an absolute box's nearest positioned or transformed element, a
+// fixed box's nearest transformed one.
+fn containing_element(L: Layout, e: i32) -> i32 {
+    let fixed = L.styles[e].position == K_FIXED;
+    var a = L.d.nodes[e].parent;
+    while a > 0 && !transforms(L, a) && (fixed || L.styles[a].position == K_STATIC) { a = L.d.nodes[a].parent; }
     return max(a, 0);
 }
 
@@ -1418,14 +1445,10 @@ fn is_clipped(L: Layout, n: i32) -> bool {
     }
 }
 
-// The next element up whose overflow could cut node e: its parent, an
-// absolute box's containing block element, none (0) above a fixed box.
+// The next element up whose overflow could cut node e: its parent, or an
+// out-of-flow box's containing element (none, 0, for the first screen).
 fn clip_parent(L: Layout, e: i32) -> i32 {
-    if L.d.nodes[e].kind == NODE_ELEMENT {
-        let p = L.styles[e].position;
-        if p == K_FIXED { return 0; }
-        if p == K_ABSOLUTE { return positioned_ancestor(L, e); }
-    }
+    if is_out(L, e) { return containing_element(L, e); }
     return L.d.nodes[e].parent;
 }
 
@@ -1455,7 +1478,8 @@ fn shift_relative(L: Layout) {
 // How far the relatively positioned elements around node n, and n itself,
 // move it: their left (else minus their right) and top (else minus their
 // bottom), percentages of their parent's content box. A fixed box inside one
-// doesn't move with it.
+// moves only with those around its containing element, when a transformed
+// one is it.
 fn relative_offset(L: Layout, n: i32) -> f32, f32 {
     var dx: f32 = 0.0;
     var dy: f32 = 0.0;
@@ -1463,7 +1487,10 @@ fn relative_offset(L: Layout, n: i32) -> f32, f32 {
     while e > 0 {
         if L.d.nodes[e].kind == NODE_ELEMENT {
             let s = L.styles[e];
-            if s.position == K_FIXED { break; }
+            if s.position == K_FIXED {
+                e = containing_element(L, e);
+                continue;
+            }
             if s.position == K_RELATIVE {
                 let p = L.d.nodes[e].parent;
                 let ps = L.styles[p];
@@ -1536,7 +1563,7 @@ recursive fn add_widths(L: Layout, n: i32, p: Widths&) {
     let node = L.d.nodes[n];
     if node.kind == NODE_TEXT {
         let r = L.run_of[n];
-        guard r >= 0;
+        guard r >= 0 else { return; }
         let run = L.runs[r];
         let ws = L.styles[n].ws;
         let wraps = ws == K_NORMAL || ws == K_PRE_WRAP;
@@ -1658,8 +1685,19 @@ fn stack(L: Layout) {
     for it, k in sorted { L.items[k] = it; }
 }
 
-// Whether a styled element starts a stacking context of its own.
-fn stacks(s: Style) -> bool { return s.position == K_FIXED || (s.position != K_STATIC && s.z_auto == 0); }
+// An element's z-index, which only positioned boxes and flex items have (CSS
+// 2.2 §9.9.1, Flexbox 1 §4.3): 0 for the others, and for auto.
+fn z_index(L: Layout, e: i32) -> i32 {
+    let p = L.d.nodes[e].parent;
+    if L.styles[e].position != K_STATIC || (p >= 0 && is_flex(L, p)) { return L.styles[e].z; }
+    return 0;
+}
+
+// Whether a styled element starts a stacking context of its own: a
+// positioned one with a z-index, a fixed one, and a transformed one.
+fn stacks(s: Style) -> bool {
+    return s.position == K_FIXED || (s.position != K_STATIC && s.z_auto == 0) || (s.xf_count > 0 && s.display != K_INLINE);
+}
 
 fn emit_own(P: Paint, n: i32) {
     for k in P.first[n]..P.first[n] + P.count[n] { P.order.push(P.by_node[k]); }
@@ -1675,7 +1713,7 @@ recursive fn paint_context(L: Layout, P: Paint, n: i32) {
     for i in mark..end { if stacks(L.styles[P.scratch[i]]) { P.scratch.push(P.scratch[i]); } }
     let sorted = P.scratch.len;
     sort_by_z(L, P, end, sorted);
-    for i in end..sorted { if L.styles[P.scratch[i]].z < 0 { paint_context(L, P, P.scratch[i]); } }
+    for i in end..sorted { if z_index(L, P.scratch[i]) < 0 { paint_context(L, P, P.scratch[i]); } }
     paint_flow(L, P, n);
     for i in mark..end {
         let e = P.scratch[i];
@@ -1683,11 +1721,11 @@ recursive fn paint_context(L: Layout, P: Paint, n: i32) {
         if !stacks(s) {
             emit_own(P, e);
             paint_flow(L, P, e);
-        } else if s.z == 0 {
+        } else if z_index(L, e) == 0 {
             paint_context(L, P, e);
         }
     }
-    for i in end..sorted { if L.styles[P.scratch[i]].z > 0 { paint_context(L, P, P.scratch[i]); } }
+    for i in end..sorted { if z_index(L, P.scratch[i]) > 0 { paint_context(L, P, P.scratch[i]); } }
     P.scratch.resize(mark);
 }
 
@@ -1698,7 +1736,7 @@ recursive fn gather(L: Layout, P: Paint, n: i32) {
     while c >= 0 {
         if L.d.nodes[c].kind == NODE_ELEMENT && L.styles[c].display != K_NONE {
             let s = L.styles[c];
-            if s.position != K_STATIC { P.scratch.push(c); }
+            if s.position != K_STATIC || stacks(s) { P.scratch.push(c); }
             if !stacks(s) { gather(L, P, c); }
         }
         c = L.d.nodes[c].next;
@@ -1721,7 +1759,7 @@ fn sort_by_z(L: Layout, P: Paint, a: i64, b: i64) {
             var j = mid;
             var t = lo;
             while i < mid || j < hi {
-                if j >= hi || (i < mid && L.styles[P.scratch[a + i]].z <= L.styles[P.scratch[a + j]].z) {
+                if j >= hi || (i < mid && z_index(L, P.scratch[a + i]) <= z_index(L, P.scratch[a + j])) {
                     P.scratch[b + t] = P.scratch[a + i];
                     i += 1;
                 } else {
@@ -1743,7 +1781,7 @@ recursive fn paint_flow(L: Layout, P: Paint, n: i32) {
     var c = L.d.nodes[n].first;
     while c >= 0 {
         let node = L.d.nodes[c];
-        if node.kind != NODE_ELEMENT || (L.styles[c].display != K_NONE && L.styles[c].position == K_STATIC) {
+        if node.kind != NODE_ELEMENT || (L.styles[c].display != K_NONE && L.styles[c].position == K_STATIC && !stacks(L.styles[c])) {
             emit_own(P, c);
             paint_flow(L, P, c);
         }
@@ -1754,22 +1792,33 @@ recursive fn paint_flow(L: Layout, P: Paint, n: i32) {
 // ------------------------------------------------------------------ clips
 
 // Cuts each item to the padding boxes of the elements around it whose
-// overflow isn't visible (CSS Overflow 3), to where they all meet. A corner
-// of that is rounded when it is a clipping box's corner, as that box's inner
-// radius (the rounder, when two meet there). An absolute box is cut only by
-// those around its containing block, a fixed one by none; a block's own "…",
-// or a list item's marker, by the element itself too. An item wholly
-// outside is dropped; one wholly inside a square clip needs none.
-fn clip_items(L: Layout) {
+// overflow isn't visible (CSS Overflow 3), to where they all meet. Those in
+// the innermost one's space, or a shift and a scale from it, meet there: a
+// corner of that is rounded when it is a clipping box's corner, as that
+// box's inner radius (the rounder, when two meet there), and a transform
+// between the item and that space takes the item's points to it. Those
+// turned another way cut on the page, square, where they reach. An absolute
+// box is cut only by those around its containing block, a fixed one only by
+// those around a transformed one; a block's own "…", or a list item's
+// marker, by the element itself too. An item with nothing left to show is
+// dropped; one wholly inside a square clip with no transform between needs
+// none.
+fn clip_items(L: Layout, mats: Mat[>..]&) {
     for k in L.items.len {
         let it = L.items[k];
         guard it.node >= 0 && it.kind != ITEM_NONE else { continue; }
+        var inner: i32 = -1;
+        var space = identity();
         var x0: f32 = -1000000000.0;
         var y0: f32 = -1000000000.0;
         var x1: f32 = 1000000000.0;
         var y1: f32 = 1000000000.0;
         var r = Radii { tl: 0.0, tr: 0.0, br: 0.0, bl: 0.0 };
-        var any = false;
+        var ox0: f32 = -1000000000.0;
+        var oy0: f32 = -1000000000.0;
+        var ox1: f32 = 1000000000.0;
+        var oy1: f32 = 1000000000.0;
+        var outer = false;
         var e = it.node;
         var own = it.kind == ITEM_TEXT && L.d.nodes[e].kind == NODE_ELEMENT;
         loop {
@@ -1777,13 +1826,57 @@ fn clip_items(L: Layout) {
             own = false;
             if up <= 0 { break; }
             if clips_content(L, up) {
+                if inner < 0 {
+                    inner = up;
+                    if mats.len > 0 { space = mats[up]; }
+                }
                 let s = L.styles[up];
                 let b = L.boxes[up];
-                let px0 = b.x + s.bl;
-                let py0 = b.y + s.bt;
-                let px1 = b.x + b.w - s.br;
-                let py1 = b.y + b.h - s.bb;
-                let pr = inner_radii(radii_of(s, b.w, b.h), s);
+                var px0 = b.x + s.bl;
+                var py0 = b.y + s.bt;
+                var px1 = b.x + b.w - s.br;
+                var py1 = b.y + b.h - s.bb;
+                var pr = inner_radii(radii_of(s, b.w, b.h), s);
+                // From its space to the innermost clip's.
+                var rel = identity();
+                if mats.len > 0 && !same(mats[up], space) { rel = mat_mul(mat_inv(space), mats[up]); }
+                if !is_axis_aligned(rel) {
+                    // Turned another way: it cuts on the page, square, where it reaches.
+                    let m = mats[up];
+                    var qx0: f32 = 1000000000.0;
+                    var qy0: f32 = 1000000000.0;
+                    var qx1: f32 = -1000000000.0;
+                    var qy1: f32 = -1000000000.0;
+                    for c in 4 {
+                        let cx = if c == 1 || c == 2 { px1 } else { px0 };
+                        let cy = if c >= 2 { py1 } else { py0 };
+                        let tx = m.a * cx + m.c * cy + m.e;
+                        let ty = m.b * cx + m.d * cy + m.f;
+                        qx0 = min(qx0, tx);
+                        qy0 = min(qy0, ty);
+                        qx1 = max(qx1, tx);
+                        qy1 = max(qy1, ty);
+                    }
+                    ox0 = max(ox0, qx0);
+                    oy0 = max(oy0, qy0);
+                    ox1 = min(ox1, qx1);
+                    oy1 = min(oy1, qy1);
+                    outer = true;
+                    e = up;
+                    continue;
+                }
+                if !is_identity(rel) {
+                    let ax0 = rel.a * px0 + rel.e;
+                    let ax1 = rel.a * px1 + rel.e;
+                    let ay0 = rel.d * py0 + rel.f;
+                    let ay1 = rel.d * py1 + rel.f;
+                    px0 = min(ax0, ax1);
+                    px1 = max(ax0, ax1);
+                    py0 = min(ay0, ay1);
+                    py1 = max(ay0, ay1);
+                    let sc = min(abs(rel.a), abs(rel.d));
+                    pr = Radii { tl: pr.tl * sc, tr: pr.tr * sc, br: pr.br * sc, bl: pr.bl * sc };
+                }
                 let nx0 = max(x0, px0);
                 let ny0 = max(y0, py0);
                 let nx1 = min(x1, px1);
@@ -1796,20 +1889,35 @@ fn clip_items(L: Layout) {
                 y0 = ny0;
                 x1 = nx1;
                 y1 = ny1;
-                any = true;
             }
             e = up;
         }
-        guard any else { continue; }
-        // A text item's extent, roughly: from about its ascent to its descent.
-        let ty = if it.kind == ITEM_TEXT { it.y - it.size } else { it.y };
-        let th = if it.kind == ITEM_TEXT { it.size * 1.3 } else { it.h };
-        if x1 <= x0 || y1 <= y0 || it.x >= x1 || ty >= y1 || it.x + it.w <= x0 || ty + th <= y0 {
+        guard inner >= 0 else { continue; }
+        if x1 <= x0 || y1 <= y0 || (outer && (ox1 <= ox0 || oy1 <= oy0)) {
             L.items[k].kind = ITEM_NONE;
             continue;
         }
-        let rounded = r.tl > 0.0 || r.tr > 0.0 || r.br > 0.0 || r.bl > 0.0;
-        if !rounded && it.x >= x0 && ty >= y0 && it.x + it.w <= x1 && ty + th <= y1 { continue; }
+        if outer {
+            L.items[k].oclip_x = ox0;
+            L.items[k].oclip_y = oy0;
+            L.items[k].oclip_w = ox1 - ox0;
+            L.items[k].oclip_h = oy1 - oy0;
+        }
+        var cm = identity();
+        if mats.len > 0 && !same(space, mats[it.node]) { cm = mat_mul(mat_inv(space), mats[it.node]); }
+        if is_identity(cm) {
+            // A text item's extent, roughly: from about its ascent to its descent.
+            let ty = if it.kind == ITEM_TEXT { it.y - it.size } else { it.y };
+            let th = if it.kind == ITEM_TEXT { it.size * 1.3 } else { it.h };
+            if it.x >= x1 || ty >= y1 || it.x + it.w <= x0 || ty + th <= y0 {
+                L.items[k].kind = ITEM_NONE;
+                continue;
+            }
+            let rounded = r.tl > 0.0 || r.tr > 0.0 || r.br > 0.0 || r.bl > 0.0;
+            if !rounded && it.x >= x0 && ty >= y0 && it.x + it.w <= x1 && ty + th <= y1 { continue; }
+        } else {
+            set_clip_matrix(L, k, cm);
+        }
         let fit = fit_radii(r, x1 - x0, y1 - y0);
         L.items[k].clip_x = x0;
         L.items[k].clip_y = y0;
@@ -2419,5 +2527,183 @@ recursive fn flex_widths(L: Layout, n: i32, p: Widths&) {
             p.min = max(p.min, least);
         }
         count += 1;
+    }
+}
+
+// ------------------------------------------------------------------ transforms
+
+// A 2D transform as CSS's matrix(a, b, c, d, e, f): (x, y) goes to
+// (a·x + c·y + e, b·x + d·y + f).
+struct Mat { a: f32, b: f32, c: f32, d: f32, e: f32, f: f32 }
+
+fn identity() -> Mat { return Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }; }
+
+fn translation(x: f32, y: f32) -> Mat { return Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: x, f: y }; }
+
+// m after n: what n does to a point, then m.
+fn mat_mul(m: Mat, n: Mat) -> Mat {
+    return Mat { a: m.a * n.a + m.c * n.b, b: m.b * n.a + m.d * n.b,
+                 c: m.a * n.c + m.c * n.d, d: m.b * n.c + m.d * n.d,
+                 e: m.a * n.e + m.c * n.f + m.e, f: m.b * n.e + m.d * n.f + m.f };
+}
+
+// The transform that undoes m (identity when m flattens everything).
+fn mat_inv(m: Mat) -> Mat {
+    let det = m.a * m.d - m.b * m.c;
+    guard abs(det) > 0.000001 else { return identity(); }
+    return Mat { a: m.d / det, b: -m.b / det, c: -m.c / det, d: m.a / det,
+                 e: (m.c * m.f - m.d * m.e) / det, f: (m.b * m.e - m.a * m.f) / det };
+}
+
+fn is_identity(m: Mat) -> bool { return is_translation(m) && m.e == 0.0 && m.f == 0.0; }
+
+// Whether two transforms are the same: one inverted and multiplied by the
+// other wouldn't quite come to identity.
+fn same(m: Mat, n: Mat) -> bool { return m.a == n.a && m.b == n.b && m.c == n.c && m.d == n.d && m.e == n.e && m.f == n.f; }
+
+fn is_translation(m: Mat) -> bool { return m.a == 1.0 && m.b == 0.0 && m.c == 0.0 && m.d == 1.0; }
+
+// Whether m keeps a rectangle's sides level: it scales and shifts, nothing more.
+fn is_axis_aligned(m: Mat) -> bool { return abs(m.b) < 0.000001 && abs(m.c) < 0.000001; }
+
+// Whether element n is transformed: it has a transform and is a block or an
+// inline-block (CSS Transforms 1 §3: an inline box isn't transformable).
+fn transforms(L: Layout, n: i32) -> bool {
+    guard L.d.nodes[n].kind == NODE_ELEMENT else { return false; }
+    let s = L.styles[n];
+    return s.xf_count > 0 && s.display != K_INLINE && s.display != K_NONE;
+}
+
+// Element n's transform about its origin, in page points: its functions in
+// order, percentages of its border box.
+fn element_matrix(L: Layout, n: i32) -> Mat {
+    let s = L.styles[n];
+    let b = L.boxes[n];
+    let ox = b.x + (if (s.origin_pct & 1) != 0 { s.origin_x / 100.0 * b.w } else { s.origin_x });
+    let oy = b.y + (if (s.origin_pct & 2) != 0 { s.origin_y / 100.0 * b.h } else { s.origin_y });
+    var m = translation(ox, oy);
+    var k: i32 = 0;
+    while k < s.xf_count {
+        let f = s.xf[k];
+        if f.kind == XF_TRANSLATE {
+            m = mat_mul(m, translation(if (f.pct & 1) != 0 { f.x / 100.0 * b.w } else { f.x },
+                                       if (f.pct & 2) != 0 { f.y / 100.0 * b.h } else { f.y }));
+        } else if f.kind == XF_SCALE {
+            m = mat_mul(m, Mat { a: f.x, b: 0.0, c: 0.0, d: f.y, e: 0.0, f: 0.0 });
+        } else if f.kind == XF_ROTATE {
+            let cs = cos(f.x);
+            let sn = sin(f.x);
+            m = mat_mul(m, Mat { a: cs, b: sn, c: -sn, d: cs, e: 0.0, f: 0.0 });
+        } else if f.kind == XF_MATRIX && k + 2 < s.xf_count {
+            m = mat_mul(m, Mat { a: f.x, b: f.y, c: s.xf[k + 1].x, d: s.xf[k + 1].y, e: s.xf[k + 2].x, f: s.xf[k + 2].y });
+            k += 2;
+        }
+        k += 1;
+    }
+    return mat_mul(m, translation(-ox, -oy));
+}
+
+// mats[n] for n and everything in it: what moves its content on the page,
+// m (its parent's) after its own transform.
+recursive fn node_matrices(L: Layout, n: i32, m: Mat, mats: Mat[>..]&) {
+    var own = m;
+    if transforms(L, n) { own = mat_mul(m, element_matrix(L, n)); }
+    mats[n] = own;
+    var c = L.d.nodes[n].first;
+    while c >= 0 {
+        node_matrices(L, c, own, mats);
+        c = L.d.nodes[c].next;
+    }
+}
+
+// Gives each item its node's transform. A translation alone moves it, so
+// that its text stays on whole pixels, with its clip's matrix changed to
+// match; anything else goes to the compositor as its matrix. One flattened
+// to nothing is dropped.
+fn transform_items(L: Layout, mats: Mat[>..]&) {
+    for k in L.items.len {
+        let it = L.items[k];
+        guard it.node >= 0 && it.kind != ITEM_NONE else { continue; }
+        let m = mats[it.node];
+        guard !is_identity(m) else { continue; }
+        if abs(m.a * m.d - m.b * m.c) < 0.000001 {
+            L.items[k].kind = ITEM_NONE;
+            continue;
+        }
+        if !is_translation(m) {
+            L.items[k].m_a = m.a; L.items[k].m_b = m.b; L.items[k].m_c = m.c;
+            L.items[k].m_d = m.d; L.items[k].m_e = m.e; L.items[k].m_f = m.f;
+            continue;
+        }
+        L.items[k].x += m.e;
+        L.items[k].y += m.f;
+        guard it.clip_w > 0.0 else { continue; }
+        // Its points moved by (e, f): the clip's matrix takes them back first.
+        let moved = mat_mul(clip_matrix(it), translation(-m.e, -m.f));
+        if is_translation(moved) {
+            L.items[k].clip_x -= moved.e;
+            L.items[k].clip_y -= moved.f;
+            set_clip_matrix(L, k, identity());
+        } else {
+            set_clip_matrix(L, k, moved);
+        }
+    }
+}
+
+// Item it's clip matrix (identity when it has none).
+fn clip_matrix(it: DItem) -> Mat {
+    guard it.c_a != 0.0 || it.c_b != 0.0 || it.c_c != 0.0 || it.c_d != 0.0 else { return identity(); }
+    return Mat { a: it.c_a, b: it.c_b, c: it.c_c, d: it.c_d, e: it.c_e, f: it.c_f };
+}
+
+// Sets item k's clip matrix; identity is all zeros.
+fn set_clip_matrix(L: Layout, k: i64, m: Mat) {
+    let none = is_identity(m);
+    L.items[k].c_a = if none { 0.0 } else { m.a };
+    L.items[k].c_b = if none { 0.0 } else { m.b };
+    L.items[k].c_c = if none { 0.0 } else { m.c };
+    L.items[k].c_d = if none { 0.0 } else { m.d };
+    L.items[k].c_e = if none { 0.0 } else { m.e };
+    L.items[k].c_f = if none { 0.0 } else { m.f };
+}
+
+// The lowest bottom edge a transform takes an element's box to, where
+// nothing clips it: the page must reach down to it, as to an absolute box.
+fn transformed_bottom(L: Layout, mats: Mat[>..]&) -> f32 {
+    var bottom: f32 = 0.0;
+    for n in L.d.nodes.len {
+        guard L.d.nodes[n].kind == NODE_ELEMENT && !is_identity(mats[n]) && L.boxes[n].h > 0.0 else { continue; }
+        if !is_clipped(L, n as i32) { bottom = max(bottom, L.boxes[n].y + L.boxes[n].h); }
+    }
+    return bottom;
+}
+
+// Each transformed node's box becomes the smallest one round where its
+// transform takes it, for hit testing and the snapshot.
+fn transform_boxes(L: Layout, mats: Mat[>..]&) {
+    for n in L.boxes.len {
+        let m = mats[n];
+        guard !is_identity(m) else { continue; }
+        let b = L.boxes[n];
+        if is_translation(m) {
+            L.boxes[n].x += m.e;
+            L.boxes[n].y += m.f;
+            continue;
+        }
+        var x0: f32 = 1000000000.0;
+        var y0: f32 = 1000000000.0;
+        var x1: f32 = -1000000000.0;
+        var y1: f32 = -1000000000.0;
+        for k in 4 {
+            let px = if k == 1 || k == 2 { b.x + b.w } else { b.x };
+            let py = if k >= 2 { b.y + b.h } else { b.y };
+            let tx = m.a * px + m.c * py + m.e;
+            let ty = m.b * px + m.d * py + m.f;
+            x0 = min(x0, tx);
+            y0 = min(y0, ty);
+            x1 = max(x1, tx);
+            y1 = max(y1, ty);
+        }
+        L.boxes[n] = Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
     }
 }

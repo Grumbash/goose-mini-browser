@@ -80,7 +80,9 @@ let P_FLEX_BASIS: i32 = 65;
 let P_ORDER: i32 = 66;
 let P_ROW_GAP: i32 = 67;
 let P_COLUMN_GAP: i32 = 68;
-let NPROPS: i64 = 69;
+let P_TRANSFORM: i32 = 69;
+let P_TRANSFORM_ORIGIN: i32 = 70;
+let NPROPS: i64 = 71;
 let P_CUSTOM: i32 = -2;   // a custom property, --name, which the cascade keeps apart
 
 // Kinds of value.
@@ -276,11 +278,25 @@ struct Style {
     // basis_kind K_AUTO, K_CONTENT, or 1 for a length, 2 for a percentage.
     align_self: i32, grow: f32, shrink: f32, order: i32, basis: f32, basis_kind: i32,
     min_w_auto: i32, min_h_auto: i32,    // min-width and min-height are auto, which a flex item turns into its content's
+    xf: XForm[6], xf_count: i32,         // transform, its functions in order
+    origin_x: f32, origin_y: f32, origin_pct: i32, // transform-origin; origin_pct bit 1 x, 2 y: percentages
 }
 
 // One box-shadow. Blurred ones aren't drawn (docs/adr/0010: the interface's
 // shadows are rings and bars, which have none).
 struct Shadow { ox: f32, oy: f32, blur: f32, spread: f32, color: u32, inset: i32 }
+
+// One transform function: translate (x and y lengths, `pct` bit 1 or 2 when
+// x or y is a percentage of the border box), scale (x, y), rotate (x, in
+// radians), or matrix(a, b, c, d, e, f), whose a and b are here and c, d and
+// e, f in the next two.
+struct XForm { kind: i32, x: f32, y: f32, pct: i32 }
+let XF_TRANSLATE: i32 = 1;
+let XF_SCALE: i32 = 2;
+let XF_ROTATE: i32 = 3;
+let XF_MATRIX: i32 = 4;
+
+fn no_xform() -> XForm { return XForm { kind: 0, x: 0.0, y: 0.0, pct: 0 }; }
 
 // currentColor until layout paints with the text's colour. Its alpha is 0 and
 // no colour name or #rrggbb parses to it.
@@ -310,7 +326,9 @@ fn root_style() -> Style {
                    flex_dir: K_ROW, flex_wrap: K_NOWRAP, justify: K_NORMAL, align_items: K_NORMAL, align_content: K_NORMAL,
                    row_gap: 0.0, col_gap: 0.0, gap_pct: 0,
                    align_self: K_AUTO, grow: 0.0, shrink: 1.0, order: 0, basis: 0.0, basis_kind: K_AUTO,
-                   min_w_auto: 1, min_h_auto: 1 };
+                   min_w_auto: 1, min_h_auto: 1,
+                   xf: [no_xform(), no_xform(), no_xform(), no_xform(), no_xform(), no_xform()], xf_count: 0,
+                   origin_x: 50.0, origin_y: 50.0, origin_pct: 3 };
 }
 
 // ------------------------------------------------------------------ parsing
@@ -966,7 +984,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
     if name == "margin" || name == "padding" {
         let base = if name == "margin" { P_MT } else { P_PT };
         let parts = values(value);
-        guard parts.len >= 1 && parts.len <= 4;
+        guard parts.len >= 1 && parts.len <= 4 else { return; }
         // top right bottom left, with CSS's rules for one to three values.
         let n = parts.len;
         let t = parts[0];
@@ -1013,7 +1031,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
         // elliptical second half, after a slash, is left out.
         let slash = find(value, "/");
         let parts = values(if name == "border-radius" && slash >= 0 { value[..slash] } else { value });
-        guard parts.len >= 1 && parts.len <= 4;
+        guard parts.len >= 1 && parts.len <= 4 else { return; }
         for side in 4 {
             let v = parts[side_index(parts.len, side)];
             if name == "border-width" { add_value(side_prop(side, P_BT_WIDTH, P_BR_WIDTH, P_BB_WIDTH, P_BL_WIDTH), v, important, out); }
@@ -1035,7 +1053,7 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
     if name == "gap" || name == "grid-gap" {
         // row, then column; one value is both.
         let parts = words(value);
-        guard parts.len >= 1 && parts.len <= 2;
+        guard parts.len >= 1 && parts.len <= 2 else { return; }
         add_value(P_ROW_GAP, parts[0], important, out);
         add_value(P_COLUMN_GAP, parts[parts.len - 1], important, out);
         return;
@@ -1050,6 +1068,23 @@ fn add_declaration(name: const u8[:], value: const u8[:], important: i32, out: D
             return;
         }
         for side in 4 { add_value(side_prop(side, P_TOP, P_RIGHT, P_BOTTOM, P_LEFT), parts[side_index(parts.len, side)], important, out); }
+        return;
+    }
+    if name == "transform" || name == "transform-origin" {
+        // Parsed when applied, where em and percentages are known; checked now,
+        // so that an invalid one is dropped, as CSS has it.
+        let prop = if name == "transform" { P_TRANSFORM } else { P_TRANSFORM_ORIGIN };
+        if value == "inherit" { push_decl(out, decl(prop, V_INHERIT, 0.0, 0, 0, important)); return; }
+        let initial = value == "initial" || value == "unset";
+        if prop == P_TRANSFORM && (initial || value == "none") { push_decl(out, decl(prop, V_KEYWORD, K_NONE, 0, 0, important)); return; }
+        var probe = root_style();
+        if prop == P_TRANSFORM {
+            parse_transform(value, probe);
+            if probe.xf_count == 0 { return; }
+        } else if !initial && !parse_origin(value, probe) {
+            return;
+        }
+        push_decl(out, text_decl(prop, V_STRING, important, if initial { "50% 50%" } else { value }, "", bytes));
         return;
     }
     if name == "box-shadow" {
@@ -1155,11 +1190,11 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
             return;
         }
         let n, u, ok = parse_length(value);
-        guard !ok || n >= 0.0;
+        guard !ok || n >= 0.0 else { return; }
     }
     if prop >= P_BT_STYLE && prop <= P_BL_STYLE {
         let st = border_style(value);
-        guard st >= 0;
+        guard st >= 0 else { return; }
         d.kind = V_KEYWORD;
         d.num = st;
         push_decl(out, d);
@@ -1180,7 +1215,7 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
     if prop == P_OPACITY {
         let pct = value.len > 0 && value[value.len - 1] == '%';
         let n, ok = parse_flt(if pct { value[..value.len - 1] } else { value });
-        guard ok;
+        guard ok else { return; }
         d.kind = V_NUMBER;
         d.num = (if pct { n / 100.0 } else { n }) as f32;
         push_decl(out, d);
@@ -1188,7 +1223,7 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
     }
     if prop == P_COLOR || prop == P_BG || prop == P_BT_COLOR || prop == P_BB_COLOR || prop == P_BL_COLOR || prop == P_BR_COLOR {
         let c, ok = parse_color(value);
-        guard ok;
+        guard ok else { return; }
         d.kind = V_COLOR;
         d.color = c;
         push_decl(out, d);
@@ -1204,7 +1239,7 @@ fn add_value(prop: i32, value: const u8[:], important: i32, out: Decl[>..]&) {
         let n, ok = parse_int(value);
         if ok { d.kind = V_KEYWORD; d.num = (if n >= 600 { K_BOLD } else { K_NORMAL }) as f32; push_decl(out, d); return; }
         let k = keyword(value);
-        guard k == K_BOLD || k == K_NORMAL || value == "bolder" || value == "lighter";
+        guard k == K_BOLD || k == K_NORMAL || value == "bolder" || value == "lighter" else { return; }
         d.kind = V_KEYWORD;
         d.num = (if k == K_BOLD || value == "bolder" { K_BOLD } else { K_NORMAL }) as f32;
         push_decl(out, d);
@@ -1270,6 +1305,7 @@ fn property_id(n: const u8[:]) -> i32 {
     if n == "bottom" { return P_BOTTOM; } if n == "left" { return P_LEFT; }
     if n == "overflow-x" { return P_OVERFLOW_X; } if n == "overflow-y" { return P_OVERFLOW_Y; }
     if n == "text-overflow" { return P_TEXT_OVERFLOW; }
+    if n == "transform" { return P_TRANSFORM; } if n == "transform-origin" { return P_TRANSFORM_ORIGIN; }
     if n == "flex-direction" { return P_FLEX_DIRECTION; } if n == "flex-wrap" { return P_FLEX_WRAP; }
     if n == "justify-content" { return P_JUSTIFY_CONTENT; } if n == "align-items" { return P_ALIGN_ITEMS; }
     if n == "align-self" { return P_ALIGN_SELF; } if n == "align-content" { return P_ALIGN_CONTENT; }
@@ -1993,7 +2029,154 @@ fn apply_decl(s: Style&, parent: Style, dc: Decl, sh: Sheet, scratch: u8[>..<]&)
 // apply, and box-shadow, whose list is text in the sheet's bytes.
 fn apply_value(s: Style&, parent: Style, dc: Decl, sh: Sheet) {
     if dc.prop == P_BOX_SHADOW && dc.kind == V_STRING { parse_shadows(span_of(sh, dc.text, dc.text_len), s); return; }
+    if dc.prop == P_TRANSFORM && dc.kind == V_STRING { parse_transform(span_of(sh, dc.text, dc.text_len), s); return; }
+    if dc.prop == P_TRANSFORM_ORIGIN && dc.kind == V_STRING { parse_origin(span_of(sh, dc.text, dc.text_len), s); return; }
     apply(s, parent, dc);
+}
+
+// transform: translate(), translateX(), translateY(), scale(), scaleX(),
+// scaleY(), rotate() and matrix(), up to six of them, in order. Anything
+// else (skew, 3D) makes the whole list none, as an invalid value would.
+fn parse_transform(text: const u8[:], s: Style&) {
+    s.xf_count = 0;
+    var i: i64 = 0;
+    while i < text.len {
+        while i < text.len && is_ws(text[i]) { i += 1; }
+        guard i < text.len else { return; }
+        let st = i;
+        while i < text.len && text[i] != '(' { i += 1; }
+        let close = if i < text.len { close_paren(text, i + 1) } else { -1 };
+        guard close > 0 else { s.xf_count = 0; return; }
+        var name: u8[>..] = [];
+        for c in trim(text[st..i]) { name.push(lower(c)); }
+        let f = name[..];
+        // Its arguments, split at commas or spaces.
+        var v: f32[6];
+        var unit: i32[6];
+        var count = 0;
+        var ok = true;
+        var j = i + 1;
+        while j < close {
+            while j < close && (is_ws(text[j]) || text[j] == ',') { j += 1; }
+            let a = j;
+            while j < close && !is_ws(text[j]) && text[j] != ',' { j += 1; }
+            guard j > a else { continue; }
+            let x, u, aok = transform_arg(text[a..j], s);
+            if !aok || count >= 6 { ok = false; break; }
+            v[count] = x;
+            unit[count] = u;
+            count += 1;
+        }
+        i = close + 1;
+        var one = no_xform();
+        let room: i32 = if f == "matrix" { 3 } else { 1 };
+        if !ok || s.xf_count + room > 6 { s.xf_count = 0; return; }
+        // Units: 0 a number, 1 a length, 2 a percentage, 3 an angle. A 0 with
+        // none is a length or an angle too.
+        let len0 = count >= 1 && (unit[0] == 1 || unit[0] == 2 || (unit[0] == 0 && v[0] == 0.0));
+        let len1 = count >= 2 && (unit[1] == 1 || unit[1] == 2 || (unit[1] == 0 && v[1] == 0.0));
+        if (f == "translate" && len0 && (count == 1 || (count == 2 && len1))) || ((f == "translatex" || f == "translatey") && count == 1 && len0) {
+            one.kind = XF_TRANSLATE;
+            if f == "translatey" {
+                one.y = v[0];
+                if unit[0] == 2 { one.pct = 2; }
+            } else {
+                one.x = v[0];
+                if unit[0] == 2 { one.pct = 1; }
+                if count == 2 {
+                    one.y = v[1];
+                    if unit[1] == 2 { one.pct = one.pct | 2; }
+                }
+            }
+        } else if (f == "scale" && (count == 1 || count == 2) && unit[0] == 0 && (count == 1 || unit[1] == 0))
+                  || ((f == "scalex" || f == "scaley") && count == 1 && unit[0] == 0) {
+            one.kind = XF_SCALE;
+            one.x = if f == "scaley" { 1.0 } else { v[0] };
+            one.y = if f == "scalex" { 1.0 } else if count == 2 { v[1] } else { v[0] };
+        } else if (f == "rotate" || f == "rotatez") && count == 1 && (unit[0] == 3 || (unit[0] == 0 && v[0] == 0.0)) {
+            one.kind = XF_ROTATE;
+            one.x = v[0];
+        } else if f == "matrix" && count == 6 {
+            for k in 3 { s.xf[s.xf_count + k] = XForm { kind: XF_MATRIX, x: v[2 * k], y: v[2 * k + 1], pct: 0 }; }
+            s.xf_count += 3;
+            continue;
+        } else {
+            s.xf_count = 0;
+            return;
+        }
+        s.xf[s.xf_count] = one;
+        s.xf_count += 1;
+    }
+}
+
+// A transform function's argument: its value and what it is (0 a number, 1
+// a length in points, 2 a percentage, 3 an angle in radians).
+fn transform_arg(w: const u8[:], s: Style) -> f32, i32, bool {
+    var k: i64 = 0;
+    while k < w.len && (w[k] == '-' || w[k] == '+' || w[k] == '.' || (w[k] >= '0' && w[k] <= '9') || ((w[k] == 'e' || w[k] == 'E') && k > 0 && k + 1 < w.len && (w[k + 1] == '-' || (w[k + 1] >= '0' && w[k + 1] <= '9')))) { k += 1; }
+    guard k > 0 else { return 0.0, 0, false; }
+    let n, ok = parse_flt(w[..k]);
+    guard ok else { return 0.0, 0, false; }
+    let x = n as f32;
+    var unit: u8[>..] = [];
+    for c in w[k..] { unit.push(lower(c)); }
+    let u = unit[..];
+    if u.len == 0 { return x, 0, true; }
+    if u == "px" { return x, 1, true; }
+    if u == "em" { return x * s.font_size, 1, true; }
+    if u == "rem" { return x * s.root_size, 1, true; }
+    if u == "pt" { return x * 4.0 / 3.0, 1, true; }
+    if u == "%" { return x, 2, true; }
+    if u == "deg" { return x * 3.14159265 / 180.0, 3, true; }
+    if u == "rad" { return x, 3, true; }
+    if u == "turn" { return x * 6.28318531, 3, true; }
+    if u == "grad" { return x * 3.14159265 / 200.0, 3, true; }
+    return 0.0, 0, false;
+}
+
+// transform-origin: one or two of left, center, right, top, bottom, lengths
+// and percentages; x then y, unless keywords say otherwise. A third value
+// (depth) is ignored. Whether it was valid: anything else, or more, isn't.
+fn parse_origin(text: const u8[:], s: Style&) -> bool {
+    var x: f32 = 50.0;
+    var y: f32 = 50.0;
+    var pct: i32 = 3;
+    var count = 0;
+    var x_set = false;
+    var y_set = false;
+    var ok = true;
+    each_word(text) {
+        let w = it;
+        if count >= 2 {
+            let v, u, wok = transform_arg(w, s);
+            if count > 2 || !wok || !(u == 1 || (u == 0 && v == 0.0)) { ok = false; }
+        } else {
+            if w == "left" || w == "right" { x = if w == "left" { 0.0 } else { 100.0 }; pct = pct | 1; x_set = true; }
+            else if w == "top" || w == "bottom" { y = if w == "top" { 0.0 } else { 100.0 }; pct = pct | 2; y_set = true; }
+            else if w == "center" { }
+            else {
+                let v, u, wok = transform_arg(w, s);
+                if !wok || !(u == 1 || u == 2 || (u == 0 && v == 0.0)) { ok = false; }
+                else {
+                    let into_x = !x_set && (count == 0 || y_set);
+                    if into_x {
+                        x = v;
+                        pct = if u == 2 { pct | 1 } else { pct & ~1 };
+                        x_set = true;
+                    } else {
+                        y = v;
+                        pct = if u == 2 { pct | 2 } else { pct & ~2 };
+                        y_set = true;
+                    }
+                }
+            }
+        }
+        count += 1;
+    };
+    s.origin_x = x;
+    s.origin_y = y;
+    s.origin_pct = pct;
+    return ok && count > 0;
 }
 
 // box-shadow: up to two shadows, separated by commas, each `x y [blur
@@ -2091,6 +2274,19 @@ fn inherit_value(s: Style&, parent: Style, p: i32) {
         s.clips = (s.clips & ~bit) | (parent.clips & bit);
     }
     else if p == P_TEXT_OVERFLOW { s.ellipsis = parent.ellipsis; }
+    else if p == P_FLEX_DIRECTION { s.flex_dir = parent.flex_dir; } else if p == P_FLEX_WRAP { s.flex_wrap = parent.flex_wrap; }
+    else if p == P_JUSTIFY_CONTENT { s.justify = parent.justify; } else if p == P_ALIGN_ITEMS { s.align_items = parent.align_items; }
+    else if p == P_ALIGN_SELF { s.align_self = parent.align_self; } else if p == P_ALIGN_CONTENT { s.align_content = parent.align_content; }
+    else if p == P_FLEX_GROW { s.grow = parent.grow; } else if p == P_FLEX_SHRINK { s.shrink = parent.shrink; }
+    else if p == P_FLEX_BASIS { s.basis = parent.basis; s.basis_kind = parent.basis_kind; }
+    else if p == P_ORDER { s.order = parent.order; }
+    else if p == P_ROW_GAP || p == P_COLUMN_GAP {
+        let bit: i32 = if p == P_ROW_GAP { 1 } else { 2 };
+        if p == P_ROW_GAP { s.row_gap = parent.row_gap; } else { s.col_gap = parent.col_gap; }
+        s.gap_pct = (s.gap_pct & ~bit) | (parent.gap_pct & bit);
+    }
+    else if p == P_TRANSFORM { s.xf = parent.xf; s.xf_count = parent.xf_count; }
+    else if p == P_TRANSFORM_ORIGIN { s.origin_x = parent.origin_x; s.origin_y = parent.origin_y; s.origin_pct = parent.origin_pct; }
 }
 
 // What an element starts from: the inherited properties of its parent, the
@@ -2201,6 +2397,8 @@ fn apply(s: Style&, parent: Style, dc: Decl) {
         if corner == 0 { s.rad_tl = v; } else if corner == 1 { s.rad_tr = v; } else if corner == 2 { s.rad_br = v; } else { s.rad_bl = v; }
     }
     else if p == P_BOX_SHADOW { s.shadow_count = 0; }       // none; the shadows themselves come through apply_decl
+    else if p == P_TRANSFORM { s.xf_count = 0; }             // none; a list comes through apply_value
+    else if p == P_TRANSFORM_ORIGIN { s.origin_x = 50.0; s.origin_y = 50.0; s.origin_pct = 3; }
     else if p == P_OPACITY { s.opacity = clamp(dc.num, 0.0, 1.0); }
     else if p == P_POSITION { if k == K_STATIC || k == K_RELATIVE || k == K_ABSOLUTE || k == K_FIXED { s.position = k; } }
     else if p >= P_TOP && p <= P_LEFT {

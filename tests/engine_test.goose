@@ -418,6 +418,24 @@ fn test_box() {
 
     check("rounded boxes, dashes, rings and bars, opacity", layout_probe(paint, 100.0, PROBE_PAINT),
           "r box 0,0,100,20 ffff0000 r 4,4,4,4 b 0 00000000 solid\np box 0,20,40,20 ff00ff00 r 10,10,10,10 b 0 00000000 solid\nu box 0,40,100,24 00000000 r 0,0,0,0 b 2 ff0000ff dashed\ns box -1,83,102,22 00000000 r 0,0,0,0 b 1 ff000000 solid\ns rect 0,84,3,20 ff0000ff\no rect 0,104,100,20 80ff0000\nt box 0,124,100,10 ff000000 r 6,6,0,0 b 0 00000000 solid\n");
+
+    // An invalid value is dropped, whatever else it would parse as: a
+    // negative border width, a keyword that isn't a border style, opacity or
+    // colour, a colour that is a length, a weight that is a keyword.
+    let invalid = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        div { width: 10px; height: 10px; border: 3px solid #000; background: #f00 }
+        #w { border-top-width: -2px } #s { border-top-style: block } #o { opacity: none }</style>
+        <div id=w></div><div id=s></div><div id=o></div>
+        """;
+    check("invalid border widths, styles and opacity", layout_probe(invalid, 100.0, PROBE_PAINT),
+          str("w rect 0,0,16,16 ffff0000\nw rect 0,0,16,3 ff000000\nw rect 13,3,3,10 ff000000\nw rect 0,13,16,3 ff000000\nw rect 0,3,3,10 ff000000\n",
+              "s rect 0,16,16,16 ffff0000\ns rect 0,16,16,3 ff000000\ns rect 13,19,3,10 ff000000\ns rect 0,29,16,3 ff000000\ns rect 0,19,3,10 ff000000\n",
+              "o rect 0,32,16,16 ffff0000\no rect 0,32,16,3 ff000000\no rect 13,35,3,10 ff000000\no rect 0,45,16,3 ff000000\no rect 0,35,3,10 ff000000\n")[..]);
+    let words = """<p style="color: #f00"><span style="color: none">a</span><span style="color: 0">b</span><b style="font-weight: auto">c</b></p>""";
+    check("a keyword as a colour", style_at(words, "span", 0, false), "display=2 size=17.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check("a length as a colour", style_at(words, "span", 1, false), "display=2 size=17.0 bold=0 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
+    check("a keyword as a weight", style_of(words, "b"), "display=2 size=17.0 bold=1 italic=0 color=ffff0000 mt=0.0 ml=0.0 auto_ml=0");
 }
 
 fn test_positioning() {
@@ -688,8 +706,141 @@ fn test_flex() {
     check("text in a flex row, after the gap", layout_probe(chip, 400.0, PROBE_TEXT), "\"Label text\" line 1 x 26\n");
 }
 
+fn test_transforms() {
+    // translateX(-50%) moves a box by half its width, items and all, with no
+    // matrix; rotate(90deg) about the middle of a 20 × 10 box turns it into
+    // 10 × 20, as its box says; scale(2) about its top left doubles it. A
+    // transformed element contains an absolute box and paints after the flow
+    // after it; skew isn't supported, so that transform is none.
+    let boxes = """
+        <style>body { margin: 0; padding: 0; max-width: none } div { background: #888 }
+        #t { position: absolute; left: 50%; top: 0; width: 40px; height: 10px; transform: translateX(-50%) }
+        #r { width: 20px; height: 10px; transform: rotate(90deg) } #s { width: 10px; height: 10px; transform: scale(2); transform-origin: 0 0 }
+        #tc { margin-left: 50px; height: 20px; transform: rotate(0deg) } #tca { position: absolute; left: 0; top: 0; width: 5px; height: 5px }
+        #after { height: 5px } #k { width: 5px; height: 5px; transform: skewX(10deg) }</style>
+        <div id=t></div><div id=r></div><div id=s></div><div id=tc><div id=tca></div></div><div id=after></div><div id=k></div>
+        """;
+    check("transforms move boxes", layout_probe(boxes, 400.0, PROBE_GEOMETRY),
+          str("t x 180.0 y 0.0 w 40.0 h 10.0\nr x 5.0 y -5.0 w 10.0 h 20.0\ns x 0.0 y 10.0 w 20.0 h 20.0\n",
+              "tc x 50.0 y 20.0 w 350.0 h 20.0\ntca x 50.0 y 20.0 w 5.0 h 5.0\nafter x 0.0 y 40.0 w 400.0 h 5.0\nk x 0.0 y 45.0 w 5.0 h 5.0\n")[..]);
+    check("transforms reach the compositor as matrices", layout_probe(boxes, 400.0, PROBE_XF),
+          "after none\nk none\nt none\nr 0.00,1.00,-1.00,0.00,15.00,-5.00\ns 2.00,0.00,0.00,2.00,0.00,-10.00\ntc none\ntca none\n");
+
+    check("matrix() and a transform-origin in keywords", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none } div { width: 10px; height: 10px; background: #000 } #m { transform: matrix(1, 0, 0, 1, 10, 20) } #o { transform: rotate(180deg); transform-origin: right bottom }</style><div id=m></div><div id=o></div>""", 400.0, PROBE_GEOMETRY),
+          "m x 10.0 y 20.0 w 10.0 h 10.0\no x 10.0 y 20.0 w 10.0 h 10.0\n");
+
+    // A turned card that clips: what is in it turns with it, so its clip
+    // needs no matrix of its own; something turned inside a box that doesn't
+    // turn has one.
+    let clips = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        #card { width: 40px; height: 40px; overflow: hidden; transform: rotate(10deg) } #art { width: 60px; height: 60px; background: #f00 }
+        #box { width: 40px; height: 40px; overflow: hidden } #spin { width: 60px; height: 20px; background: #00f; transform: rotate(30deg) }</style>
+        <div id=card><div id=art></div></div><div id=box><div id=spin></div></div>
+        """;
+    check("clips in the space of what they cut", layout_probe(clips, 400.0, PROBE_XF), "art turned, clip plain\nspin turned, clip mapped\n");
+
+    // From the review. A turned item in two clips that don't overlap has
+    // nothing left to show.
+    let empty = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        #outer { width: 100px; height: 100px; overflow: hidden } #inner { margin-left: 200px; width: 100px; height: 100px; overflow: hidden }
+        #spin { width: 60px; height: 60px; margin: 20px; background: #c33; transform: rotate(10deg) }</style>
+        <div id=outer><div id=inner><div id=spin></div></div></div>
+        """;
+    check("a turned item in an empty clip", layout_probe(empty, 400.0, PROBE_CLIP), "spin dropped\n");
+
+    // Clips in different spaces each cut in their own: slides that clip, in
+    // a track moved 200 left, in a viewport that clips; a clipping box moved
+    // 100 right in one that doesn't move; a turned card that clips, in a
+    // table that clips and doesn't turn.
+    let carousel = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        #viewport { margin: 40px 0 0 200px; width: 400px; height: 120px; overflow: hidden }
+        #track { display: flex; transform: translateX(-200px) }
+        .slide { flex: none; width: 180px; height: 100px; margin: 10px; overflow: hidden; border-radius: 12px }
+        .slide div { width: 180px; height: 100px; background: #c33 }</style>
+        <div id=viewport><div id=track><div class=slide><div id=a1></div></div><div class=slide><div id=a2></div></div>
+        <div class=slide><div id=a3></div></div><div class=slide><div id=a4></div></div></div></div>
+        """;
+    check("slides moved inside a viewport", layout_probe(carousel, 800.0, PROBE_CLIP),
+          "a1 dropped\na2 clip 210,50,180,100 r 12\na3 clip 410,50,180,100 r 12\na4 dropped\n");
+    let nested = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        #outer { margin: 20px; width: 200px; height: 100px; overflow: hidden }
+        #inner { width: 200px; height: 100px; overflow: hidden; transform: translateX(100px) }
+        #content { width: 200px; height: 100px; background: #c33 }
+        #table { position: relative; margin: 20px; width: 300px; height: 150px; overflow: hidden }
+        #card { position: absolute; left: 220px; top: 20px; width: 120px; height: 100px; overflow: hidden; border-radius: 10px; transform: rotate(20deg) }
+        #art { width: 120px; height: 100px; background: #33c }</style>
+        <div id=outer><div id=inner><div id=content></div></div></div><div id=table><div id=card><div id=art></div></div></div>
+        """;
+    check("clips moved and turned inside others", layout_probe(nested, 400.0, PROBE_CLIP),
+          "content clip 120,20,100,100 r 0\nart clip 240,160,120,100 r 10 outer 20,140,300,150\n");
+
+    // A unitless 0 is a length or an angle; 0px isn't an angle, so that
+    // whole transform is none.
+    let zeros = """
+        <style>body { margin: 0; padding: 0; max-width: none } div { width: 10px; height: 10px; background: #000 }
+        #z1 { width: 40px; transform: translate(-50%, 0) } #z2 { transform: translateX(10px) rotate(0) }
+        #z3 { transform: rotate(0px) translateX(10px) } #z4 { transform: translate(0, -50%) }</style>
+        <div id=z1></div><div id=z2></div><div id=z3></div><div id=z4></div>
+        """;
+    check("unitless zeros in transforms", layout_probe(zeros, 400.0, PROBE_GEOMETRY),
+          "z1 x -20.0 y 0.0 w 40.0 h 10.0\nz2 x 10.0 y 10.0 w 10.0 h 10.0\nz3 x 0.0 y 20.0 w 10.0 h 10.0\nz4 x 0.0 y 25.0 w 10.0 h 10.0\n");
+
+    // inherit takes the parent's transform and transform-origin; an invalid
+    // transform is dropped, so an earlier one stands.
+    let inherits = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        #p { width: 100px; height: 100px; transform: translateX(10px); transform-origin: 0 0 }
+        #c { width: 40px; height: 20px; background: #c33; transform: inherit }
+        #q { width: 100px; height: 50px; transform: rotate(90deg); transform-origin: 0 0 }
+        #qc { width: 40px; height: 20px; background: #3c3; transform: rotate(90deg); transform-origin: inherit }
+        .a { width: 40px; height: 20px; background: #33c; transform: rotate(90deg) } #a { transform: rotate(10) }</style>
+        <div id=p><div id=c></div></div><div style="height: 60px"></div><div id=q><div id=qc></div></div>
+        <div style="height: 60px"></div><div class=a id=a></div>
+        """;
+    check("inherit and invalid transforms", layout_probe(inherits, 400.0, PROBE_GEOMETRY),
+          str("p x 10.0 y 0.0 w 100.0 h 100.0\nc x 20.0 y 0.0 w 40.0 h 20.0\nq x -50.0 y 160.0 w 50.0 h 100.0\n",
+              "qc x -40.0 y 140.0 w 40.0 h 20.0\na x 10.0 y 260.0 w 20.0 h 40.0\n")[..]);
+
+    // A fixed box in a transformed element moves with the relative box
+    // around that element, as an absolute one does.
+    let fixedrel = """
+        <style>body { margin: 0; padding: 0; max-width: none }
+        #rel { position: relative; top: 50px; left: 30px } #t { transform: translateX(10px); height: 100px }
+        #f { position: fixed; left: 0; top: 0; width: 20px; height: 20px } #a { position: absolute; left: 0; top: 0; width: 20px; height: 20px }</style>
+        <div id=rel><div id=t><div id=f></div><div id=a></div></div></div>
+        """;
+    check("a fixed box in a transform in a relative box", layout_probe(fixedrel, 400.0, PROBE_GEOMETRY),
+          "rel x 30.0 y 50.0 w 400.0 h 100.0\nt x 40.0 y 50.0 w 400.0 h 100.0\nf x 40.0 y 50.0 w 20.0 h 20.0\na x 40.0 y 50.0 w 20.0 h 20.0\n");
+
+    // z-index applies to positioned boxes: a static transformed one paints
+    // with them at 0, after the flow, whatever its z-index.
+    let zs = """
+        <style>body { margin: 0; padding: 0; max-width: none } div { height: 20px }
+        #p { background: #eee; padding: 10px } #t { transform: translateX(10px); z-index: -1; background: #c33 }
+        #after { margin-top: -20px; background: #33c } #t5 { transform: translateX(10px); z-index: 5; background: #c3c }
+        #pos { position: relative; z-index: 1; margin-top: -20px; background: #3cc }</style>
+        <div id=p><div id=t></div><div id=after></div></div><div id=t5></div><div id=pos></div>
+        """;
+    check("z-index of static transformed boxes", layout_probe(zs, 400.0, PROBE_ORDER), "p after t t5 pos");
+
+    // Where a transform takes a box counts in the page's height, unless a
+    // box around it clips it.
+    let far = """
+        <style>body { margin: 0; padding: 0; max-width: none }</style>
+        <div style="height: 10px; overflow: hidden"><div style="height: 10px; transform: translateY(5000px)"></div></div>
+        <div style="height: 20px; transform: translateY(2000px)"></div>
+        """;
+    check("transforms reach down the page", layout_probe(far, 400.0, PROBE_PAGE), "2030.0");
+}
+
 // ------------------------------------------------------------------ layout
 
+let PROBE_PAGE: i32 = 17;   // the page's height
+let PROBE_XF: i32 = 15;     // each item of an element with an id: its matrix, or "none"; with a clip, how it is mapped
 let PROBE_ORDER: i32 = 9;   // the elements with an id, in the order their items paint
 let PROBE_CLIP: i32 = 10;   // each item of an element with an id: its clip, none, or dropped
 let PROBE_ELLIPSIS: i32 = 11; // whether #e's text ends in "…" inside its box
@@ -740,7 +891,7 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
                      fonts: fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
                      measured: measured };
     measure(L);
-    layout_page(L, width, 600.0);
+    let page_h = layout_page(L, width, 600.0);
 
     var out: u8[>..] = [];
     if probe == PROBE_TEXT {
@@ -866,18 +1017,50 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             guard has else { continue; }
             out.append(id);
             if it.kind == ITEM_NONE { out.append(" dropped\n"); continue; }
-            if it.clip_w <= 0.0 { out.append(" none\n"); continue; }
-            out.append(" clip ");
-            format_flt(out, it.clip_x, 0); out.push(',');
-            format_flt(out, it.clip_y, 0); out.push(',');
-            format_flt(out, it.clip_w, 0); out.push(',');
-            format_flt(out, it.clip_h, 0);
-            out.append(" r ");
-            format_flt(out, it.clip_tl, 0);
-            if it.clip_tr != it.clip_tl || it.clip_br != it.clip_tl || it.clip_bl != it.clip_tl {
-                out.push(','); format_flt(out, it.clip_tr, 0);
-                out.push(','); format_flt(out, it.clip_br, 0);
-                out.push(','); format_flt(out, it.clip_bl, 0);
+            if it.clip_w <= 0.0 && it.oclip_w <= 0.0 { out.append(" none\n"); continue; }
+            if it.clip_w > 0.0 {
+                out.append(" clip ");
+                format_flt(out, it.clip_x, 0); out.push(',');
+                format_flt(out, it.clip_y, 0); out.push(',');
+                format_flt(out, it.clip_w, 0); out.push(',');
+                format_flt(out, it.clip_h, 0);
+                out.append(" r ");
+                format_flt(out, it.clip_tl, 0);
+                if it.clip_tr != it.clip_tl || it.clip_br != it.clip_tl || it.clip_bl != it.clip_tl {
+                    out.push(','); format_flt(out, it.clip_tr, 0);
+                    out.push(','); format_flt(out, it.clip_br, 0);
+                    out.push(','); format_flt(out, it.clip_bl, 0);
+                }
+            }
+            if it.oclip_w > 0.0 {
+                out.append(" outer ");
+                format_flt(out, it.oclip_x, 0); out.push(',');
+                format_flt(out, it.oclip_y, 0); out.push(',');
+                format_flt(out, it.oclip_w, 0); out.push(',');
+                format_flt(out, it.oclip_h, 0);
+            }
+            out.push('\n');
+        }
+    } else if probe == PROBE_PAGE {
+        format_flt(out, page_h, 1);
+    } else if probe == PROBE_XF {
+        for it in items {
+            guard it.node >= 0 && it.kind != ITEM_NONE else { continue; }
+            let id, has = attr_value(d, it.node, "id");
+            guard has else { continue; }
+            out.append(id);
+            let turned = it.m_a != 0.0 || it.m_b != 0.0 || it.m_c != 0.0 || it.m_d != 0.0;
+            if it.clip_w > 0.0 {
+                let mapped = it.c_a != 0.0 || it.c_b != 0.0 || it.c_c != 0.0 || it.c_d != 0.0;
+                out.append(if turned { " turned" } else { " plain" });
+                out.append(if mapped { ", clip mapped\n" } else { ", clip plain\n" });
+                continue;
+            }
+            if !turned { out.append(" none\n"); continue; }
+            let m: f32[6] = [it.m_a, it.m_b, it.m_c, it.m_d, it.m_e, it.m_f];
+            for v, j in m {
+                out.push(if j == 0 { ' ' } else { ',' });
+                format_flt(out, if v < 0.005 && v > -0.005 { 0.0 } else { v }, 2);
             }
             out.push('\n');
         }
@@ -1044,6 +1227,7 @@ fn main() {
     test_box();
     test_positioning();
     test_flex();
+    test_transforms();
     test_layout();
     test_snapshot();
     test_page();
