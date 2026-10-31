@@ -98,17 +98,20 @@ fn style_at(src: const u8[:], name: const u8[:], k: i64, font: bool) -> u8[>..] 
         guard n.kind == NODE_ELEMENT && node_name(d, i as i32) == name else { continue; }
         if seen < k { seen += 1; continue; }
         let st = styles[i];
+        let bold = if st.weight >= 600 { 1 } else { 0 };
         if font {
-            format(out, "italic=", st.italic, " bold=", st.bold, " size=");
+            format(out, "italic=", st.italic, " bold=", bold, " size=");
             format_flt(out, st.font_size, 1);
             out.append(" lh=");
             format_flt(out, line_height(st), 1);
-            format(out, " family=", st.family);
+            format(out, " family=", st.family, " weight=", st.weight);
+            if st.spacing != 0.0 { out.append(" spacing="); format_flt(out, st.spacing, 1); }
+            if st.text_case != K_NONE { format(out, " case=", st.text_case); }
             return out;
         }
         format(out, "display=", st.display, " size=");
         format_flt(out, st.font_size, 1);
-        format(out, " bold=", st.bold, " italic=", st.italic, " color=");
+        format(out, " bold=", bold, " italic=", st.italic, " color=");
         format_uint(out, st.color, 16, 8, '0');
         out.append(" mt=");
         format_flt(out, st.mt, 1);
@@ -258,9 +261,9 @@ fn test_css_interface() {
         <style>h1 { font: italic 600 20px/1.5 "Barlow Condensed", Georgia, serif }
         h2 { font: 12px monospace; font-weight: bold } h3 { font: bold }</style><h1>a</h1><h2>b</h2><h3>c</h3>
         """;
-    check("the font shorthand", style_at(fonts, "h1", 0, true), "italic=1 bold=1 size=20.0 lh=30.0 family=1");
-    check("a longhand after the shorthand wins", style_at(fonts, "h2", 0, true), "italic=0 bold=1 size=12.0 lh=14.4 family=2");
-    check("a font with no size is ignored", style_at(fonts, "h3", 0, true), "italic=0 bold=1 size=20.4 lh=26.5 family=0");
+    check("the font shorthand", style_at(fonts, "h1", 0, true), "italic=1 bold=1 size=20.0 lh=30.0 family=3 weight=600");
+    check("a longhand after the shorthand wins", style_at(fonts, "h2", 0, true), "italic=0 bold=1 size=12.0 lh=14.4 family=2 weight=700");
+    check("a font with no size is ignored", style_at(fonts, "h3", 0, true), "italic=0 bold=1 size=20.4 lh=26.5 family=0 weight=700");
 
     // ::before and ::after, made once; :first-child still sees the first real child.
     let gen = """<style>p.q::before { content: "> "; color: #ff0000 } p.q::after { content: "" } p:before { content: none } p.q span:first-child { color: #00ff00 } p.q span::after { content: "\41 B" }</style><p class=q><span>s</span> quote</p><p>plain</p>""";
@@ -837,8 +840,169 @@ fn test_transforms() {
     check("transforms reach down the page", layout_probe(far, 400.0, PROBE_PAGE), "2030.0");
 }
 
+fn test_fonts() {
+    // Weights from 1 to 1000; bolder and lighter step from the parent's.
+    let weights = """
+        <style>h3 { font-weight: 300 } h3 b { font-weight: bolder } h4 { font-weight: 700 } h4 i { font-weight: lighter }
+        h5 { font-weight: 950 } h5 b { font-weight: bolder } h6 { font-weight: 50 } h6 i { font-weight: lighter }</style>
+        <h3>c <b>d</b></h3><h4>e <i>f</i></h4><h5>g <b>h</b></h5><h6>i <i>j</i></h6>
+        """;
+    check("bolder from 300", style_at(weights, "b", 0, true), "italic=0 bold=0 size=20.4 lh=26.5 family=0 weight=400");
+    check("lighter from 700", style_at(weights, "i", 0, true), "italic=1 bold=0 size=17.0 lh=27.2 family=0 weight=400");
+    check("bolder from over 900 stays", style_at(weights, "b", 1, true), "italic=0 bold=1 size=17.0 lh=27.2 family=0 weight=950");
+    check("lighter from under 100 stays", style_at(weights, "i", 1, true), "italic=1 bold=0 size=17.0 lh=27.2 family=0 weight=50");
+
+    // The bundled families by name.
+    let bundled = """
+        <style>h1 { font: 800 20px/1 "Barlow Condensed", sans-serif } h2 { font: 500 11px/1 "JetBrains Mono", monospace }</style>
+        <h1>a</h1><h2>b</h2>
+        """;
+    check("a bundled family by name", style_at(bundled, "h1", 0, true), "italic=0 bold=1 size=20.0 lh=20.0 family=3 weight=800");
+    check("the other bundled family", style_at(bundled, "h2", 0, true), "italic=0 bold=0 size=11.0 lh=11.0 family=4 weight=500");
+
+    // bolder and lighter at the edges of CSS's table.
+    let edges = """
+        <style>b { font-weight: bolder } i { font-weight: lighter }</style>
+        <p style="font-weight: 349"><b>a</b></p><p style="font-weight: 350"><b>a</b></p><p style="font-weight: 899"><b>a</b></p>
+        <p style="font-weight: 900"><b>a</b></p><p style="font-weight: 549"><i>a</i></p><p style="font-weight: 550"><i>a</i></p>
+        <p style="font-weight: 749"><i>a</i></p><p style="font-weight: 750"><i>a</i></p>
+        """;
+    check("bolder at the edges", weights_of(edges, "b"), "400 700 900 900 ");
+    check("lighter at the edges", weights_of(edges, "i"), "100 400 400 700 ");
+
+    // Invalid letter-spacing and text-transform are dropped, so the parent's
+    // stand; full-width is valid, though Tusk doesn't draw it, and normal is 0.
+    let invalid = """
+        <div style="text-transform: uppercase; letter-spacing: 10px"><p style="text-transform: 0">a</p><p style="text-transform: 58px">b</p>
+        <p style="letter-spacing: none">c</p><p style="letter-spacing: bold">d</p><p style="text-transform: full-width">e</p>
+        <p style="letter-spacing: normal">f</p></div>
+        """;
+    var dropped: u8[>..] = [];
+    for k in 6 { format(dropped, style_at(invalid, "p", k, true), "\n"); }
+    check("invalid letter-spacing and text-transform",  dropped[..],
+          str("italic=0 bold=0 size=17.0 lh=27.2 family=0 weight=400 spacing=10.0 case=58\n",
+              "italic=0 bold=0 size=17.0 lh=27.2 family=0 weight=400 spacing=10.0 case=58\n",
+              "italic=0 bold=0 size=17.0 lh=27.2 family=0 weight=400 spacing=10.0 case=58\n",
+              "italic=0 bold=0 size=17.0 lh=27.2 family=0 weight=400 spacing=10.0 case=58\n",
+              "italic=0 bold=0 size=17.0 lh=27.2 family=0 weight=400 spacing=10.0\n",
+              "italic=0 bold=0 size=17.0 lh=27.2 family=0 weight=400 case=58\n")[..]);
+
+    // A font id carries the family; the weight in hundreds, rounded the way
+    // CSS looks for a face: down under 400, to 500 up to it, up over it; then
+    // italic, and ligatures off for spaced text.
+    var ids: u8[>..] = [];
+    var st = root_style();
+    st.family = FAMILY_CONDENSED;
+    for w in [1, 350, 400, 401, 500, 501, 1000] {
+        st.weight = w as i32;
+        st.italic = if w == 500 { 1 } else { 0 };
+        st.spacing = if w == 1000 { 2.0 } else { 0.0 };
+        let id = font_of(st);
+        format(ids, id & 15, "/", (id >> 4) & 15, "/", id >> 8, " ");
+    }
+    check("font ids", ids[..], "3/1/0 3/3/0 3/4/0 3/5/0 3/5/1 3/6/0 3/10/2 ");
+
+    // The platform reads font ids as font_of writes them: light text is
+    // narrower than regular, bold wider; Georgia at 500 is its regular face,
+    // as CSS finds faces, and its italic another; Barlow's Black is wider
+    // than its Medium.
+    var sans = root_style();
+    var serif = root_style();
+    serif.family = FAMILY_SERIF;
+    var cond = root_style();
+    cond.family = FAMILY_CONDENSED;
+    let bread = "Focaccia bread";
+    var facts: u8[>..] = [];
+    let regular = width_in(sans, bread);
+    sans.weight = 300;
+    facts.append(if width_in(sans, bread) < regular { "light narrower; " } else { "light not narrower; " });
+    sans.weight = 700;
+    facts.append(if width_in(sans, bread) > regular { "bold wider; " } else { "bold not wider; " });
+    let georgia = width_in(serif, bread);
+    serif.weight = 500;
+    facts.append(if width_in(serif, bread) == georgia { "500 regular; " } else { "500 not regular; " });
+    serif.weight = 400;
+    serif.italic = 1;
+    facts.append(if width_in(serif, bread) != georgia { "italic its own; " } else { "italic upright; " });
+    cond.weight = 500;
+    let medium = width_in(cond, bread);
+    cond.weight = 900;
+    facts.append(if width_in(cond, bread) > medium { "black wider" } else { "black not wider" });
+    check("font ids reach the platform", facts[..], "light narrower; bold wider; 500 regular; italic its own; black wider");
+
+    // letter-spacing comes after each character: three characters (four
+    // bytes) with 10 points each are 30 wider; text-transform changes case
+    // before measuring.
+    let spaced = """
+        <style>body { margin: 0; padding: 0; max-width: none } p { margin: 0 } #s { letter-spacing: 10px }
+        #u { text-transform: uppercase } #c { text-transform: capitalize } #l { text-transform: lowercase }</style>
+        <p id=a>aéb</p><p id=s>aéb</p><p id=u>abc é я</p><p id=c>two words</p><p id=l>ÉCOLE ПРИВЕТ</p>
+        """;
+    check("letter-spacing", layout_probe(spaced, 400.0, PROBE_SPACING), "30.0");
+
+    // Spacing goes after each letter with its marks: x with a combining
+    // circumflex is one; a zero-width space gets none. Text is measured in
+    // its new case.
+    let units = """
+        <style>body { margin: 0; padding: 0; max-width: none } p { margin: 0 }</style>
+        <p id=a>x&#x302;a&#x200B;b</p><p id=s style="letter-spacing: 10px">x&#x302;a&#x200B;b</p>
+        """;
+    check("letter-spacing by units", layout_probe(units, 400.0, PROBE_SPACING), "30.0");
+    check("no spacing inside a unit", layout_probe(units, 400.0, PROBE_CARETS), "0 0 0 10 10 10 10 20 30 ");
+    check("text measured in its new case", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none } p { margin: 0 }</style><p id=a>ABC</p><p id=s style="text-transform: uppercase">abc</p>""", 400.0, PROBE_SPACING), "0.0");
+    let cases = """
+        <style>body { margin: 0; padding: 0; max-width: none } p { margin: 0 } #u { text-transform: uppercase }
+        #l { text-transform: lowercase } #c { text-transform: capitalize }</style>
+        <p id=u>gdańsk łódź şehir brașov čeština ґанок ελλάδα ÿ µ</p><p id=l>ŁÓDŹ ΆΔΑ Ґ</p>
+        <p id=c>"hello" (world) hello-world foo/bar a&nbsp;b don't 3rd</p>
+        """;
+    check("cases beyond Latin-1", layout_probe(cases, 1000.0, PROBE_TEXT),
+          str("\"GDAŃSK ŁÓDŹ ŞEHIR BRAȘOV ČEŠTINA ҐАНОК ΕΛΛΆΔΑ Ÿ Μ\" line 1 x 0\n\"łódź άδα ґ\" line 2 x 0\n",
+              "\"\"Hello\" (World) Hello-World Foo/Bar A B Don't 3rd\" line 3 x 0\n")[..]);
+    check("text-transform", layout_probe(spaced, 400.0, PROBE_TEXT),
+          "\"aéb\" line 1 x 0\n\"aéb\" line 2 x 0\n\"ABC É Я\" line 3 x 0\n\"Two Words\" line 4 x 0\n\"école привет\" line 5 x 0\n");
+}
+
+// The weight of each element called `name`, in order.
+fn weights_of(src: const u8[:], name: const u8[:]) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes };
+    load_sheets(d, sh);
+    var styles: Style[>..] = [];
+    compute_styles(d, sh, styles);
+    var out: u8[>..] = [];
+    for n, i in nodes {
+        guard n.kind == NODE_ELEMENT && node_name(d, i as i32) == name else { continue; }
+        format(out, styles[i].weight, " ");
+    }
+    return out;
+}
+
+// How wide `text` is in style s's font at 17 points, as the platform measures it.
+fn width_in(s: Style, text: const u8[:]) -> f32 {
+    var carets: f32[>..] = [];
+    for k in text.len + 1 { carets.push(0.0); }
+    tp_text_carets(font_of(s), 17.0, text, carets[..]);
+    return carets[text.len];
+}
+
 // ------------------------------------------------------------------ layout
 
+let PROBE_SPACING: i32 = 16; // how much wider #s's text is than #a's
+let PROBE_CARETS: i32 = 18; // how much further each caret of #s's text is than #a's
 let PROBE_PAGE: i32 = 17;   // the page's height
 let PROBE_XF: i32 = 15;     // each item of an element with an id: its matrix, or "none"; with a clip, how it is mapped
 let PROBE_ORDER: i32 = 9;   // the elements with an id, in the order their items paint
@@ -1041,6 +1205,30 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
             }
             out.push('\n');
         }
+    } else if probe == PROBE_CARETS {
+        var a: i32 = -1;
+        var b: i32 = -1;
+        for n, i in nodes {
+            guard n.kind == NODE_TEXT && run_of[i] >= 0 else { continue; }
+            let id, has = attr_value(d, n.parent, "id");
+            if has && id == "a" { a = run_of[i]; }
+            if has && id == "s" { b = run_of[i]; }
+        }
+        if a >= 0 && b >= 0 {
+            let ra = runs[a];
+            let rb = runs[b];
+            for k in rb.len + 1 { format_flt(out, (carets[rb.caret + k] - carets[rb.caret]) - (carets[ra.caret + k] - carets[ra.caret]), 0); out.push(' '); }
+        }
+    } else if probe == PROBE_SPACING {
+        var a: f32 = 0.0;
+        var b: f32 = 0.0;
+        for it in items {
+            guard it.kind == ITEM_TEXT else { continue; }
+            let id, has = attr_value(d, nodes[it.node].parent, "id");
+            if has && id == "a" { a = it.w; }
+            if has && id == "s" { b = it.w; }
+        }
+        format_flt(out, b - a, 1);
     } else if probe == PROBE_PAGE {
         format_flt(out, page_h, 1);
     } else if probe == PROBE_XF {
@@ -1221,6 +1409,10 @@ fn test_page() {
 }
 
 fn main() {
+    // The bundled fonts, as the app registers them; run from the repository.
+    var fonts: u8[>..] = [];
+    format(fonts, tp_register_fonts("app/fonts"));
+    check("the bundled fonts are there (run from the repository)", fonts[..], "6");
     test_html();
     test_css();
     test_css_interface();
@@ -1228,6 +1420,7 @@ fn main() {
     test_positioning();
     test_flex();
     test_transforms();
+    test_fonts();
     test_layout();
     test_snapshot();
     test_page();

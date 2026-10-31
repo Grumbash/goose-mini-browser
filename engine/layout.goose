@@ -52,6 +52,7 @@ struct DItem {
     m_a: f32, m_b: f32, m_c: f32, m_d: f32, m_e: f32, m_f: f32,
     c_a: f32, c_b: f32, c_c: f32, c_d: f32, c_e: f32, c_f: f32,
     oclip_x: f32, oclip_y: f32, oclip_w: f32, oclip_h: f32,
+    spacing: f32,            // text: letter-spacing, after each character
 }
 
 struct Rect { x: f32, y: f32, w: f32, h: f32 }
@@ -66,6 +67,8 @@ struct Metrics {
 extern "tusk_platform" {
     fn tp_font_metrics(font: i32, size: f32, out: Metrics&) -> i32;
     fn tp_text_carets(font: i32, size: f32, text: const u8[:], carets: f32[:]) -> i32;
+    fn tp_register_fonts(dir: const u8[:]) -> i32;
+    fn tp_text_units(text: const u8[:], units: u8[:]) -> i32;
 }
 
 // A font at one size, with what layout needs from it.
@@ -115,11 +118,17 @@ struct Line {
     atom: bool,                  // an inline-block came last, so a break may follow
 }
 
-// The platform's font id: the family, then bold and italic bits.
+// The platform's font id: the family in the low four bits; the weight in
+// hundreds in the next four, rounded the way CSS looks for a face (Fonts 4
+// §5.2): down under 400, to 500 from 400 to 500, up over it; then whether it
+// is italic, and whether optional ligatures are off, as they are for
+// letter-spaced text (Text 3 §9.2).
 fn font_of(s: Style) -> i32 {
-    var f = s.family;
-    if s.bold != 0 { f = f | 16; }
-    if s.italic != 0 { f = f | 32; }
+    let w = s.weight;
+    let hundreds = if w < 400 { max(w / 100, 1) } else if w == 400 { 4 } else if w <= 500 { 5 } else { min((w + 99) / 100, 10) };
+    var f = s.family | (hundreds << 4);
+    if s.italic != 0 { f = f | 256; }
+    if s.spacing != 0.0 { f = f | 512; }
     return f;
 }
 
@@ -196,7 +205,115 @@ fn add_text_run(L: Layout, n: i32) {
             last_space = false;
         }
     }
+    if s.text_case != K_NONE { change_case(L.text[start..], s.text_case); }
     add_run(L, n, s, start);
+}
+
+// text-transform, in place: upper or lower case, or a capital to start each
+// word, where a letter's other case is as long in UTF-8: Latin with its
+// extensions, Greek, Cyrillic and Armenian (ß, ŉ, ı and the like keep
+// theirs). A word starts after a space or punctuation, not after an
+// apostrophe.
+fn change_case(t: u8[:], to: i32) {
+    var word_start = true;
+    var i: i64 = 0;
+    while i < t.len {
+        let cp, n = decode_utf8(t, i);
+        let m = if to == K_UPPERCASE || (to == K_CAPITALIZE && word_start) { upper_of(cp) }
+                else if to == K_LOWERCASE { lower_of(cp) } else { cp };
+        if m != cp && utf8_length(m) == n { encode_utf8(t, i, m); }
+        if cp != '\'' && cp != 0x2019 { word_start = !word_char(cp); }
+        i += n;
+    }
+}
+
+// The code point at t[i] and how many bytes it takes; a byte that doesn't
+// start one well is itself.
+fn decode_utf8(t: const u8[:], i: i64) -> i32, i64 {
+    let c = t[i] as i32;
+    let n: i64 = if c >= 0xF0 { 4 } else if c >= 0xE0 { 3 } else if c >= 0xC0 { 2 } else { 1 };
+    guard n > 1 && i + n <= t.len else { return c, 1; }
+    var cp = c & (if n == 2 { 0x1F } else if n == 3 { 0x0F } else { 0x07 });
+    for k in 1..n {
+        let b = t[i + k] as i32;
+        guard (b & 0xC0) == 0x80 else { return c, 1; }
+        cp = (cp << 6) | (b & 0x3F);
+    }
+    return cp, n;
+}
+
+fn utf8_length(cp: i32) -> i64 { return if cp < 0x80 { 1 } else if cp < 0x800 { 2 } else if cp < 0x10000 { 3 } else { 4 }; }
+
+// Writes code point cp at t[i], in as many bytes as it takes.
+fn encode_utf8(t: u8[:], i: i64, cp: i32) {
+    let n = utf8_length(cp);
+    if n == 1 { t[i] = cp as u8; return; }
+    t[i] = ((if n == 2 { 0xC0 } else if n == 3 { 0xE0 } else { 0xF0 }) | (cp >> (6 * (n - 1)))) as u8;
+    for k in 1..n { t[i + k] = (0x80 | ((cp >> (6 * (n - 1 - k))) & 0x3F)) as u8; }
+}
+
+// Whether cp is part of a word: a letter or a digit, not a space, a symbol or
+// punctuation, as far as capitalize needs to know.
+fn word_char(cp: i32) -> bool {
+    if cp < 0x80 { return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') || (cp >= '0' && cp <= '9'); }
+    if (cp >= 0xA0 && cp <= 0xBF && cp != 0xAA && cp != 0xB5 && cp != 0xBA) || cp == 0xD7 || cp == 0xF7 { return false; }
+    return !((cp >= 0x2000 && cp <= 0x206F) || (cp >= 0x3000 && cp <= 0x303F));
+}
+
+// Whether cp is in [lo, hi], a block of pairs of an upper then a lower case
+// letter, as the lower one of its pair when `lower`, else as the upper one.
+fn paired(cp: i32, lo: i32, hi: i32, lower: bool) -> bool { return cp >= lo && cp <= hi && (((cp - lo) & 1) != 0) == lower; }
+
+// cp in upper case, where that is one code point.
+fn upper_of(cp: i32) -> i32 {
+    if cp >= 'a' && cp <= 'z' { return cp - 32; }
+    if cp < 0x80 { return cp; }
+    if cp >= 0xE0 && cp <= 0xFE && cp != 0xF7 { return cp - 32; }
+    if cp == 0xFF { return 0x178; }
+    if cp == 0xB5 { return 0x39C; }
+    // Latin Extended-A and B.
+    if paired(cp, 0x100, 0x12F, true) || paired(cp, 0x132, 0x137, true) || paired(cp, 0x139, 0x148, true)
+        || paired(cp, 0x14A, 0x177, true) || paired(cp, 0x179, 0x17E, true) || paired(cp, 0x1CD, 0x1DC, true)
+        || paired(cp, 0x1DE, 0x1EF, true) || paired(cp, 0x1F8, 0x21F, true) || paired(cp, 0x222, 0x233, true) { return cp - 1; }
+    // Greek, with its tonos.
+    if (cp >= 0x3B1 && cp <= 0x3C1) || (cp >= 0x3C3 && cp <= 0x3CB) { return cp - 32; }
+    if cp == 0x3C2 { return 0x3A3; }
+    if cp == 0x3AC { return 0x386; }
+    if cp >= 0x3AD && cp <= 0x3AF { return cp - 37; }
+    if cp == 0x3CC { return 0x38C; }
+    if cp == 0x3CD || cp == 0x3CE { return cp - 63; }
+    // Cyrillic.
+    if cp >= 0x430 && cp <= 0x44F { return cp - 32; }
+    if cp >= 0x450 && cp <= 0x45F { return cp - 80; }
+    if paired(cp, 0x460, 0x481, true) || paired(cp, 0x48A, 0x4BF, true) || paired(cp, 0x4C1, 0x4CE, true)
+        || paired(cp, 0x4D0, 0x52F, true) { return cp - 1; }
+    // Armenian, and Latin Extended Additional.
+    if cp >= 0x561 && cp <= 0x586 { return cp - 48; }
+    if paired(cp, 0x1E00, 0x1E95, true) || paired(cp, 0x1EA0, 0x1EFF, true) { return cp - 1; }
+    return cp;
+}
+
+// cp in lower case, where that is one code point: upper_of's other way.
+fn lower_of(cp: i32) -> i32 {
+    if cp >= 'A' && cp <= 'Z' { return cp + 32; }
+    if cp < 0x80 { return cp; }
+    if cp >= 0xC0 && cp <= 0xDE && cp != 0xD7 { return cp + 32; }
+    if cp == 0x178 { return 0xFF; }
+    if paired(cp, 0x100, 0x12F, false) || paired(cp, 0x132, 0x137, false) || paired(cp, 0x139, 0x148, false)
+        || paired(cp, 0x14A, 0x177, false) || paired(cp, 0x179, 0x17E, false) || paired(cp, 0x1CD, 0x1DC, false)
+        || paired(cp, 0x1DE, 0x1EF, false) || paired(cp, 0x1F8, 0x21F, false) || paired(cp, 0x222, 0x233, false) { return cp + 1; }
+    if (cp >= 0x391 && cp <= 0x3A1) || (cp >= 0x3A3 && cp <= 0x3AB) { return cp + 32; }
+    if cp == 0x386 { return 0x3AC; }
+    if cp >= 0x388 && cp <= 0x38A { return cp + 37; }
+    if cp == 0x38C { return 0x3CC; }
+    if cp == 0x38E || cp == 0x38F { return cp + 63; }
+    if cp >= 0x410 && cp <= 0x42F { return cp + 32; }
+    if cp >= 0x400 && cp <= 0x40F { return cp + 80; }
+    if paired(cp, 0x460, 0x481, false) || paired(cp, 0x48A, 0x4BF, false) || paired(cp, 0x4C1, 0x4CE, false)
+        || paired(cp, 0x4D0, 0x52F, false) { return cp + 1; }
+    if cp >= 0x531 && cp <= 0x556 { return cp + 48; }
+    if paired(cp, 0x1E00, 0x1E95, false) || paired(cp, 0x1EA0, 0x1EFF, false) { return cp + 1; }
+    return cp;
 }
 
 fn add_marker_run(L: Layout, li: i32, ordinal: i32) {
@@ -236,6 +353,22 @@ fn add_run(L: Layout, n: i32, s: Style, start: i64) {
     } else if tp_text_carets(font, s.font_size, L.text[start..start + len], L.carets[caret..caret + len + 1]) != 0 {
         // No platform text: even steps, so layout still runs.
         for k in len + 1 { L.carets[caret + k] = k * s.font_size * 0.5; }
+    }
+    if s.spacing != 0.0 {
+        // letter-spacing after each typographic character unit, the last one's
+        // too (CSS Text 3 §9.2): a letter with its marks, an emoji with its
+        // modifiers; a zero-width character gets none.
+        var units: u8[>..] = [];
+        for k in len { units.push(0); }
+        if tp_text_units(L.text[start..start + len], units[..]) != 0 {
+            for k in len { units[k] = if (L.text[start + k] & 0xC0) != 0x80 { 1 } else { 0 }; }
+        }
+        var started: f32 = 0.0;
+        for k in len + 1 {
+            let boundary = k == len || units[k] != 0;
+            L.carets[caret + k] += (if boundary { started } else { max(started - 1.0, 0.0) }) * s.spacing;
+            if k < len && units[k] != 0 { started += 1.0; }
+        }
     }
     L.run_of[n] = L.runs.len as i32;
     L.runs.push(Run { node: n, start: start as i32, len: len as i32, caret: caret as i32, font: fi });
@@ -539,7 +672,7 @@ fn rect_item(n: i32, x: f32, y: f32, w: f32, h: f32, color: u32) -> DItem {
                    clip_x: 0.0, clip_y: 0.0, clip_w: 0.0, clip_h: 0.0, clip_tl: 0.0, clip_tr: 0.0, clip_br: 0.0, clip_bl: 0.0,
                    m_a: 0.0, m_b: 0.0, m_c: 0.0, m_d: 0.0, m_e: 0.0, m_f: 0.0,
                    c_a: 0.0, c_b: 0.0, c_c: 0.0, c_d: 0.0, c_e: 0.0, c_f: 0.0,
-                   oclip_x: 0.0, oclip_y: 0.0, oclip_w: 0.0, oclip_h: 0.0 };
+                   oclip_x: 0.0, oclip_y: 0.0, oclip_w: 0.0, oclip_h: 0.0, spacing: 0.0 };
 }
 
 fn text_item(n: i32, x: f32, y: f32, w: f32, color: u32, font: i32, size: f32, text: i32, text_len: i32) -> DItem {
@@ -549,6 +682,13 @@ fn text_item(n: i32, x: f32, y: f32, w: f32, color: u32, font: i32, size: f32, t
     it.size = size;
     it.text = text;
     it.text_len = text_len;
+    return it;
+}
+
+// A text item in style s: its font, size, colour and letter-spacing.
+fn styled_text(n: i32, x: f32, y: f32, w: f32, s: Style, text: i32, text_len: i32) -> DItem {
+    var it = text_item(n, x, y, w, s.color, font_of(s), s.font_size, text, text_len);
+    it.spacing = s.spacing;
     return it;
 }
 
@@ -1063,8 +1203,7 @@ fn place(line: Line&, w: f32, space: bool, trailing: f32, above: f32, below: f32
 // with its decoration. Until the line closes, y is relative to its baseline.
 fn emit_text(L: Layout, line: Line&, run: Run, s: Style, from: i32, to: i32, x: f32, raise: f32) {
     let c = run.caret;
-    L.items.push(text_item(run.node, line.left + x, -raise, L.carets[c + to] - L.carets[c + from], s.color, font_of(s),
-                           s.font_size, run.start + from, to - from));
+    L.items.push(styled_text(run.node, line.left + x, -raise, L.carets[c + to] - L.carets[c + from], s, run.start + from, to - from));
     guard s.deco == K_UNDERLINE || s.deco == K_LINE_THROUGH;
     var ink = to;                 // decoration stops at the last visible character
     while ink > from && L.text[run.start + ink - 1] == ' ' { ink -= 1; }
@@ -1153,7 +1292,7 @@ fn ellipsize(L: Layout, line: Line&) -> f32 {
         end_x = max(end_x, it.x + cut_w);
     }
     let s = L.styles[er.node];
-    L.items.push(text_item(er.node, end_x, 0.0, ew, s.color, font_of(s), s.font_size, er.start, er.len));
+    L.items.push(styled_text(er.node, end_x, 0.0, ew, s, er.start, er.len));
     return end_x + ew - line.left;
 }
 
@@ -1200,8 +1339,7 @@ fn paint_marker(L: Layout, li: i32, content_x: f32, baseline: f32) {
     let run = L.runs[r];
     let s = L.styles[li];
     let w = L.carets[run.caret + run.len] - L.carets[run.caret];
-    L.items.push(text_item(li, content_x - w - s.font_size * 0.45, baseline, w, s.color, font_of(s), s.font_size,
-                           run.start, run.len));
+    L.items.push(styled_text(li, content_x - w - s.font_size * 0.45, baseline, w, s, run.start, run.len));
 }
 
 fn union(a: Rect, b: Rect) -> Rect {

@@ -67,7 +67,20 @@ pub struct CFDictionaryValueCallBacks {
     equal: *const c_void,
 }
 
+#[repr(C)]
+pub struct CFArrayCallBacks {
+    version: CFIndex,
+    retain: *const c_void,
+    release: *const c_void,
+    copy_description: *const c_void,
+    equal: *const c_void,
+}
+
 pub const kCFStringEncodingUTF8: u32 = 0x0800_0100;
+pub const kCFNumberSInt32Type: CFIndex = 3;
+pub const kCFStringComposedCharacterCluster: CFIndex = 2;
+pub const kCFNumberFloat64Type: CFIndex = 6;
+pub const kCTFontManagerScopeProcess: u32 = 1;
 pub const kCTFontUIFontSystem: u32 = 2;
 pub const kCTFontTraitItalic: u32 = 1 << 0;
 pub const kCTFontTraitBold: u32 = 1 << 1;
@@ -81,6 +94,19 @@ pub const kCGImageByteOrder32Little: u32 = 2 << 12;
 unsafe extern "C" {
     pub static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
     pub static kCFTypeDictionaryValueCallBacks: CFDictionaryValueCallBacks;
+    pub static kCFTypeArrayCallBacks: CFArrayCallBacks;
+    pub fn CFArrayCreate(
+        alloc: CFTypeRef,
+        values: *const CFTypeRef,
+        n: CFIndex,
+        callbacks: *const CFArrayCallBacks,
+    ) -> CFTypeRef;
+    pub fn CFStringGetLength(s: CFTypeRef) -> CFIndex;
+    pub fn CFStringGetRangeOfCharacterClusterAtIndex(
+        s: CFTypeRef,
+        index: CFIndex,
+        kind: CFIndex,
+    ) -> CFRange;
     pub fn CFRelease(cf: CFTypeRef);
     pub fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
     pub fn CFEqual(a: CFTypeRef, b: CFTypeRef) -> u8;
@@ -112,6 +138,8 @@ unsafe extern "C" {
     ) -> CFTypeRef;
     pub fn CFArrayGetCount(array: CFTypeRef) -> CFIndex;
     pub fn CFArrayGetValueAtIndex(array: CFTypeRef, i: CFIndex) -> CFTypeRef;
+    pub fn CFNumberCreate(alloc: CFTypeRef, kind: CFIndex, value: *const c_void) -> CFTypeRef;
+    pub fn CFStringGetCString(s: CFTypeRef, buf: *mut u8, size: CFIndex, encoding: u32) -> bool;
     pub fn CFURLCreateFromFileSystemRepresentation(
         alloc: CFTypeRef,
         path: *const u8,
@@ -123,6 +151,27 @@ unsafe extern "C" {
 #[link(name = "CoreText", kind = "framework")]
 unsafe extern "C" {
     pub static kCTFontAttributeName: CFTypeRef;
+    pub static kCTFontFamilyNameAttribute: CFTypeRef;
+    pub static kCTFontTraitsAttribute: CFTypeRef;
+    pub static kCTFontWeightTrait: CFTypeRef;
+    pub static kCTFontSymbolicTrait: CFTypeRef;
+    pub static kCTFontVariationAttribute: CFTypeRef;
+    pub static kCTFontFeatureSettingsAttribute: CFTypeRef;
+    pub static kCTFontOpenTypeFeatureTag: CFTypeRef;
+    pub static kCTFontOpenTypeFeatureValue: CFTypeRef;
+    pub fn CTFontDescriptorCreateWithAttributes(attributes: CFTypeRef) -> CFTypeRef;
+    pub fn CTFontCreateWithFontDescriptor(
+        descriptor: CFTypeRef,
+        size: f64,
+        matrix: *const c_void,
+    ) -> CFTypeRef;
+    pub fn CTFontCopyFamilyName(font: CFTypeRef) -> CFTypeRef;
+    pub fn CTFontCopyPostScriptName(font: CFTypeRef) -> CFTypeRef;
+    pub fn CTFontManagerRegisterFontsForURL(
+        url: CFTypeRef,
+        scope: u32,
+        error: *mut CFTypeRef,
+    ) -> bool;
     pub fn CTFontCreateWithName(name: CFTypeRef, size: f64, matrix: *const c_void) -> CFTypeRef;
     pub fn CTFontCreateUIFontForLanguage(kind: u32, size: f64, language: CFTypeRef) -> CFTypeRef;
     pub fn CTFontCreateCopyWithSymbolicTraits(
