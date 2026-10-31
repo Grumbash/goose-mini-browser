@@ -1893,9 +1893,7 @@ mod tests {
                 reply(
                     "200 OK",
                     "Content-Type: text/html\r\nContent-Encoding: gzip\r\n",
-                    include_bytes!(
-                        "/private/tmp/claude-501/-Users-v-Work-Kingpin/4a90dd99-fce4-4188-ab82-22545495676e/scratchpad/gz/body.gz"
-                    ),
+                    include_bytes!("testdata/body.gz"),
                 ),
                 0,
             ),

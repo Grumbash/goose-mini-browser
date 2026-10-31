@@ -183,7 +183,8 @@ mod tests {
     fn the_macs_memory_is_some_of_it_used() {
         let (mut total, mut used) = (0i64, 0i64);
         assert_eq!(tp_mac_memory(&mut total, &mut used), 0);
-        assert!(total >= 8 << 30, "{total}");
+        // CI runners have 7 GiB, so only rule out a nonsense reading.
+                assert!(total >= 4 << 30, "{total}");
         // At least this process, and never more than there is.
         assert!(
             used >= tp_memory_footprint() && used <= total,
