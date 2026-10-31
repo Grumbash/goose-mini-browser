@@ -391,11 +391,11 @@ fn check_window(p: &mut Platform) {
     }
 }
 
-/// Draws the layers (see `compositor`) into the window and presents them, the
-/// page scrolled by `scroll` points over a `background` of 0xAARRGGBB. Waits
-/// for a free drawable, which paces a run of frames to the display.
+/// Draws the layers (see `compositor`) where they are placed into the window
+/// and presents them, over a `background` of 0xAARRGGBB. Waits for a free
+/// drawable, which paces a run of frames to the display.
 #[unsafe(no_mangle)]
-pub extern "C" fn tp_render(scroll: f32, background: u32) -> i32 {
+pub extern "C" fn tp_render(background: u32) -> i32 {
     guarded(|| {
         with_platform(|p| {
             let drawable = unsafe { p.layer.nextDrawable() }.ok_or(ERR_METAL)?;
@@ -404,8 +404,8 @@ pub extern "C" fn tp_render(scroll: f32, background: u32) -> i32 {
                 .window
                 .screen()
                 .map_or(p.refresh_hz, |s| s.maximumFramesPerSecond() as f64);
-            let (scale, refresh) = (p.scale, p.refresh_hz);
-            with_compositor(|c| c.present(&drawable, scroll as f64 * scale, background, refresh))?;
+            let refresh = p.refresh_hz;
+            with_compositor(|c| c.present(&drawable, background, refresh))?;
             p.frames += 1;
             Ok(0)
         })
@@ -494,7 +494,7 @@ mod tests {
         );
         let mut e = GpEvent::default();
         assert_eq!(tp_next_event(0, &mut e), ERR_NOT_MAIN_THREAD);
-        assert_eq!(tp_render(0.0, 0xFFFF_FFFF), ERR_NOT_MAIN_THREAD);
+        assert_eq!(tp_render(0xFFFF_FFFF), ERR_NOT_MAIN_THREAD);
         assert_eq!(tp_frames(), ERR_NOT_MAIN_THREAD as i64);
     }
 

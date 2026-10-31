@@ -35,9 +35,12 @@ mod tests {
     fn the_footprint_is_this_process_size() {
         let before = tp_memory_footprint();
         assert!(before > 1 << 20 && before < 1 << 34, "{before}");
-        let block = std::hint::black_box(vec![1u8; 64 << 20]); // 64 MiB, touched
+        // While this process holds a touched block of 256 MiB, its footprint
+        // is at least that. (Growth isn't a fair check: tests on other
+        // threads free as much meanwhile.)
+        let block = std::hint::black_box(vec![1u8; 256 << 20]);
         let after = tp_memory_footprint();
-        assert!(after - before > 60 << 20, "{before} -> {after}");
+        assert!(after >= 256 << 20, "{before} -> {after}");
         drop(block);
     }
 }

@@ -27,6 +27,20 @@ import engine.snapshot;
 
 struct Event { kind: i32, code: i32, x: f64, y: f64, w: f64, h: f64 }
 
+// Where a layer goes (platform/src/compositor.rs, Place), in points: its
+// content's point (scroll_x, scroll_y) lands on the window's (x, y), and a, b,
+// c, d turn and scale it about there (all 0: none). With clip_w 0 or more it
+// shows only inside its clip, measured from where it lands, its corners
+// rounded by radius (at most half its shorter side); a clip with no area shows
+// nothing, and clip_w below 0 is none. Opacity fades each thing in it, so
+// where two overlap the one below shows through. It is drawn over the layers
+// of a lower z, and only when shown isn't 0. Points are at most 1e7 from 0
+// and a, b, c, d at most 1e4. Placing a layer rebuilds nothing.
+struct Place {
+    x: f32, y: f32, scroll_x: f32, scroll_y: f32, a: f32, b: f32, c: f32, d: f32,
+    clip_x: f32, clip_y: f32, clip_w: f32, clip_h: f32, radius: f32, opacity: f32, z: i32, shown: i32,
+}
+
 struct FrameStats {
     frames: i32, dropped: i32, refresh_hz: f32,
     max_interval_ms: f32, mean_interval_ms: f32, max_cpu_ms: f32, max_gpu_ms: f32,
@@ -35,10 +49,11 @@ struct FrameStats {
 extern "tusk_platform" {
     fn tp_open(width: f64, height: f64, title: const u8&, title_len: i64) -> i32;
     fn tp_next_event(timeout_ms: i64, out: Event&) -> i32;
-    fn tp_render(scroll: f32, background: u32) -> i32;
+    fn tp_render(background: u32) -> i32;
     fn tp_start_metal() -> i32;
     fn tp_set_layer(layer: i32, items: const DItem[:], text: const u8[:], paths: const f32[:], scale: f32) -> i32;
-    fn tp_screenshot(path: const u8[:], width: f32, height: f32, scale: f32, scroll: f32, background: u32) -> i32;
+    fn tp_place_layer(layer: i32, place: const Place&) -> i32;
+    fn tp_screenshot(path: const u8[:], width: f32, height: f32, scale: f32, background: u32) -> i32;
     fn tp_frame_stats(out: FrameStats&, reset: bool) -> i32;
     fn tp_memory_footprint() -> i64;
     fn tp_frames() -> i64;
@@ -105,6 +120,19 @@ fn set_layer(layer: i32, items: const DItem[:], text: const u8[:], paths: const 
     let rc = tp_set_layer(layer, items, text, paths, scale);
     guard rc != 0 else { return; }
     write_stderr(str("tusk: the compositor refused layer ", layer, " (error ", rc, ")\n"));
+    exit(1);
+}
+
+// The page's layer: scrolled by `scroll`, and shown only in its view, `width`
+// × `view_h` at the window's corner, which spares the GPU the rest. A window
+// shorter than the bar has no view, and the page doesn't show.
+fn place_page(scroll: f32, width: f32, view_h: f32) {
+    let p = Place { x: 0.0, y: 0.0, scroll_x: 0.0, scroll_y: scroll, a: 0.0, b: 0.0, c: 0.0, d: 0.0,
+                    clip_x: 0.0, clip_y: 0.0, clip_w: max(width, 0.0), clip_h: max(view_h, 0.0),
+                    radius: 0.0, opacity: 1.0, z: 0, shown: 1 };
+    let rc = tp_place_layer(LAYER_PAGE, p);
+    guard rc != 0 else { return; }
+    write_stderr(str("tusk: the compositor refused the page's place (error ", rc, ")\n"));
     exit(1);
 }
 
@@ -334,7 +362,8 @@ fn main() {
         let page_h = show_page(P, shot_w, shot_h, scale, cost);
         show_bar(P, path[name_start..], cost, shot_w, shot_h + BAR_H, scale);
         let y = clamp_scroll(at, page_h, shot_h);
-        let rc = tp_screenshot(shot, shot_w, shot_h + BAR_H, scale, y, bg);
+        place_page(y, shot_w, shot_h);
+        let rc = tp_screenshot(shot, shot_w, shot_h + BAR_H, scale, bg);
         guard rc == 0 else {
             if rc == ERR_ARGUMENT {
                 write_stderr("tusk: no screenshot: the file can't be written\n");
@@ -387,7 +416,7 @@ fn main() {
             guard idle_exit_ms < 0 else { break; }
             settle = false;
             show_bar(P, path[name_start..], cost, width, height, scale);
-            tp_render(scroll, bg);
+            tp_render(bg);
             continue;
         }
         // This event and every one already waiting, then at most one frame.
@@ -432,11 +461,12 @@ fn main() {
         scroll = clamp_scroll(scroll, page_h, height - BAR_H);
         // A frame only when what is on screen changed.
         if resized || scroll != before {
-            tp_render(scroll, bg);
+            place_page(scroll, width, height - BAR_H);
+            tp_render(bg);
             settle = true;
         }
         if mode == MODE_SCROLL_TEST {
-            scroll_test(page_h, height, bg);
+            scroll_test(page_h, width, height, bg);
             quit = true;
         }
     }
@@ -491,7 +521,7 @@ fn print_snapshot(P: Page, cost: Cost, html_bytes: i64) {
 
 // Scrolls down the page and back for 10 s at a brisk flick's speed, a frame
 // per display refresh, and prints what the frames cost (docs/adr/0003).
-fn scroll_test(page_h: f32, height: f32, bg: u32) {
+fn scroll_test(page_h: f32, width: f32, height: f32, bg: u32) {
     var stats = FrameStats { frames: 0, dropped: 0, refresh_hz: 0.0, max_interval_ms: 0.0, mean_interval_ms: 0.0,
                              max_cpu_ms: 0.0, max_gpu_ms: 0.0 };
     tp_frame_stats(stats, true);
@@ -510,7 +540,8 @@ fn scroll_test(page_h: f32, height: f32, bg: u32) {
         let d = speed * t;
         let laps = floor(d / (2.0 * travel));
         let p = d - laps * 2.0 * travel;
-        tp_render((if p < travel { p } else { 2.0 * travel - p }) as f32, bg);
+        place_page((if p < travel { p } else { 2.0 * travel - p }) as f32, width, height - BAR_H);
+        tp_render(bg);
     }
     tp_frame_stats(stats, false);
     print("scroll test: ", stats.frames, " frames in 10 s at ", stats.refresh_hz, " Hz; dropped ", stats.dropped,
