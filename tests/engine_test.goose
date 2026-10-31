@@ -30,7 +30,282 @@ fn tree_of(src: const u8[:]) -> u8[>..] {
     return out;
 }
 
+fn base_of(src: const u8[:]) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    let href, has = base_href(d);
+    var out: u8[>..] = [];
+    if has { out.append(href); } else { out.append("none"); }
+    return out;
+}
+
+fn imports_of(src: const u8[:]) -> u8[>..] {
+    var hrefs: u8[>..] = [];
+    var ends: i64[>..] = [];
+    var medias: u8[>..] = [];
+    var media_ends: i64[>..] = [];
+    sheet_imports(src, hrefs, ends, medias, media_ends);
+    var out: u8[>..] = [];
+    var from: i64 = 0;
+    var mfrom: i64 = 0;
+    for e, k in ends {
+        format(out, "[", hrefs[from..e]);
+        if media_ends[k] > mfrom { format(out, " ", medias[mfrom..media_ends[k]]); }
+        out.append("]");
+        from = e;
+        mfrom = media_ends[k];
+    }
+    return out;
+}
+
+fn sources_of(src: const u8[:]) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var list: i32[>..] = [];
+    sheet_sources(d, list);
+    var out: u8[>..] = [];
+    for n in list {
+        let href, has = attr_value(d, n, "href");
+        format(out, "[", node_name(d, n), if has { " " } else { "" }, href, "]");
+    }
+    return out;
+}
+
+fn test_sheets() {
+    check("a page's sheets in document order: its <style>s and the <link>s to sheets for the screen",
+          sources_of(str("<link rel=stylesheet href=a.css><style>p{}</style><link rel='Alternate Stylesheet' href=b.css>",
+                         "<link rel=icon href=c.ico><link rel='preload stylesheet' href=d.css><link rel=stylesheet href=''>",
+                         "<link rel=stylesheet href=e.css media=print><link rel=stylesheet href=f.css disabled>",
+                         "<style media=print>q{}</style><link rel=stylesheet href=g.css media='screen and (min-width: 1px)'>")[..]),
+          "[link a.css][style][link d.css][link g.css]");
+    check("a sheet's @imports: before its first rule, after @charset, for the screen",
+          imports_of(str("@charset \"utf-8\";\n/* c */ @import url(a.css); @import \"b.css\" screen; @import url('c;.css');",
+                         "@import url(p.css) print; @IMPORT 'e.css'; p { color: red } @import url(late.css);")[..]),
+          "[a.css][b.css screen][c;.css][e.css]");
+    check("a sheet with no imports has none", imports_of("p { color: red }"), "");
+    check("an @import after a rule is no import", imports_of("@media screen { p {} } @import url(x.css);"), "");
+}
+
+fn mq(q: const u8[:], w: f32, h: f32, dark: bool) -> u8[>..] {
+    return str(if media_matches(q, MediaEnv { width: w, height: h, scale: 2.0, dark: dark }) { "on" } else { "off" });
+}
+
+// The colour of each <p> of `src`, its sheets styled for a viewport `w` wide,
+// then for one `w2` wide: whether that restyled anything, and the colours.
+fn colours_at(src: const u8[:], w: f32, w2: f32) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(src, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes, media: media };
+    // A sheet imported by a linked one, its media from the <link> and the
+    // @import; the linked one; and one with @media and @supports blocks, as
+    // the worker hands them over.
+    let ends: i64[3] = [19, 38, 240];
+    let media_ends: i64[3] = [25, 31, 31];
+    load_sheets_with(d, sh, str("p.i { color: #0f0 }", "p.l { color: #00f }",
+                                "@media (min-width: 900px) { p.w { color: #f00 } } @supports (display: flex) { p.s { color: #0ff } } @supports (display: nonsense) { p.n { color: #f0f } } @supports not (foo: bar) { p.x { color: #ff0 } }")[..],
+                     ends[..], "screen\x01(max-width: 700px)screen", media_ends[..]);
+    var out: u8[>..] = [];
+    var styles: Style[>..] = [];
+    for pass in 2 {
+        let width = if pass == 0 { w } else { w2 };
+        let changed = set_media(sh, MediaEnv { width: width, height: 800.0, scale: 2.0, dark: false });
+        compute_styles(d, sh, styles);
+        if pass == 1 { out.append(if changed { "restyled:" } else { "same:" }); }
+        for n, i in nodes {
+            guard n.kind == NODE_ELEMENT && node_name(d, i as i32) == "p" else { continue; }
+            format_int(out, styles[i].color & 0xFFFFFF, 16, 6, '0');
+            out.push(' ');
+        }
+        out.push('|');
+    }
+    return out;
+}
+
+// The sheet `css`, with media `m` from its <link> or @import (empty: none),
+// on `html` at a viewport `w` wide, styled once at w and, when w2 > 0, again
+// at w2 (as serve does when a breakpoint is crossed): each <p>'s colour,
+// then each generated ::before/::after as name=text, or name=none when its
+// style hides it.
+fn styled_at(css: const u8[:], m: const u8[:], html: const u8[:], w: f32, w2: f32) -> u8[>..] {
+    var nodes: Node[>..] = [];
+    var attrs: Attr[>..] = [];
+    var bytes: u8[>..] = [];
+    let d = Doc { nodes: nodes, attrs: attrs, bytes: bytes };
+    parse_html(html, d);
+    var rules: Rule[>..] = [];
+    var comps: Compound[>..] = [];
+    var classes: Span[>..] = [];
+    var decls: Decl[>..] = [];
+    var sbytes: u8[>..] = [];
+    var sattrs: AttrSel[>..] = [];
+    var vars: Var[>..] = [];
+    var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
+    let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
+                     vars: vars, var_bytes: var_bytes, media: media };
+    let ends: i64[1] = [css.len];
+    let media_ends: i64[1] = [m.len];
+    load_sheets_with(d, sh, css, ends[..], m, media_ends[..]);
+    var styles: Style[>..] = [];
+    set_media(sh, MediaEnv { width: w, height: 800.0, scale: 2.0, dark: false });
+    compute_styles(d, sh, styles);
+    if w2 > 0.0 {
+        set_media(sh, MediaEnv { width: w2, height: 800.0, scale: 2.0, dark: false });
+        compute_styles(d, sh, styles);
+    }
+    var out: u8[>..] = [];
+    for n, i in nodes {
+        guard n.kind == NODE_ELEMENT else { continue; }
+        let name = node_name(d, i as i32);
+        if name == "p" {
+            format_int(out, styles[i].color & 0xFFFFFF, 16, 6, '0');
+            out.push(' ');
+        } else if is_generated(d, i as i32) {
+            out.append(name);
+            if styles[i].display == K_NONE { out.append("=none "); }
+            else { format(out, "=", if n.first >= 0 { node_text(d, n.first) } else { "" }, " "); }
+        }
+    }
+    return out;
+}
+
+// Sheets as Chrome reads them: calc() in queries, comments and escapes in
+// at-rules, import conditions, layers, a BOM, which sheets count, and a
+// restyle's generated content.
+fn test_media_review() {
+    // Wikipedia's own sheet: 23 blocks such as @media screen and
+    // (max-width:calc(1120px - 1px)) and (min-width:calc(640px - 1px)).
+    check("calc() in a media query, as Wikipedia writes its breakpoints",
+          str(mq("screen and (max-width:calc(1120px - 1px))", 800.0, 600.0, false),
+              mq("screen and (min-width:calc(640px - 1px))", 1200.0, 600.0, false)), "onon");
+    // A comment is whitespace to the tokenizer; Tusk keeps it in the prelude.
+    check("a comment in an @media or @supports prelude",
+          styled_at("@media screen /* wide */ { p.a { color: #f00 } } @supports (color: red) /* ok */ { p.b { color: #0f0 } }",
+                    "", "<p class=a>a<p class=b>b", 1000.0, 0.0),
+          "ff0000 00ff00 ");
+    // A '{' in that comment opens a block skip_block never closes: the rest
+    // of the sheet is swallowed.
+    check("a brace in a comment in an at-rule prelude swallows nothing after it",
+          styled_at("@media screen /* { */ { p.a { color: #f00 } } p.b { color: #00f }", "", "<p class=a>a<p class=b>b",
+                    1000.0, 0.0),
+          "ff0000 0000ff ");
+    // skip_block takes an escaped quote in a selector (Tailwind's
+    // .before\:content-\[\'\'\]) for a string: the @media's end lands at the
+    // sheet's end and swallows every rule after it.
+    check("an escaped quote in a selector inside @media",
+          styled_at("@media (min-width: 640px) { .sm\\:before\\:content-\\[\\'\\'\\]::before { --tw-content: ''; content: var(--tw-content) } } @media (max-width: 600px) { p.b { color: #0f0 } } p.c { color: #00f }",
+                    "", "<p class=b>b<p class=c>c", 400.0, 0.0),
+          "00ff00 0000ff ");
+    // @import url(x) layer(base) / supports(...): Cascade 5 import conditions,
+    // before the media list. Tusk imports a layered sheet unlayered.
+    check("an @import into a layer, or with supports(), still applies, its media after them",
+          imports_of("@import url(a.css) layer(base); @import url(b.css) layer supports(display: block) screen; @import url(c.css) supports(display: nonsense);"),
+          "[a.css][b.css screen]");
+    // Unlayered author rules beat layered ones whatever their order (Cascade 5).
+    check("an unlayered rule beats an @layer rule after it",
+          styled_at("p { color: #00f } @layer base { p { color: #f00 } }", "", "<p>a", 1000.0, 0.0), "0000ff ");
+    // A UTF-8 BOM is stripped when a sheet is decoded; left in, it turns the
+    // first @media into a qualified rule and the block's second rule escapes it.
+    check("a sheet that starts with a BOM keeps its first @media",
+          styled_at("\xEF\xBB\xBF@media (max-width: 600px) { p.a { color: #f00 } p.b { color: #0f0 } }", "",
+                    "<p class=a>a<p class=b>b", 1000.0, 0.0),
+          "1c1c1c 1c1c1c ");
+    check("a sheet that starts with a BOM keeps its @imports", imports_of("\xEF\xBB\xBF@import url(a.css);"), "[a.css]");
+    // `not print` is for the screen; so is a list with any query for it.
+    check("<link media='not print'> and media='print, (min-width: 1px)' are for the screen",
+          sources_of("<link rel=stylesheet href=a.css media='not print'><link rel=stylesheet href=b.css media='print, (min-width: 1px)'>"),
+          "[link a.css][link b.css]");
+    // Tusk runs no scripts and says (scripting: none), so its parser's
+    // scripting flag is off and <noscript> is markup (HTML §13.2.6.4.4):
+    // the fallback of the common async pattern <link media=print
+    // onload="this.media='all'"><noscript><link ...></noscript> applies.
+    check("a <noscript>'s <link> is a sheet when scripts don't run",
+          sources_of("<head><link rel=stylesheet href=x.css media=print onload=\"this.media='all'\"><noscript><link rel=stylesheet href=a.css></noscript></head><p>x"),
+          "[link a.css]");
+    // Template contents are inert: their sheets apply to nothing (a
+    // declarative shadow root's apply only inside it).
+    check("a <template>'s <link> and <style> are not the page's sheets",
+          sources_of("<template><link rel=stylesheet href=t.css><style>p{}</style></template><link rel=stylesheet href=a.css>"),
+          "[link a.css]");
+    // serve restyles in place when a breakpoint is crossed; a ::after made
+    // under an @media that turned off must go, and one whose content changed
+    // must show the new content.
+    check("a ::after from an @media that turns off goes",
+          styled_at("@media (min-width: 900px) { p::after { content: 'wide' } }", "", "<p>x", 1000.0, 600.0),
+          "1c1c1c ::after=none ");
+    check("a ::after whose content an @media changes shows the new content",
+          styled_at("p::after { content: 'narrow' } @media (min-width: 900px) { p::after { content: 'wide' } }", "", "<p>x",
+                    600.0, 1000.0),
+          "1c1c1c ::after=wide ");
+}
+
+// The colour of each <p class=a|b|c> under sheet `css`, at 1000 wide.
+fn colours_at2(css: const u8[:]) -> u8[>..] { return styled_at(css, "", "<p class=a>a<p class=b>b<p class=c>c", 1000.0, 0.0); }
+
+fn test_media() {
+    check("min-width and max-width at 800", str(mq("(min-width: 768px)", 800.0, 600.0, false), mq("(max-width: 50em)", 800.0, 600.0, false)), "onon");
+    check("past them", str(mq("(min-width: 801px)", 800.0, 600.0, false), mq("(max-width: 49em)", 800.0, 600.0, false)), "offoff");
+    check("a type, and, and a list", str(mq("screen and (min-width: 600px)", 800.0, 600.0, false),
+                                         mq("print and (min-width: 600px)", 800.0, 600.0, false),
+                                         mq("print, (orientation: landscape)", 800.0, 600.0, false)), "onoffon");
+    check("not and only", str(mq("not print", 800.0, 600.0, false), mq("not screen and (min-width: 1px)", 800.0, 600.0, false),
+                              mq("only screen and (max-width: 900px)", 800.0, 600.0, false)), "onoffon");
+    check("ranges", str(mq("(width >= 800px)", 800.0, 600.0, false), mq("(400px < width <= 700px)", 800.0, 600.0, false),
+                        mq("(500px <= width < 900px)", 800.0, 600.0, false), mq("(height > 700px)", 800.0, 600.0, false)),
+          "onoffonoff");
+    check("dark mode, hover and a fine pointer",
+          str(mq("(prefers-color-scheme: dark)", 800.0, 600.0, true), mq("(prefers-color-scheme: dark)", 800.0, 600.0, false),
+              mq("(hover: hover) and (pointer: fine)", 800.0, 600.0, false)), "onoffon");
+    check("no scripts, and the backing scale",
+          str(mq("(scripting: none)", 800.0, 600.0, false), mq("(min-resolution: 2dppx)", 800.0, 600.0, false),
+              mq("(-webkit-min-device-pixel-ratio: 3)", 800.0, 600.0, false)), "ononoff");
+    check("what Tusk can't read is off", str(mq("(min-width: 10furlongs)", 800.0, 600.0, false),
+                                             mq("screen and", 800.0, 600.0, false), mq("(unknown-feature)", 800.0, 600.0, false),
+                                             mq("(min-width: 1px) and (max-width: 2000px) or (color)", 800.0, 600.0, false)),
+          "offoffoffoff");
+    check("a type Tusk isn't matches nothing, so `not` it matches",
+          str(mq("not tv", 800.0, 600.0, false), mq("not unknowntype", 800.0, 600.0, false), mq("unknowntype", 800.0, 600.0, false)),
+          "ononoff");
+    check("unknown with or: a true gets past it; with not, it stays unknown",
+          str(mq("(min-width: 1px) or (foo: bar)", 800.0, 600.0, false), mq("not (hover: foo)", 800.0, 600.0, false),
+              mq("(foo: bar) or (max-width: 1px)", 800.0, 600.0, false)), "onoffoff");
+    check("(display-mode) is the browser's; `and(` and `not(` are functions, which no query is",
+          str(mq("(display-mode)", 800.0, 600.0, false), mq("screen and(min-width: 1px)", 800.0, 600.0, false),
+              mq("not(print)", 800.0, 600.0, false)), "onoffoff");
+    check("@supports reads NOT in any case, and says no to displays Tusk lays out as blocks",
+          colours_at2("@supports NOT (display: nonsense) { p.a { color: #f00 } } @supports (display: grid) { p.b { color: #f00 } } @supports not (display: contents) { p.c { color: #0f0 } }"),
+          "ff0000 1c1c1c 00ff00 ");
+    let page = "<p class=i>i<p class=l>l<p class=w>w<p class=s>s<p class=n>n<p class=x>x";
+    check("@media turns on and off with the width, inside the media of the <link> and the @import; @supports by what Tusk reads",
+          colours_at(page, 600.0, 1000.0),
+          "00ff00 0000ff 1c1c1c 00ffff 1c1c1c ffff00 |restyled:1c1c1c 0000ff ff0000 00ffff 1c1c1c ffff00 |");
+    check("a width that flips nothing restyles nothing", colours_at(page, 1000.0, 1100.0),
+          "1c1c1c 0000ff ff0000 00ffff 1c1c1c ffff00 |same:1c1c1c 0000ff ff0000 00ffff 1c1c1c ffff00 |");
+}
+
 fn test_html() {
+    check("the first <base> with an href is the page's base",
+          base_of("<base target=_top><base href='/docs/'><base href='/other/'><p>x"), "/docs/");
+    check("a page with no <base href> has none", base_of("<base target=x><p>x"), "none");
     check("implied structure and an unclosed p",
           tree_of("<title>T</title><p>One<p>Two &amp; <b>three</b>"),
           "#document\n  html\n    head\n      title\n        \"T\"\n    body\n      p\n        \"One\"\n      p\n        \"Two & \"\n        b\n          \"three\"\n");
@@ -88,8 +363,9 @@ fn style_at(src: const u8[:], name: const u8[:], k: i64, font: bool) -> u8[>..] 
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -140,8 +416,9 @@ fn restyled(src: const u8[:], name: const u8[:]) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var first: Style[>..] = [];
     compute_styles(d, sh, first);
@@ -172,8 +449,9 @@ fn var_bytes_of(src: const u8[:]) -> i64 {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -196,8 +474,9 @@ fn styled_tree(src: const u8[:]) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -929,8 +1208,9 @@ fn hits_of(src: const u8[:], xs: const f32[:], ys: const f32[:]) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -992,8 +1272,36 @@ fn test_heights() {
     check("percentage heights", layout_probe(pcts, 400.0, PROBE_GEOMETRY),
           "a x 0.0 y 0.0 w 400.0 h 100.0\nb x 0.0 y 200.0 w 400.0 h 0.0\nc x 0.0 y 200.0 w 400.0 h 150.0\nd x 10.0 y 360.0 w 380.0 h 100.0\ne x 0.0 y 0.0 w 10.0 h 30.0\nf x 0.0 y 470.0 w 400.0 h 40.0\n");
     // So does an <svg>'s, its width following through its viewBox.
+    // A page sized to the window, as Wikipedia's is (html, body { height:
+    // 100% }), scrolls to the end of what it draws; what a clip cuts counts
+    // only as far as the clip.
+    check("a page scrolls to the end of its overflow", layout_probe("""<style>html, body { height: 100%; margin: 0; padding: 0; max-width: none }</style><div style="height: 900px; background: #000"></div><div style="height: 300px; overflow: hidden"><div style="height: 5000px; background: #000"></div></div>""", 400.0, PROBE_PAGE),
+          "1200.0");
+    // An <img> is replaced as an <svg> is: its width and height attributes
+    // are its dimensions, and CSS beats each (so width: 100px alone leaves
+    // the height attribute's 333, as browsers draw it); with height: auto
+    // their ratio gives the height; with no size it takes no room until it
+    // is decoded.
+    check("an img's size", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none } img { display: block }</style><img id=a src=x.png width=250 height=333><img id=b src=x.png width=250 height=333 style="width: 100px"><img id=c src=x.png><img id=d src=x.png width=400 height=200 style="max-width: 50%; height: auto">""", 400.0, PROBE_GEOMETRY),
+          "a x 0.0 y 0.0 w 250.0 h 333.0\nb x 0.0 y 333.0 w 100.0 h 333.0\nc x 0.0 y 666.0 w 0.0 h 0.0\nd x 0.0 y 666.0 w 200.0 h 100.0\n");
     check("an svg's percentage height", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none }</style><div style="height: 100px"><svg id=s viewBox="0 0 2 1" style="display: block; height: 50%"></svg></div>""", 400.0, PROBE_GEOMETRY),
           "s x 0.0 y 0.0 w 100.0 h 50.0\n");
+    // What a clip cuts away entirely (clip_items makes it ITEM_NONE and sets
+    // no clip) doesn't reach down the page: a "show more" box or a max-height
+    // code block mustn't grow the page by all it hides.
+    check("what a clip hides entirely doesn't lengthen the page", layout_probe("""<style>html, body { height: 100%; margin: 0; padding: 0; max-width: none }</style><div style="height: 300px; overflow: hidden"><div style="height: 300px"></div><div style="height: 5000px; background: #000"></div></div>""", 400.0, PROBE_PAGE),
+          "600.0");
+    // A fixed box stays on the screen: what overflows it can't be scrolled
+    // to, and positioned_bottom leaves fixed boxes out for that reason.
+    check("what overflows a fixed box doesn't lengthen the page", layout_probe("""<style>html, body { height: 100%; margin: 0; padding: 0; max-width: none }</style><div style="position: fixed; top: 0; left: 0; width: 100px; height: 100%"><div style="height: 3000px; background: #000"></div></div>""", 400.0, PROBE_PAGE),
+          "600.0");
+    // What a transform moves up reaches only as far as where it is drawn,
+    // not where it was before.
+    check("overflow a transform moves up reaches only as far as it is drawn", layout_probe("""<style>html, body { height: 100%; margin: 0; padding: 0; max-width: none }</style><div style="height: 100px; transform: translateY(-500px)"><div style="height: 1000px; background: #000"></div></div>""", 400.0, PROBE_PAGE),
+          "600.0");
+    // A shadow is ink overflow: it doesn't scroll (CSS Overflow 3).
+    check("a box-shadow doesn't lengthen the page", layout_probe("""<style>html, body { height: 100%; margin: 0; padding: 0; max-width: none }</style><div style="height: 900px; background: #000; box-shadow: 0 100px 0 #000"></div>""", 400.0, PROBE_PAGE),
+          "900.0");
 }
 
 fn test_svg() {
@@ -1288,8 +1596,9 @@ fn svg_paints(src: const u8[:]) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -1446,8 +1755,9 @@ fn weights_of(src: const u8[:], name: const u8[:]) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -1508,8 +1818,9 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
     var sattrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sattrs, decls: decls, bytes: sbytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -1920,7 +2231,7 @@ fn test_snapshot() {
                    "  - paragraph [ref=n8]: Some link text.\n    - link \"link\" [ref=n10] [href=/x]\n",
                    "  - list [ref=n13]\n    - listitem [ref=n14]: one\n    - listitem [ref=n16]: two\n",
                    "  - table [ref=n18]\n    - row [ref=n19]: a | b\n",
-                   "  - link \"cat\" [ref=n25] [href=/y]\n    - img \"cat\" [ref=n26]\n");
+                   "  - paragraph [ref=n24]\n    - link \"cat\" [ref=n25] [href=/y]\n      - img \"cat\" [ref=n26]\n");
     check("the page as a tree for agents", layout_probe(page[..], 400.0, PROBE_SNAPSHOT), want[..]);
     // Page text can't start lines of its own; links laid out as blocks, or
     // wrapping blocks, are still named links.
@@ -1959,6 +2270,9 @@ fn test_page() {
 }
 
 fn main() {
+    test_sheets();
+    test_media();
+    test_media_review();
     // The bundled fonts, as the app registers them; run from the repository.
     var fonts: u8[>..] = [];
     format(fonts, tp_register_fonts("app/fonts"));

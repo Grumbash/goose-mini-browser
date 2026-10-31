@@ -34,6 +34,7 @@ pub const MSG_SIZE: i32 = 1; // a: width, b: the view's height, c: backing scale
 pub const MSG_HIT: i32 = 2; // a, b: a point on the page
 pub const MSG_SNAPSHOT: i32 = 3;
 pub const MSG_QUIT: i32 = 4;
+pub const MSG_NET: i32 = 5; // a: a request that ended (net.rs)
 
 /// What a tab's display list came with, laid out as Goose's `struct
 /// FrameInfo`: the page's height, its canvas colour, its size in nodes and
@@ -124,14 +125,53 @@ pub extern "C" fn tp_tab_open(tab: i32) -> i32 {
     })
 }
 
-/// Closes tab `tab`'s mailbox, once its worker has ended; what was still in
-/// it goes too.
+/// Closes tab `tab`'s mailbox, once its worker has ended; its requests stop
+/// first, and what was still in it goes too. A worker still waiting on it
+/// wakes, finds it gone and ends.
 #[unsafe(no_mangle)]
 pub extern "C" fn tp_tab_drop(tab: i32) -> i32 {
     guarded(|| {
-        tabs().remove(&tab).ok_or(ERR_ARGUMENT)?;
+        if !is_open(tab) {
+            return Err(ERR_ARGUMENT);
+        }
+        crate::net::cancel_tab(tab);
+        let t = tabs().remove(&tab).ok_or(ERR_ARGUMENT)?;
+        t.wake.notify_all();
         Ok(0)
     })
+}
+
+/// Whether tab `tab`'s mailbox is open.
+pub(crate) fn is_open(tab: i32) -> bool {
+    tabs().contains_key(&tab)
+}
+
+/// Drops a MSG_NET for request `req` still waiting in tab `tab`'s mailbox:
+/// one cancelled after it ended.
+pub(crate) fn forget_net(tab: i32, req: i32) {
+    if let Some(t) = tabs().get_mut(&tab) {
+        t.inbox
+            .retain(|m| !(m.kind == MSG_NET && m.a as i32 == req));
+    }
+}
+
+/// From the network's queue: request `req` of tab `tab` has ended. False
+/// for a tab already closed, which hears nothing.
+pub(crate) fn post_net(tab: i32, req: i32) -> bool {
+    let mut tabs = tabs();
+    let Some(t) = tabs.get_mut(&tab) else {
+        return false;
+    };
+    post(
+        &mut t.inbox,
+        TabMsg {
+            kind: MSG_NET,
+            a: req as f32,
+            ..Default::default()
+        },
+    );
+    t.wake.notify_one();
+    true
 }
 
 /// Posts `msg` to tab `tab`'s worker, and wakes that worker only.

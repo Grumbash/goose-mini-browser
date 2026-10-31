@@ -126,6 +126,17 @@ fn attr_value(d: Doc, n: i32, name: const u8[:]) -> const u8[:], bool {
     return d.bytes[0..0], false;
 }
 
+// The href of the document's first <base> that has one, and whether there is
+// one (HTML §4.2.3): what the page's relative URLs resolve against.
+fn base_href(d: Doc) -> const u8[:], bool {
+    for n, k in d.nodes {
+        guard n.kind == NODE_ELEMENT && node_name(d, k as i32) == "base" else { continue; }
+        let href, has = attr_value(d, k as i32, "href");
+        if has { return href, true; }
+    }
+    return d.bytes[0..0], false;
+}
+
 // Whether `cls` is one of the space-separated words of the element's class.
 fn has_class(d: Doc, n: i32, cls: const u8[:]) -> bool {
     let v, ok = attr_value(d, n, "class");

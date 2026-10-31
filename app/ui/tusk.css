@@ -28,7 +28,12 @@ body { background:var(--bg); color:var(--ink); font:400 17px/1.5 var(--f-ui); -w
 .oilg i { position:relative; width:9px; height:12px; flex:none }
 .oilg svg { position:absolute; inset:0; width:100%; height:100% }
 .oilg path { fill:none; stroke:var(--steel-4); stroke-width:2.2 }
+.oilg b { position:absolute; left:0; right:0; bottom:0; overflow:hidden }
+.oilg b svg { top:auto; bottom:0; height:12px }
 .oilg .f path { fill:#1FB5A8; stroke:none }
+.oilg .m path { fill:var(--steel-5); stroke:none }
+.ro b.t, .oilh b.t { color:#1FB5A8 }
+.ro b.m, .oilh b.m { color:var(--steel-5) }
 .drop { position:absolute; z-index:2; left:-8px; top:-11px; width:26px; height:34px; display:flex; align-items:flex-end; justify-content:center; padding-bottom:6px }
 .drop svg { position:absolute; inset:0; width:100%; height:100% }
 .drop path { fill:#1FB5A8; stroke:var(--oil); stroke-width:1.5 }
@@ -63,12 +68,16 @@ body { background:var(--bg); color:var(--ink); font:400 17px/1.5 var(--f-ui); -w
 .plate .i { width:12px; height:12px; transform:rotate(90deg) }
 .nav { left:168px; gap:12px; color:var(--steel-5) }
 .nav .i { width:16px; height:16px }
+.nav .off { opacity:.35 }
 .url { left:290px; width:620px; gap:10px; padding:0 10px 0 6px; border-radius:5px; background:var(--oil); box-shadow:inset 0 0 0 1px var(--steel-3);
   font:400 12.5px/1 var(--f-mono); color:var(--steel-5) }
 .env { padding:4px 6px; border-radius:3px; background:var(--ok); color:var(--oil); font:700 9.5px/1 var(--f-mono); letter-spacing:.08em }
 .u i { font-style:normal; color:var(--steel-4) }
 .u b { font-weight:700; color:#F2F3F5 }
 .u em { font-style:normal; color:var(--hazard) }
+.url.editing { box-shadow:inset 0 0 0 1px var(--hazard) }
+.u mark { background:rgba(245,183,0,.35); color:#F2F3F5 }
+.u .caret { display:inline-block; width:2px; height:14px; margin:0 -1px; vertical-align:middle }
 .tools { right:14px; gap:8px; color:var(--steel-5) }
 .tools > span { display:flex; align-items:center; justify-content:center; width:28px; height:28px }
 .tools .i { width:16px; height:16px }
@@ -120,6 +129,7 @@ body { background:var(--bg); color:var(--ink); font:400 17px/1.5 var(--f-ui); -w
 .wfc i { position:absolute; top:6px; height:8px; border-radius:1px }
 .wfc .w { background:var(--h-w) }
 .wfc .d { background:var(--h-d) }
+.wfc .c { background:var(--h-c) }
 .er .wfc .w { background:#7A2A22 }
 .er .wfc .d { background:var(--err) }
 .live .wfc i { background:repeating-linear-gradient(-45deg, var(--h-w) 0 3px, rgba(140,106,46,.35) 3px 6px) }

@@ -15,8 +15,10 @@
 mod cg;
 pub mod compositor;
 mod memory;
+pub mod net;
 pub mod tabs;
 pub mod text;
+pub mod url;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -27,8 +29,9 @@ use objc2::runtime::AnyObject;
 use objc2::{AllocAnyThread, ClassType, MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEvent,
-    NSEventMask, NSEventModifierFlags, NSEventType, NSTrackingArea, NSTrackingAreaOptions,
-    NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSEventMask, NSEventModifierFlags, NSEventType, NSPasteboard, NSPasteboardTypeString,
+    NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowStyleMask,
+    NSWindowTitleVisibility,
 };
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
@@ -126,6 +129,22 @@ impl<T: Copy> GSlice<T> {
         }
         Some(unsafe { std::slice::from_raw_parts(self.data, n) })
     }
+
+    /// Copies `src` in, for a type with alignment 1; false, and nothing
+    /// copied, unless the slice is exactly as long.
+    ///
+    /// # Safety
+    /// Goose's slice is valid and writable for this call.
+    pub unsafe fn copy_from(&self, src: &[T]) -> bool {
+        const { assert!(std::mem::align_of::<T>() == 1) };
+        if self.count() != Some(src.len()) {
+            return false;
+        }
+        if !src.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.data, src.len()) };
+        }
+        true
+    }
 }
 
 struct Platform {
@@ -137,6 +156,8 @@ struct Platform {
     refresh_hz: f64,
     open: bool,
     pending: VecDeque<(GpEvent, u64)>, // each with its scroll phase (see queue)
+    key_texts: VecDeque<String>,       // the text of each EV_KEY in `pending`, in order
+    key_text: String,                  // the text of the EV_KEY tp_next_event gave last
     frames: i64,
     tracking: Retained<NSTrackingArea>, // the content's, whose exit is the pointer leaving
     pressed: u32,   // the buttons whose presses Goose was given, bit b for button b
@@ -366,6 +387,8 @@ pub extern "C" fn tp_open(
                 refresh_hz,
                 open: true,
                 pending,
+                key_texts: VecDeque::new(),
+                key_text: String::new(),
                 frames: 0,
                 tracking,
                 pressed: 0,
@@ -500,6 +523,9 @@ pub extern "C" fn tp_next_event(timeout_ms: i64, out: *mut GpEvent) -> i32 {
             };
             loop {
                 if let Some((e, _)) = p.pending.pop_front() {
+                    if e.kind == EV_KEY {
+                        p.key_text = p.key_texts.pop_front().unwrap_or_default();
+                    }
                     unsafe { out.write_unaligned(e) };
                     return Ok(0);
                 }
@@ -598,6 +624,9 @@ fn take(p: &mut Platform, until: &NSDate) -> bool {
         check_window(p);
         place_lights(p);
         if let Some(e) = translated {
+            if e.kind == EV_KEY {
+                p.key_texts.push_back(key_text(&ev));
+            }
             let phase = if kind == NSEventType::ScrollWheel {
                 ev.phase().0 as u64 | (ev.momentumPhase().0 as u64) << 32
             } else {
@@ -789,6 +818,75 @@ fn route(pressed: &mut u32, size: (f64, f64), e: GpEvent) -> Option<GpEvent> {
     Some(GpEvent { code, ..e })
 }
 
+/// What a key typed, for a text field: its characters, unless ⌘ or ⌃ makes
+/// it a shortcut, without controls and AppKit's function keys (U+F700 to
+/// U+F8FF: arrows, Home, F1...).
+fn key_text(ev: &NSEvent) -> String {
+    let flags = ev.modifierFlags();
+    if flags.contains(NSEventModifierFlags::Command)
+        || flags.contains(NSEventModifierFlags::Control)
+    {
+        return String::new();
+    }
+    let chars = ev.characters().map(|s| s.to_string()).unwrap_or_default();
+    typed(&chars)
+}
+
+/// `chars` without controls and function keys.
+fn typed(chars: &str) -> String {
+    chars
+        .chars()
+        .filter(|&c| c >= ' ' && c != '\u{7f}' && !('\u{f700}'..='\u{f8ff}').contains(&c))
+        .collect()
+}
+
+/// The text of the key event tp_next_event gave last (empty for none), into
+/// `out` when `out` is as long; returns its length either way, so call with
+/// an empty `out` to learn it.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_key_text(out: GSlice<u8>) -> i32 {
+    guarded(|| {
+        with_platform(|p| {
+            let len = p.key_text.len();
+            if out.count() == Some(len) {
+                unsafe { out.copy_from(p.key_text.as_bytes()) };
+            }
+            Ok(len as i32)
+        })
+    })
+}
+
+/// The pasteboard's text, as tp_key_text gives its own: copied into `out`
+/// when it is as long, its length returned either way. Main thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_paste(out: GSlice<u8>) -> i32 {
+    guarded(|| {
+        on_main_thread()?;
+        let board = NSPasteboard::generalPasteboard();
+        let text = unsafe { board.stringForType(NSPasteboardTypeString) }
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if out.count() == Some(text.len()) {
+            unsafe { out.copy_from(text.as_bytes()) };
+        }
+        i32::try_from(text.len()).map_err(|_| ERR_ARGUMENT)
+    })
+}
+
+/// Puts `text` (UTF-8) on the pasteboard. Main thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_copy(text: GSlice<u8>) -> i32 {
+    guarded(|| {
+        on_main_thread()?;
+        let text = std::str::from_utf8(unsafe { text.as_slice() }.ok_or(ERR_ARGUMENT)?)
+            .map_err(|_| ERR_ARGUMENT)?;
+        let board = NSPasteboard::generalPasteboard();
+        board.clearContents();
+        unsafe { board.setString_forType(&NSString::from_str(text), NSPasteboardTypeString) };
+        Ok(0)
+    })
+}
+
 /// Adds event `e` to the ones waiting for Goose. A move replaces a move just
 /// before it, and a scroll is added to a scroll of the same kind and `phase`
 /// (a trackpad gesture's, and its momentum's) just before it, so a burst of
@@ -932,6 +1030,16 @@ pub(crate) fn post_to_main(kind: i32, code: i32) {
             app.postEvent_atStart(&event, false);
         }
     });
+}
+
+/// 1 when the system is in dark mode, 0 when it is light. Any thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn tp_dark_mode() -> i32 {
+    guarded(|| {
+        let key = NSString::from_str("AppleInterfaceStyle");
+        let style = NSUserDefaults::standardUserDefaults().stringForKey(&key);
+        Ok(style.is_some_and(|s| s.to_string().eq_ignore_ascii_case("dark")) as i32)
+    })
 }
 
 /// Sets the window's title to `title`, UTF-8.
@@ -1154,6 +1262,15 @@ mod tests {
             None
         );
         assert_eq!(pressed, 1);
+    }
+
+    #[test]
+    fn typed_text_drops_controls_and_function_keys() {
+        assert_eq!(typed("a"), "a");
+        assert_eq!(typed("Ж é"), "Ж é");
+        assert_eq!(typed("\r\t\u{8}\u{7f}"), "");
+        assert_eq!(typed("\u{f702}\u{f703}"), ""); // ← and →
+        assert_eq!(typed("😀"), "😀");
     }
 
     #[test]

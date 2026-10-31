@@ -236,7 +236,21 @@ struct Rule {
     order: i32,
     origin: i32,
     pseudo: i32,                       // its last compound's: 1 for ::before, 2 for ::after
+    media: i32,                        // the @media it is in (Sheet.media), or -1
+    layer: i32,                        // its cascade layer's rank, from 0 for the first declared; UNLAYERED for none
 }
+
+// The rank of a rule in no @layer, which beats every layer's (Cascade 5 §6.4).
+let UNLAYERED: i32 = 255;
+
+// An @media's query list, as a span of Sheet.bytes, and the one it is in
+// (-1: none). Its rules apply while it is on, and it is on while its query
+// list and its parent's match the viewport (set_media).
+struct Media { text: i32, text_len: i32, parent: i32, on: bool }
+
+// What media queries ask of (Media Queries 4): the viewport in CSS pixels,
+// the backing scale, and whether the system is in dark mode.
+struct MediaEnv { width: f32, height: f32, scale: f32, dark: bool }
 
 // One declaration. Custom properties, values that wait on var() and strings
 // keep their text, as spans into Sheet.bytes: `text` is the value, and `name`
@@ -254,6 +268,7 @@ struct Sheet {
     bytes: u8[>..]&,
     vars: Var[>..]&,          // every element's own custom properties, see Var
     var_bytes: u8[>..]&,      // their values, substituted
+    media: Media[>..]&,       // the @media rules apply under, see Media
 }
 
 // One custom property of one element, in a chain: an element's own come
@@ -316,7 +331,7 @@ struct Style {
     fill: u32, stroke: u32, stroke_width: f32, linecap: i32, linejoin: i32, fill_rule: i32, transform_box: i32,
     stroke_pct: i32,                     // 1: stroke_width is a percentage of the viewport's diagonal
     fill_opacity: f32, stroke_opacity: f32,
-    svg: i32,                            // 1: an <svg> in HTML, 2: inside one
+    svg: i32,                            // 1: an <svg> in HTML, 2: inside one, 3: an <img> (replaced, as an <svg> is)
     svg_set: i32,                        // the SVG_ paint properties the element's own declarations set
 }
 
@@ -411,6 +426,7 @@ fn skip_block(l: Lexer&) {
         else if c == '}' { depth -= 1; if depth == 0 { l.pos += 1; return; } }
         else if c == '"' || c == '\'' { l.pos = skip_string(s, l.pos); continue; }
         else if at_comment(s, l.pos) { l.pos = skip_comment(s, l.pos); continue; }
+        else if c == '\\' { l.pos += 2; continue; }     // an escape: the next character is no brace or quote
         l.pos += 1;
     }
 }
@@ -450,50 +466,162 @@ fn skip_string(s: const u8[:], i: i64) -> i64 {
 // Parses a whole style sheet into `sh`. `order` numbers rules across sheets so
 // later ones win ties; returns the next free number.
 fn parse_sheet(src: const u8[:], sh: Sheet, origin: i32, order: i32) -> i32 {
+    return parse_rules(src, sh, origin, order, -1);
+}
+
+// Parses rules from `src` into `sh`, under @media `media` (-1: none). An
+// @media block's rules go under a new Media; an @supports block's go in when
+// its condition holds and are dropped when it doesn't; an @layer block's go
+// in with its layer's rank, layers ranked in the order the sheet first names
+// them. Other at-rules are skipped, with any block they open. One pass: the
+// blocks it is inside, at most 16 deep, are a stack of where each ends, the
+// Media outside it and the layer it is in. Comments in a prelude are
+// spaces; a backslash escapes the character after it.
+fn parse_rules(src: const u8[:], sh: Sheet, origin: i32, order: i32, media: i32) -> i32 {
     var l = Lexer { src: src, pos: 0 };
+    // A sheet that starts with a UTF-8 byte order mark starts after it.
+    if starts_with(src, "\xEF\xBB\xBF") { l.pos = 3; }
     var next = order;
+    var cur = media;
+    var layer = UNLAYERED;
+    var block_end: i64[16];
+    var block_media: i32[16];
+    var block_layer: i32[16];
+    var top: i64 = 0;
+    // The layers' names in the order first named, apart by commas, and how
+    // many there are.
+    var layers: u8[>..] = [];
+    var named: i32 = 0;
     loop {
         skip_ws_comments(l);
+        // Out of the blocks that end here, past their '}'.
+        while top > 0 && l.pos >= block_end[top - 1] {
+            l.pos = max(l.pos, block_end[top - 1] + 1);
+            top -= 1;
+            cur = block_media[top];
+            layer = block_layer[top];
+            skip_ws_comments(l);
+        }
         guard l.pos < src.len else { break; }
+        // Where what is read now must end: the block it is in, or the sheet.
+        let lim = if top > 0 { block_end[top - 1] } else { src.len };
         // The <!-- and --> that old pages wrap style sheets in are skipped.
         if starts_with(src[l.pos..], "<!--") { l.pos += 4; continue; }
         if starts_with(src[l.pos..], "-->") { l.pos += 3; continue; }
-        if src[l.pos] == '@' {                  // at-rules: skipped, with any block they open
-            while l.pos < src.len && src[l.pos] != ';' && src[l.pos] != '{' { l.pos += 1; }
-            if l.pos < src.len && src[l.pos] == '{' { skip_block(l); } else { l.pos += 1; }
+        if src[l.pos] == '@' {
+            let at = l.pos;
+            var e = at + 1;
+            while e < lim && is_ident(src[e]) { e += 1; }
+            while l.pos < lim && src[l.pos] != ';' && src[l.pos] != '{' {
+                if src[l.pos] == '"' || src[l.pos] == '\'' { l.pos = skip_string(src, l.pos); continue; }
+                if at_comment(src, l.pos) { l.pos = skip_comment(src, l.pos); continue; }
+                if src[l.pos] == '\\' { l.pos += 2; continue; }
+                l.pos += 1;
+            }
+            let name = src[at + 1..e];
+            var prelude: u8[>..] = [];
+            without_comments(src[e..min(l.pos, lim)], prelude);
+            let pre = trim(prelude[..]);
+            guard l.pos < lim && src[l.pos] == '{' else {
+                // A statement: `@layer a, b;` names layers in that order.
+                if same_word(name, "layer") {
+                    each_split(pre, ',') { let r = layer_rank(layers, named, trim(it), layer, false); };
+                }
+                l.pos += 1;
+                continue;
+            }
+            let open = l.pos;
+            skip_block(l);
+            // Its '}', or the sheet's end for a block the sheet never closes.
+            let close = if l.pos > open + 1 && src[l.pos - 1] == '}' { l.pos - 1 } else { src.len };
+            let into = same_word(name, "media") || same_word(name, "layer")
+                       || (same_word(name, "supports") && supports(pre));
+            guard into && top < 16 else { continue; }
+            block_end[top] = min(close, lim);
+            block_media[top] = cur;
+            block_layer[top] = layer;
+            top += 1;
+            if same_word(name, "media") {
+                let text = sh.bytes.len as i32;
+                sh.bytes.append(pre);
+                sh.media.push(Media { text: text, text_len: pre.len as i32, parent: cur, on: false });
+                cur = (sh.media.len - 1) as i32;
+            } else if same_word(name, "layer") {
+                layer = layer_rank(layers, named, pre, layer, true);
+            }
+            l.pos = open + 1;
             continue;
         }
         if src[l.pos] == '}' { l.pos += 1; continue; }
         let pstart = l.pos;
-        while l.pos < src.len && src[l.pos] != '{' {
+        while l.pos < lim && src[l.pos] != '{' {
             if at_comment(src, l.pos) { l.pos = skip_comment(src, l.pos); continue; }
+            if src[l.pos] == '\\' { l.pos += 2; continue; }
             l.pos += 1;
         }
-        guard l.pos < src.len else { break; }
-        let prelude = src[pstart..l.pos];
+        guard l.pos < lim else { l.pos = lim; continue; }
+        let selectors = src[pstart..l.pos];
         l.pos += 1;
         let bstart = l.pos;
-        while l.pos < src.len && src[l.pos] != '}' {
+        while l.pos < lim && src[l.pos] != '}' {
             if src[l.pos] == '"' || src[l.pos] == '\'' { l.pos = skip_string(src, l.pos); continue; }
             if at_comment(src, l.pos) { l.pos = skip_comment(src, l.pos); continue; }
+            if src[l.pos] == '\\' { l.pos += 2; continue; }
             l.pos += 1;
         }
+        l.pos = min(l.pos, lim);
         var body_text: u8[>..] = [];
-        without_comments(src[bstart..min(l.pos, src.len)], body_text);
-        l.pos = min(l.pos + 1, src.len);
+        without_comments(src[bstart..l.pos], body_text);
+        // Past the rule's '}', but never past its block's.
+        l.pos = if l.pos < lim { l.pos + 1 } else { lim };
         let decl_start = sh.decls.len as i32;
         parse_declarations(body_text[..], sh.decls, sh.bytes);
         let decl_count = sh.decls.len as i32 - decl_start;
         guard decl_count > 0 else { continue; }
-        each_split(prelude, ',') {
-            if parse_selector(trim(it), sh, decl_start, decl_count, origin, next) { next += 1; }
+        each_split(selectors, ',') {
+            if parse_selector(trim(it), sh, decl_start, decl_count, origin, next, cur, layer) { next += 1; }
         };
     }
     return next;
 }
 
+// The rank of layer `name` inside layer `outer` (UNLAYERED: none), named
+// in the sheet's `layers` (`named` of them, apart by commas): its own if
+// named before, else the next. A nested layer is "outer.name". An unnamed
+// block (`fresh`, no name) is a layer of its own. Ranks stop at 254.
+fn layer_rank(layers: u8[>..]&, named: i32&, name: const u8[:], outer: i32, fresh: bool) -> i32 {
+    var full: u8[>..] = [];
+    if outer != UNLAYERED {
+        // The outer layer's name: the outer-th in the list.
+        var k: i32 = 0;
+        var from: i64 = 0;
+        for c, j in layers {
+            guard c == ',' else { continue; }
+            if k == outer { full.append(layers[from..j]); full.push('.'); }
+            k += 1;
+            from = j + 1;
+        }
+    }
+    if name.len == 0 && fresh { format(full, "#", named); }
+    else { full.append(name); }
+    var k: i32 = 0;
+    var from: i64 = 0;
+    for c, j in layers {
+        guard c == ',' else { continue; }
+        if layers[from..j] == full[..] { return k; }
+        k += 1;
+        from = j + 1;
+    }
+    guard named < UNLAYERED - 1 else { return UNLAYERED - 1; }
+    layers.append(full);
+    layers.push(',');
+    named += 1;
+    return named - 1;
+}
+
 // One complex selector; false (and nothing added) when it uses what we don't support.
-fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origin: i32, order: i32) -> bool {
+fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origin: i32, order: i32, media: i32,
+                  layer: i32) -> bool {
     guard sel.len > 0 && selector_supported(sel) else { return false; }
     let comp_start = sh.comps.len;
     var ids = 0;
@@ -583,7 +711,7 @@ fn parse_selector(sel: const u8[:], sh: Sheet, decl: i32, decl_count: i32, origi
     let spec = (min(ids, 255) << 16) | (min(classes, 255) << 8) | min(types, 255);
     let pseudo = sh.comps[sh.comps.len - 1].pseudo;
     sh.rules.push(Rule { comp: comp_start as i32, comp_count: (sh.comps.len - comp_start) as i32, decl: decl, decl_count: decl_count,
-                         spec: spec as i32, order: order, origin: origin, pseudo: pseudo });
+                         spec: spec as i32, order: order, origin: origin, pseudo: pseudo, media: media, layer: layer });
     return true;
 }
 
@@ -1749,7 +1877,7 @@ fn compute_styles(d: Doc, sh: Sheet, styles: Style[>..]&) {
     // matches gets the cascade for its pseudo-elements, so that the rest
     // don't pay for looking.
     var pseudo_rules: i32[>..] = [];
-    for r, i in sh.rules { if r.pseudo != 0 { pseudo_rules.push(i as i32); } }
+    for r, i in sh.rules { if r.pseudo != 0 && applies(sh, r) { pseudo_rules.push(i as i32); } }
     var offsets: i32[>..] = [];
     var order: i32[>..] = [];
     index_rules(sh, offsets, order);
@@ -1782,19 +1910,43 @@ fn viewport_overflow(d: Doc, styles: Style[>..]&) {
     }
 }
 
-// Files every rule under one key of its last compound, so that an element
-// tries only the rules it could match: those under its id, its classes, its
-// tag, and the universal ones.
+// Where a declaration ranks in the cascade, as one number: importance, then
+// origin, then its layer (Cascade 5 §6.4: a later layer beats an earlier
+// one, and no layer beats any, the other way round for !important), then
+// specificity, then order. Bits: importance 62, origin 59–61, layer 51–58,
+// specificity 27–50, order 0–26.
+fn cascade_prio(important: i32, origin: i64, layer: i32, spec: i32, order: i32) -> i64 {
+    let rank: i64 = if important != 0 { UNLAYERED - layer } else { layer };
+    let o: i64 = order;
+    return (important as i64) << 62 | origin << 59 | rank << 51 | (spec as i64) << 27 | (o & 0x7FFFFFF);
+}
+
+// Whether `a` is `lower` in any case, `lower` being in lower case.
+fn same_word(a: const u8[:], lower: const u8[:]) -> bool {
+    guard a.len == lower.len else { return false; }
+    for c, j in a { if (if c >= 'A' && c <= 'Z' { c + 32 } else { c }) != lower[j] { return false; } }
+    return true;
+}
+
+// Whether rule r applies to the viewport: it is in no @media, or in one
+// that is on.
+fn applies(sh: Sheet, r: Rule) -> bool { return r.media < 0 || sh.media[r.media].on; }
+
+// Files every rule that applies under one key of its last compound, so that
+// an element tries only the rules it could match: those under its id, its
+// classes, its tag, and the universal ones. A rule in an @media that is off
+// costs nothing.
 fn index_rules(sh: Sheet, offsets: i32[>..]&, order: i32[>..]&) {
     var counts: i32[1025];
     fill(counts[..], 0);
-    for r in sh.rules { counts[rule_bucket(sh, r)] += 1; }
+    for r in sh.rules { if applies(sh, r) { counts[rule_bucket(sh, r)] += 1; } }
     offsets.push(0);
     for b in BUCKETS + 1 { offsets.push(offsets[b] + counts[b]); }
     var next: i32[1025];
     for b in BUCKETS + 1 { next[b] = offsets[b]; }
-    for r in sh.rules { order.push(0); }
+    for r in sh.rules { if applies(sh, r) { order.push(0); } }
     for r, i in sh.rules {
+        guard applies(sh, r) else { continue; }
         let b = rule_bucket(sh, r);
         order[next[b]] = i as i32;
         next[b] += 1;
@@ -1842,13 +1994,21 @@ recursive fn compute_subtree(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, par
         s = if is_generated(d, n) { styles[n] } else { cascade(d, sh, n, parent, 0, w) };
     }
     styles[n] = s;
-    if element && pseudo_rules.len > 0 && s.display != K_NONE && !is_generated(d, n) {
-        // Which of its pseudo-elements a rule styles: 1 ::before, 2 ::after.
+    if element && !is_generated(d, n) {
+        // Which of its pseudo-elements a rule styles: 1 ::before, 2 ::after;
+        // and one made before, styled again: by rules that still give it
+        // content, or hidden.
         var styled: i32 = 0;
-        for k in pseudo_rules {
-            let r = sh.rules[k];
-            if (styled & r.pseudo) == 0 && rule_matches(sh, d, r, n) { styled |= r.pseudo; }
+        if s.display != K_NONE {
+            for k in pseudo_rules {
+                let r = sh.rules[k];
+                if (styled & r.pseudo) == 0 && rule_matches(sh, d, r, n) { styled |= r.pseudo; }
+            }
         }
+        let f = d.nodes[n].first;
+        let l = d.nodes[n].last;
+        if f >= 0 && is_generated(d, f) && node_name(d, f) == "::before" { styled |= 1; }
+        if l >= 0 && is_generated(d, l) && node_name(d, l) == "::after" { styled |= 2; }
         if (styled & 1) != 0 { generate(d, sh, styles, n, s, 1, w); }
         if (styled & 2) != 0 { generate(d, sh, styles, n, s, 2, w); }
     }
@@ -1872,6 +2032,21 @@ fn generate(d: Doc, sh: Sheet, styles: Style[>..]&, n: i32, s: const Style&, whi
     if edge >= 0 && d.nodes[edge].kind == NODE_ELEMENT && node_name(d, edge) == name {
         if ps.content_len < 0 { ps.display = K_NONE; }
         styles[edge] = ps;
+        // Content the cascade changed: its text says the new content (the
+        // DOM only grows, so the new text goes after the bytes there).
+        guard ps.content_len >= 0 else { return; }
+        let content = span_of(sh, ps.content, ps.content_len);
+        let t = d.nodes[edge].first;
+        if t >= 0 && d.nodes[t].kind == NODE_TEXT {
+            if node_text(d, t) != content {
+                d.nodes[t].text = d.bytes.len as i32;
+                d.nodes[t].text_len = content.len as i32;
+                d.bytes.append(content);
+            }
+        } else if content.len > 0 {
+            add_text(d, content, edge);
+            styles.push(ps);
+        }
         return;
     }
     guard ps.content_len >= 0;
@@ -1893,7 +2068,8 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work
     fill(win_prio[..], -1);
     let mark = w.customs.len;
     // Whether it is SVG: 1 for an <svg> in HTML, 2 for what is inside one.
-    let svg: i32 = if parent.svg != 0 { 2 } else if pseudo == 0 && node_name(d, e) == "svg" { 1 } else { 0 };
+    let svg: i32 = if parent.svg != 0 && parent.svg != 3 { 2 } else if pseudo == 0 && node_name(d, e) == "svg" { 1 }
+                   else if pseudo == 0 && node_name(d, e) == "img" { 3 } else { 0 };
     // The buckets this element's rules can be in, each once however many
     // classes it has: the universal one, its tag's, its id's and its classes',
     // split as has_class splits them.
@@ -1916,11 +2092,11 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work
         let b = buckets[bi];
         for k in w.offsets[b]..w.offsets[b + 1] {
             let r = sh.rules[w.order[k]];
-            guard r.pseudo == pseudo && (r.origin != ORIGIN_UA_HTML || svg == 0) && rule_matches(sh, d, r, e) else { continue; }
+            guard r.pseudo == pseudo && (r.origin != ORIGIN_UA_HTML || svg == 0 || svg == 3) && rule_matches(sh, d, r, e) else { continue; }
             let origin: i64 = if r.origin == ORIGIN_UA_HTML { ORIGIN_UA } else { r.origin };
             for j in r.decl..r.decl + r.decl_count {
                 let dc = sh.decls[j];
-                let prio = (dc.important as i64) << 62 | origin << 56 | (r.spec as i64) << 32 | r.order;
+                let prio = cascade_prio(dc.important, origin, r.layer, r.spec, r.order);
                 if dc.prop == P_CUSTOM { keep_custom(sh, w, mark, dc, prio); continue; }
                 if prio >= win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
             }
@@ -1934,9 +2110,11 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work
         for ai in a0..a0 + d.nodes[e].attr_count {
             let a = d.attrs[ai];
             let an = d.bytes[a.name..a.name + a.name_len];
-            let presents = an == "fill" || an == "stroke" || an == "stroke-width" || an == "stroke-linecap" || an == "stroke-linejoin"
-                || an == "fill-rule" || an == "fill-opacity" || an == "stroke-opacity" || an == "opacity" || an == "color" || an == "display"
-                || (svg == 1 && (an == "width" || an == "height"));
+            // An <img>'s width and height are its dimensions too (HTML §15.4.3).
+            let presents = (svg != 3 && (an == "fill" || an == "stroke" || an == "stroke-width" || an == "stroke-linecap"
+                || an == "stroke-linejoin" || an == "fill-rule" || an == "fill-opacity" || an == "stroke-opacity"
+                || an == "opacity" || an == "color" || an == "display"))
+                || ((svg == 1 || svg == 3) && (an == "width" || an == "height"));
             guard presents else { continue; }
             var v: u8[>..] = [];
             v.append(trim(d.bytes[a.value..a.value + a.value_len]));
@@ -1944,7 +2122,7 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work
             var hint: Decl[>..] = [];
             add_declaration(an, v[..], 0, hint, sh.bytes);
             for dc in hint {
-                let prio = (ORIGIN_AUTHOR as i64) << 56;
+                let prio = cascade_prio(0, ORIGIN_AUTHOR, UNLAYERED, 0, 0);
                 if prio > win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
             }
         }
@@ -1957,7 +2135,7 @@ fn cascade(d: Doc, sh: Sheet, e: i32, parent: const Style&, pseudo: i32, w: Work
         without_comments(style_attr, text);
         parse_declarations(text[..], inline, sh.bytes);
         for dc in inline {
-            let prio = (dc.important as i64) << 62 | (ORIGIN_INLINE as i64) << 56;
+            let prio = cascade_prio(dc.important, ORIGIN_INLINE, UNLAYERED, 0, 0);
             if dc.prop == P_CUSTOM { keep_custom(sh, w, mark, dc, prio); continue; }
             if prio >= win_prio[dc.prop] { win_prio[dc.prop] = prio; win[dc.prop] = dc; }
         }
@@ -2680,8 +2858,9 @@ let UA_CSS = """
     article, main, header, footer, nav, aside, address, hr, form, fieldset, details, summary, center, menu, dir,
     table, caption, thead, tbody, tfoot, tr, legend, hgroup { display: block }
     li { display: list-item }
-    head, title, style, script, link, meta, base, noscript, template, iframe, object, embed, video, audio, img,
+    head, title, style, script, link, meta, base, template, iframe, object, embed, video, audio,
     math, input, button, select, textarea, map, area, canvas, picture, source, track, param { display: none }
+    img { background-color: #e9ecef }
     html { color: #1c1c1c; font-family: sans-serif; font-size: 17px; line-height: 1.6 }
     body { max-width: 720px; margin: 0 auto; padding: 40px 32px 120px }
     h1 { font-size: 2em; font-weight: bold; line-height: 1.2; margin: 0.4em 0 0.6em }
@@ -2725,17 +2904,720 @@ let UA_SVG_CSS = """
     """;
 
 // Builds the document's sheets into `sh`: Tusk's own, then each <style> in
-// document order. Linked sheets wait for the network stack (M2).
+// document order. A page whose linked sheets were fetched uses
+// load_sheets_with.
 fn load_sheets(d: Doc, sh: Sheet) {
     var order = parse_sheet(UA_SVG_CSS, sh, ORIGIN_UA, 0);
     order = parse_sheet(UA_CSS, sh, ORIGIN_UA_HTML, order);
     for n, i in d.nodes {
-        guard n.kind == NODE_ELEMENT && n.first >= 0 && node_name(d, i as i32) == "style" else { continue; }
+        guard n.kind == NODE_ELEMENT && n.first >= 0 && node_name(d, i as i32) == "style" && !in_template(d, i as i32)
+              else { continue; }
         // A sheet for print or speech only isn't for the screen.
         let media, has = attr_value(d, i as i32, "media");
         if has && !for_screen(media) { continue; }
         order = parse_sheet(node_text(d, n.first), sh, ORIGIN_AUTHOR, order);
     }
+}
+
+// Builds the document's sheets into `sh`: Tusk's own, then the page's, each
+// parsed on its own, in the cascade's order: those of sheet_sources in
+// document order, each one's @imports before it. The k-th is
+// texts[ends[k - 1]..ends[k]], from 0 for the first, and applies under
+// medias[media_ends[k - 1]..media_ends[k]]: the media its <link>, <style> or
+// @import gave it and those of the sheets that import it, each a query list,
+// apart by U+0001, outermost first (none: always).
+fn load_sheets_with(d: Doc, sh: Sheet, texts: const u8[:], ends: const i64[:], medias: const u8[:],
+                    media_ends: const i64[:]) {
+    var order = parse_sheet(UA_SVG_CSS, sh, ORIGIN_UA, 0);
+    order = parse_sheet(UA_CSS, sh, ORIGIN_UA_HTML, order);
+    var from: i64 = 0;
+    var mfrom: i64 = 0;
+    for end, k in ends {
+        var media: i32 = -1;
+        let ms = medias[mfrom..media_ends[k]];
+        var q: i64 = 0;
+        for c, j in ms {
+            guard c == 0x01 || j == ms.len - 1 else { continue; }
+            let part = trim(ms[q..(if c == 0x01 { j } else { j + 1 })]);
+            if part.len > 0 {
+                let text = sh.bytes.len as i32;
+                sh.bytes.append(part);
+                sh.media.push(Media { text: text, text_len: part.len as i32, parent: media, on: false });
+                media = (sh.media.len - 1) as i32;
+            }
+            q = j + 1;
+        }
+        order = parse_rules(texts[from..end], sh, ORIGIN_AUTHOR, order, media);
+        from = end;
+        mfrom = media_ends[k];
+    }
+}
+
+// Turns each @media of `sh` on or off for `env`; whether any changed, when
+// the page must be styled again. A Media's parent comes before it.
+fn set_media(sh: Sheet, env: MediaEnv) -> bool {
+    var changed = false;
+    for m, k in sh.media {
+        let on = (m.parent < 0 || sh.media[m.parent].on) && media_matches(sh.bytes[m.text..m.text + m.text_len], env);
+        if on != m.on {
+            sh.media[k].on = on;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// ------------------------------------------------------------------ media queries
+
+// Whether media query list `q` matches `env` (Media Queries 4): any of its
+// queries does. A query: `only` or `not`, a media type, then `and` and
+// conditions; or conditions alone. A query Tusk can't read is false, as
+// the spec says ("not all").
+fn media_matches(q: const u8[:], env: MediaEnv) -> bool {
+    var lower: u8[>..] = [];
+    lower.append(q);
+    to_lower(lower[..]);
+    guard trim(lower[..]).len > 0 else { return true; }
+    var any = false;
+    var depth = 0;
+    var from: i64 = 0;
+    for c, j in lower {
+        if c == '(' { depth += 1; } else if c == ')' { depth -= 1; }
+        guard (c == ',' && depth == 0) || j == lower.len - 1 else { continue; }
+        let end = if c == ',' && depth == 0 { j } else { j + 1 };
+        if query_matches(trim(lower[from..end]), env) { any = true; }
+        from = j + 1;
+    }
+    return any;
+}
+
+fn query_matches(q: const u8[:], env: MediaEnv) -> bool {
+    guard q.len > 0 else { return false; }
+    guard q[0] != '(' else { let ok, v = condition(q, env); return ok && v == MQ_TRUE; }
+    var i: i64 = 0;
+    var negate = false;
+    var word = next_word(q, i);
+    // A word right before '(' is a function, which no query has.
+    guard i >= q.len || q[i] != '(' else { return false; }
+    if word == "not" && (i >= q.len || q[skip_spaces(q, i)] != '(') {
+        negate = true;
+        word = next_word(q, i);
+    } else if word == "only" {
+        word = next_word(q, i);
+    } else if word == "not" {
+        // `not (...)`: a condition.
+        let ok, v = condition(q, env);
+        return ok && v == MQ_TRUE;
+    }
+    guard word.len > 0 else { return false; }
+    // A type Tusk isn't, known or not, matches nothing (Media Queries 4 §2.3).
+    let type_ok = word == "all" || word == "screen";
+    i = skip_spaces(q, i);
+    var v = if type_ok { MQ_TRUE } else { MQ_FALSE };
+    if i < q.len {
+        let and = next_word(q, i);
+        guard and == "and" && i < q.len && q[i] != '(' else { return false; }
+        let ok, c = condition(trim(q[i..]), env);
+        guard ok else { return false; }
+        v = mq_and(v, c);
+    }
+    if negate { v = mq_not(v); }
+    return v == MQ_TRUE;
+}
+
+// A media condition's value (Media Queries 4 §3.1): true, false, or unknown
+// for a feature Tusk can't read, which only `or` with a true can get past;
+// a query whose value is unknown doesn't match.
+let MQ_FALSE: i32 = 0;
+let MQ_TRUE: i32 = 1;
+let MQ_UNKNOWN: i32 = 2;
+
+fn mq_and(a: i32, b: i32) -> i32 {
+    if a == MQ_FALSE || b == MQ_FALSE { return MQ_FALSE; }
+    return if a == MQ_TRUE && b == MQ_TRUE { MQ_TRUE } else { MQ_UNKNOWN };
+}
+
+fn mq_or(a: i32, b: i32) -> i32 {
+    if a == MQ_TRUE || b == MQ_TRUE { return MQ_TRUE; }
+    return if a == MQ_FALSE && b == MQ_FALSE { MQ_FALSE } else { MQ_UNKNOWN };
+}
+
+fn mq_not(a: i32) -> i32 { return if a == MQ_UNKNOWN { MQ_UNKNOWN } else { MQ_TRUE - a }; }
+
+fn skip_spaces(q: const u8[:], i: i64) -> i64 {
+    var j = i;
+    while j < q.len && is_ws(q[j]) { j += 1; }
+    return j;
+}
+
+// The word at `i` after any spaces, letters, digits and '-', moving `i` past
+// it.
+fn next_word(q: const u8[:], i: i64&) -> const u8[:] {
+    i = skip_spaces(q, i);
+    let start = i;
+    while i < q.len && (is_ident(q[i])) { i += 1; }
+    return q[start..i];
+}
+
+// A condition: `not (x)`, or `(x)` joined by all `and` or all `or`. Whether it
+// could be read, and its value.
+recursive fn condition(q: const u8[:], env: MediaEnv) -> bool, i32 {
+    var i = skip_spaces(q, 0);
+    var negate = false;
+    if starts_with(q[i..], "not") && i + 3 < q.len && is_ws(q[i + 3]) {
+        negate = true;
+        i = skip_spaces(q, i + 3);
+    }
+    var joiner = 0;                         // 1 and, 2 or
+    var v = MQ_FALSE;
+    var first = true;
+    loop {
+        i = skip_spaces(q, i);
+        guard i < q.len && q[i] == '(' else { return false, MQ_FALSE; }
+        // The matching ')'.
+        var depth = 0;
+        var j = i;
+        while j < q.len {
+            if q[j] == '(' { depth += 1; } else if q[j] == ')' { depth -= 1; if depth == 0 { break; } }
+            j += 1;
+        }
+        guard j < q.len else { return false, MQ_FALSE; }
+        let inner = trim(q[i + 1..j]);
+        var x = MQ_UNKNOWN;
+        if inner.len > 0 && (inner[0] == '(' || starts_with(inner, "not ")) {
+            let ok, y = condition(inner, env);
+            guard ok else { return false, MQ_FALSE; }
+            x = y;
+        } else {
+            // A feature Tusk can't read, or a value it can't, is unknown.
+            let ok, y = feature(inner, env);
+            if ok { x = if y { MQ_TRUE } else { MQ_FALSE }; }
+        }
+        if first { v = x; first = false; }
+        else if joiner == 1 { v = mq_and(v, x); }
+        else { v = mq_or(v, x); }
+        i = skip_spaces(q, j + 1);
+        guard i < q.len else { break; }
+        guard !negate else { return false, MQ_FALSE; }    // `not` takes one condition
+        let word = next_word(q, i);
+        let join = if word == "and" { 1 } else if word == "or" { 2 } else { 0 };
+        guard join != 0 && (joiner == 0 || joiner == join) else { return false, MQ_FALSE; }  // no mixing without parens
+        guard i < q.len && q[i] != '(' else { return false, MQ_FALSE; }   // `and(` is a function
+        joiner = join;
+    }
+    return true, if negate { mq_not(v) } else { v };
+}
+
+// One media feature: `name`, `name: value`, or a range such as `width >= 600px`
+// or `400px < width <= 700px`. Whether it could be read, and its value.
+fn feature(f: const u8[:], env: MediaEnv) -> bool, bool {
+    let colon = find(f, ":");
+    if colon > 0 {
+        let name = trim(f[..colon]);
+        let value = trim(f[colon + 1..]);
+        if starts_with(name, "min-") { return compare(name[4..], value, ">=", env); }
+        if starts_with(name, "max-") { return compare(name[4..], value, "<=", env); }
+        if starts_with(name, "-webkit-min-") { return compare(name[12..], value, ">=", env); }
+        if starts_with(name, "-webkit-max-") { return compare(name[12..], value, "<=", env); }
+        if name == "width" || name == "height" || name == "resolution" || name == "aspect-ratio"
+           || name == "-webkit-device-pixel-ratio" || name == "device-width" || name == "device-height" {
+            return compare(name, value, "=", env);
+        }
+        return discrete(name, value, env);
+    }
+    // A range: one or two comparisons around the name.
+    var ops: i64[>..] = [];
+    for c, j in f { if (c == '<' || c == '>' || c == '=') && (j == 0 || (f[j - 1] != '<' && f[j - 1] != '>')) { ops.push(j); } }
+    if ops.len == 0 { return discrete(trim(f), "", env); }
+    let a = ops[0];
+    let alen: i64 = if a + 1 < f.len && f[a + 1] == '=' && f[a] != '=' { 2 } else { 1 };
+    let left = trim(f[..a]);
+    let op1 = f[a..a + alen];
+    let rest = f[a + alen..];
+    if ops.len == 1 {
+        // `name op value` or `value op name`.
+        if is_feature_name(left) { return compare(left, trim(rest), op1, env); }
+        return compare(trim(rest), left, flip(op1), env);
+    }
+    let b = ops[1] - (a + alen);
+    let blen: i64 = if b + 1 < rest.len && rest[b + 1] == '=' { 2 } else { 1 };
+    let name = trim(rest[..b]);
+    let right = trim(rest[b + blen..]);
+    let ok1, v1 = compare(name, left, flip(op1), env);
+    let ok2, v2 = compare(name, right, rest[b..b + blen], env);
+    return ok1 && ok2, v1 && v2;
+}
+
+fn is_feature_name(s: const u8[:]) -> bool { return s.len > 0 && ((s[0] >= 'a' && s[0] <= 'z') || s[0] == '-'); }
+
+// `a op b` the other way round: `b flip(op) a`.
+fn flip(op: const u8[:]) -> const u8[:] {
+    if op == "<" { return ">"; }
+    if op == ">" { return "<"; }
+    if op == "<=" { return ">="; }
+    if op == ">=" { return "<="; }
+    return op;
+}
+
+// Whether the viewport's `name` stands as `op` says to `value`.
+fn compare(name: const u8[:], value: const u8[:], op: const u8[:], env: MediaEnv) -> bool, bool {
+    var have: f64 = 0.0;
+    var want: f64 = 0.0;
+    if name == "width" || name == "device-width" || name == "height" || name == "device-height" {
+        have = if name == "width" || name == "device-width" { env.width } else { env.height };
+        let ok, px = media_length(value, env);
+        guard ok else { return false, false; }
+        want = px;
+    } else if name == "aspect-ratio" {
+        guard env.height > 0.0 else { return true, false; }
+        have = env.width / env.height;
+        let slash = find(value, "/");
+        let n, nok = parse_flt(trim(if slash > 0 { value[..slash] } else { value }));
+        var dv: f64 = 1.0;
+        if slash > 0 {
+            let x, dok = parse_flt(trim(value[slash + 1..]));
+            guard dok else { return false, false; }
+            dv = x;
+        }
+        guard nok && dv > 0.0 else { return false, false; }
+        want = n / dv;
+    } else if name == "resolution" || name == "device-pixel-ratio" || name == "-webkit-device-pixel-ratio" {
+        have = env.scale;
+        var i: i64 = 0;
+        while i < value.len && (value[i] == '.' || (value[i] >= '0' && value[i] <= '9')) { i += 1; }
+        let n, ok = parse_flt(value[..i]);
+        guard ok else { return false, false; }
+        let unit = value[i..];
+        if unit == "dppx" || unit == "x" || unit.len == 0 { want = n; }
+        else if unit == "dpi" { want = n / 96.0; }
+        else if unit == "dpcm" { want = n * 2.54 / 96.0; }
+        else { return false, false; }
+    } else if name == "color" {
+        have = 8.0;
+        let n, ok = parse_flt(value);
+        guard ok else { return false, false; }
+        want = n;
+    } else if name == "monochrome" || name == "color-index" {
+        have = 0.0;
+        let n, ok = parse_flt(value);
+        guard ok else { return false, false; }
+        want = n;
+    } else {
+        return false, false;
+    }
+    if op == "=" || op == ":" { return true, abs(have - want) < 0.001; }
+    if op == ">=" { return true, have >= want - 0.001; }
+    if op == "<=" { return true, have <= want + 0.001; }
+    if op == ">" { return true, have > want + 0.001; }
+    if op == "<" { return true, have < want - 0.001; }
+    return false, false;
+}
+
+// A length in a media query, in CSS pixels: em and rem are 16px there, and
+// calc(), min(), max() and clamp() of lengths and numbers, with + - * /,
+// are worked out (Wikipedia writes calc(640px - 1px)).
+fn media_length(v: const u8[:], env: MediaEnv) -> bool, f64 {
+    var i: i64 = 0;
+    var ok = true;
+    var len = false;
+    let x = calc_sum(v, i, env, ok, len);
+    guard ok && skip_spaces(v, i) == v.len && (len || x == 0.0) else { return false, 0.0; }
+    return true, x;
+}
+
+// A sum in calc(): products joined by + and -, of the same kind. Moves `i`
+// past it; `len` says whether it is a length (else a number).
+recursive fn calc_sum(v: const u8[:], i: i64&, env: MediaEnv, ok: bool&, len: bool&) -> f64 {
+    var l1 = false;
+    var x = calc_product(v, i, env, ok, l1);
+    loop {
+        let j = skip_spaces(v, i);
+        guard ok && j < v.len && (v[j] == '+' || v[j] == '-') else { break; }
+        let minus = v[j] == '-';
+        i = j + 1;
+        var l2 = false;
+        let y = calc_product(v, i, env, ok, l2);
+        if l1 != l2 { ok = false; }
+        x = if minus { x - y } else { x + y };
+    }
+    len = l1;
+    return x;
+}
+
+// A product in calc(): values joined by * and /; a length may be multiplied
+// or divided by a number, not by a length.
+recursive fn calc_product(v: const u8[:], i: i64&, env: MediaEnv, ok: bool&, len: bool&) -> f64 {
+    var l1 = false;
+    var x = calc_value(v, i, env, ok, l1);
+    loop {
+        let j = skip_spaces(v, i);
+        guard ok && j < v.len && (v[j] == '*' || v[j] == '/') else { break; }
+        let divide = v[j] == '/';
+        i = j + 1;
+        var l2 = false;
+        let y = calc_value(v, i, env, ok, l2);
+        if divide {
+            if l2 || y == 0.0 { ok = false; } else { x = x / y; }
+        } else {
+            if l1 && l2 { ok = false; }
+            x = x * y;
+            l1 = l1 || l2;
+        }
+    }
+    len = l1;
+    return x;
+}
+
+// A value in calc(): a number with or without a unit, a sum in brackets, or
+// calc(), min(), max() or clamp() of sums.
+recursive fn calc_value(v: const u8[:], i: i64&, env: MediaEnv, ok: bool&, len: bool&) -> f64 {
+    i = skip_spaces(v, i);
+    guard i < v.len else { ok = false; return 0.0; }
+    if v[i] == '(' {
+        i += 1;
+        let x = calc_sum(v, i, env, ok, len);
+        i = skip_spaces(v, i);
+        if i < v.len && v[i] == ')' { i += 1; } else { ok = false; }
+        return x;
+    }
+    if (v[i] >= 'a' && v[i] <= 'z') || (v[i] >= 'A' && v[i] <= 'Z') {
+        let name_at = i;
+        while i < v.len && is_ident(v[i]) { i += 1; }
+        let name = v[name_at..i];
+        guard i < v.len && v[i] == '(' else { ok = false; return 0.0; }
+        i += 1;
+        var x = calc_sum(v, i, env, ok, len);
+        var args = 1;
+        var lo = x;
+        var hi = x;
+        var mid = x;
+        loop {
+            i = skip_spaces(v, i);
+            guard ok && i < v.len && v[i] == ',' else { break; }
+            i += 1;
+            var l2 = false;
+            let y = calc_sum(v, i, env, ok, l2);
+            if l2 != len { ok = false; }
+            args += 1;
+            if args == 2 { mid = y; }
+            if args == 3 { hi = y; }
+            x = if same_word(name, "max") { max(x, y) } else { min(x, y) };
+        }
+        i = skip_spaces(v, i);
+        if i < v.len && v[i] == ')' { i += 1; } else { ok = false; }
+        if same_word(name, "calc") { if args != 1 { ok = false; } return x; }
+        if same_word(name, "min") || same_word(name, "max") { return x; }
+        if same_word(name, "clamp") {
+            if args != 3 { ok = false; }
+            return max(lo, min(mid, hi));
+        }
+        ok = false;
+        return 0.0;
+    }
+    let start = i;
+    if v[i] == '-' || v[i] == '+' { i += 1; }
+    while i < v.len && (v[i] == '.' || (v[i] >= '0' && v[i] <= '9')) { i += 1; }
+    let n, number = parse_flt(v[start..i]);
+    guard number else { ok = false; return 0.0; }
+    let unit_at = i;
+    while i < v.len && ((v[i] >= 'a' && v[i] <= 'z') || (v[i] >= 'A' && v[i] <= 'Z')) { i += 1; }
+    let unit = v[unit_at..i];
+    guard unit.len > 0 else { len = false; return n; }
+    len = true;
+    let px, known = unit_px(unit, env);
+    guard known else { ok = false; return 0.0; }
+    return n * px;
+}
+
+// How many CSS pixels one `unit` is in a media query: em and rem are 16px.
+fn unit_px(unit: const u8[:], env: MediaEnv) -> f64, bool {
+    if same_word(unit, "px") { return 1.0, true; }
+    if same_word(unit, "em") || same_word(unit, "rem") { return 16.0, true; }
+    if same_word(unit, "pt") { return 4.0 / 3.0, true; }
+    if same_word(unit, "pc") { return 16.0, true; }
+    if same_word(unit, "in") { return 96.0, true; }
+    if same_word(unit, "cm") { return 96.0 / 2.54, true; }
+    if same_word(unit, "mm") { return 96.0 / 25.4, true; }
+    if same_word(unit, "vw") { return env.width / 100.0, true; }
+    if same_word(unit, "vh") { return env.height / 100.0, true; }
+    return 0.0, false;
+}
+
+// A feature with a keyword, or none (`(hover)`): what Tusk is, on a Mac. A
+// keyword the feature doesn't have can't be read: false, false.
+fn discrete(name: const u8[:], value: const u8[:], env: MediaEnv) -> bool, bool {
+    let none = value.len == 0;
+    if name == "width" || name == "height" { return none, if name == "width" { env.width > 0.0 } else { env.height > 0.0 }; }
+    if name == "orientation" {
+        guard none || value == "portrait" || value == "landscape" else { return false, false; }
+        return true, none || (value == "portrait") == (env.height >= env.width);
+    }
+    if name == "prefers-color-scheme" {
+        guard none || value == "light" || value == "dark" else { return false, false; }
+        return true, none || (value == "dark") == env.dark;
+    }
+    if name == "hover" || name == "any-hover" {
+        guard none || value == "hover" || value == "none" else { return false, false; }
+        return true, none || value == "hover";
+    }
+    if name == "pointer" || name == "any-pointer" {
+        guard none || value == "fine" || value == "coarse" || value == "none" else { return false, false; }
+        return true, none || value == "fine";
+    }
+    if name == "prefers-reduced-motion" || name == "prefers-reduced-transparency" || name == "prefers-reduced-data" {
+        guard none || value == "no-preference" || value == "reduce" else { return false, false; }
+        return true, value == "no-preference";
+    }
+    if name == "prefers-contrast" {
+        guard none || value == "no-preference" || value == "more" || value == "less" || value == "custom" else { return false, false; }
+        return true, value == "no-preference";
+    }
+    if name == "forced-colors" || name == "inverted-colors" {
+        guard none || value == "none" || value == "active" || value == "inverted" else { return false, false; }
+        return true, value == "none";
+    }
+    if name == "scripting" {                          // no JavaScript yet (docs/adr/0004)
+        guard none || value == "none" || value == "enabled" || value == "initial-only" else { return false, false; }
+        return true, value == "none";
+    }
+    if name == "display-mode" {
+        guard none || value == "browser" || value == "fullscreen" || value == "standalone" || value == "minimal-ui"
+              || value == "picture-in-picture" || value == "window-controls-overlay" else { return false, false; }
+        return true, none || value == "browser";
+    }
+    if name == "update" {
+        guard none || value == "fast" || value == "slow" || value == "none" else { return false, false; }
+        return true, none || value == "fast";
+    }
+    if name == "color-gamut" {
+        guard value == "srgb" || value == "p3" || value == "rec2020" else { return false, false; }
+        return true, value != "rec2020";
+    }
+    if name == "dynamic-range" || name == "video-dynamic-range" {
+        guard value == "standard" || value == "high" else { return false, false; }
+        return true, value == "standard";
+    }
+    if name == "color" { return true, true; }
+    if name == "monochrome" || name == "grid" { return true, value == "0"; }
+    if name == "resolution" || name == "aspect-ratio" { return none, true; }
+    return false, false;
+}
+
+// ------------------------------------------------------------------ @supports
+
+// Whether an @supports condition holds (CSS Conditional 3): `(property:
+// value)` holds when Tusk reads that declaration, `selector(s)` when it
+// reads that selector, and `not`, `and` and `or` join them as they say. What
+// it can't read is false.
+recursive fn supports(q: const u8[:]) -> bool {
+    var i = skip_spaces(q, 0);
+    var negate = false;
+    if i + 3 < q.len && same_word(q[i..i + 3], "not") && (is_ws(q[i + 3]) || q[i + 3] == '(') {
+        negate = true;
+        i = skip_spaces(q, i + 3);
+    }
+    var joiner = 0;                         // 1 and, 2 or
+    var v = false;
+    var first = true;
+    loop {
+        i = skip_spaces(q, i);
+        guard i < q.len else { return false; }
+        let name_at = i;
+        while i < q.len && q[i] != '(' && is_ident(q[i]) { i += 1; }
+        let fn_name = q[name_at..i];
+        guard i < q.len && q[i] == '(' else { return false; }
+        var depth = 0;
+        var j = i;
+        while j < q.len {
+            if q[j] == '(' { depth += 1; } else if q[j] == ')' { depth -= 1; if depth == 0 { break; } }
+            else if q[j] == '"' || q[j] == '\'' { j = skip_string(q, j); continue; }
+            j += 1;
+        }
+        guard j < q.len else { return false; }
+        let inner = trim(q[i + 1..j]);
+        var x = false;
+        if same_word(fn_name, "selector") {
+            x = selector_supported(inner);
+        } else if fn_name.len > 0 {
+            x = false;                          // font-tech(), font-format() and the rest
+        } else if inner.len > 3 && (inner[0] == '(' || (same_word(inner[..3], "not") && (is_ws(inner[3]) || inner[3] == '('))) {
+            x = supports(inner);
+        } else {
+            x = declaration_supported(inner);
+        }
+        if first { v = x; first = false; }
+        else if joiner == 1 { v = v && x; }
+        else { v = v || x; }
+        i = skip_spaces(q, j + 1);
+        guard i < q.len else { break; }
+        guard !negate else { return false; }
+        let word_at = i;
+        while i < q.len && is_ident(q[i]) { i += 1; }
+        let word = q[word_at..i];
+        let join = if same_word(word, "and") { 1 } else if same_word(word, "or") { 2 } else { 0 };
+        guard join != 0 && (joiner == 0 || joiner == join) else { return false; }
+        joiner = join;
+    }
+    return if negate { !v } else { v };
+}
+
+// Whether Tusk reads `property: value` as a declaration: it knows the
+// property and takes the value.
+fn declaration_supported(decl: const u8[:]) -> bool {
+    let colon = find(decl, ":");
+    guard colon > 0 else { return false; }
+    // Displays Tusk lays out as blocks for now (M3): saying no keeps a
+    // page's fallbacks.
+    if same_word(trim(decl[..colon]), "display") {
+        let v = trim(decl[colon + 1..]);
+        if same_word(v, "grid") || same_word(v, "inline-grid") || same_word(v, "contents") || same_word(v, "subgrid") {
+            return false;
+        }
+    }
+    var out: Decl[>..] = [];
+    var bytes: u8[>..] = [];
+    parse_declarations(decl, out, bytes);
+    return out.len > 0;
+}
+
+// Whether element n links a style sheet for the screen: rel has the word
+// stylesheet and not alternate, it has an href, it isn't disabled, and its
+// media includes the screen.
+fn is_sheet_link(d: Doc, n: i32) -> bool {
+    guard d.nodes[n].kind == NODE_ELEMENT && node_name(d, n) == "link" else { return false; }
+    let rel, has_rel = attr_value(d, n, "rel");
+    let href, has_href = attr_value(d, n, "href");
+    let _, disabled = attr_value(d, n, "disabled");
+    guard has_rel && has_href && trim(href).len > 0 && !disabled else { return false; }
+    var sheet = false;
+    var alternate = false;
+    var word: u8[>..] = [];
+    for c, j in rel {
+        let blank = c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0c';
+        if !blank { word.push(if c >= 'A' && c <= 'Z' { c + 32 } else { c }); }
+        if blank || j == rel.len - 1 {
+            if word[..] == "stylesheet" { sheet = true; }
+            if word[..] == "alternate" { alternate = true; }
+            word.resize(0);
+        }
+    }
+    let media, has_media = attr_value(d, n, "media");
+    return sheet && !alternate && (!has_media || for_screen(media));
+}
+
+// Whether node n is inside a <template>, whose content is inert.
+fn in_template(d: Doc, n: i32) -> bool {
+    var p = d.nodes[n].parent;
+    while p >= 0 {
+        if is_element(d, p, "template") { return true; }
+        p = d.nodes[p].parent;
+    }
+    return false;
+}
+
+// The document's sheets in document order onto `out`: each <style> for the
+// screen with text, and each <link> to a sheet (is_sheet_link), but none in
+// a <template>.
+fn sheet_sources(d: Doc, out: i32[>..]&) {
+    for n, i in d.nodes {
+        guard n.kind == NODE_ELEMENT else { continue; }
+        let k = i as i32;
+        guard !in_template(d, k) else { continue; }
+        if n.first >= 0 && node_name(d, k) == "style" {
+            let media, has = attr_value(d, k, "media");
+            if !has || for_screen(media) { out.push(k); }
+        } else if is_sheet_link(d, k) {
+            out.push(k);
+        }
+    }
+}
+
+// The sheets sheet `src` imports: each @import before its first rule that
+// could be for the screen, its URL as written onto `hrefs` and its media
+// onto `medias` (empty: all), where each ends onto `ends` and `media_ends`
+// (CSS Cascade 4 §2.1). @charset and @layer statements may come before them.
+fn sheet_imports(src: const u8[:], hrefs: u8[>..]&, ends: i64[>..]&, medias: u8[>..]&, media_ends: i64[>..]&) {
+    var l = Lexer { src: src, pos: 0 };
+    if starts_with(src, "\xEF\xBB\xBF") { l.pos = 3; }
+    loop {
+        skip_ws_comments(l);
+        guard l.pos < src.len && src[l.pos] == '@' else { return; }
+        var e = l.pos + 1;
+        while e < src.len && is_ident(src[e]) { e += 1; }
+        var name: u8[>..] = [];
+        name.append(src[l.pos + 1..e]);
+        to_lower(name[..]);
+        var end = e;
+        while end < src.len && src[end] != ';' && src[end] != '{' {
+            if src[end] == '"' || src[end] == '\'' { end = skip_string(src, end); continue; }
+            end += 1;
+        }
+        guard end < src.len && src[end] == ';' else { return; }     // a block: rules have begun
+        if name[..] == "import" {
+            let href, rest = import_target(trim(src[e..end]));
+            let holds, media = import_conditions(rest);
+            if href.len > 0 && holds && (media.len == 0 || for_screen(media)) {
+                hrefs.append(href);
+                ends.push(hrefs.len);
+                medias.append(media);
+                media_ends.push(medias.len);
+            }
+        } else if name[..] != "charset" && name[..] != "layer" {
+            return;
+        }
+        l.pos = end + 1;
+    }
+}
+
+// What follows an @import's URL (Cascade 5 §2.1): a layer, `layer` or
+// `layer(name)`, which Tusk imports unlayered; then `supports(...)`, which
+// must hold; then the media list. Whether it holds, and the media list.
+fn import_conditions(rest: const u8[:]) -> bool, const u8[:] {
+    var r = trim(rest);
+    if starts_with(r, "layer") || starts_with(r, "LAYER") {
+        var i: i64 = 5;
+        if i < r.len && r[i] == '(' {
+            while i < r.len && r[i] != ')' { i += 1; }
+            i = min(i + 1, r.len);
+        }
+        guard i == r.len || is_ws(r[i]) || r[i] == 's' || r[i] == 'S' else { return true, r; }
+        r = trim(r[i..]);
+    }
+    if r.len > 9 && same_word(r[..9], "supports(") {
+        var depth = 0;
+        var i: i64 = 8;
+        while i < r.len {
+            if r[i] == '(' { depth += 1; } else if r[i] == ')' { depth -= 1; if depth == 0 { break; } }
+            i += 1;
+        }
+        guard i < r.len else { return false, r[0..0]; }
+        let cond = trim(r[9..i]);
+        let holds = if cond.len > 0 && (cond[0] == '(' || same_word(cond[..min(cond.len, 4)], "not ")
+                                         || same_word(cond[..min(cond.len, 9)], "selector("))
+                    { supports(cond) } else { declaration_supported(cond) };
+        return holds, trim(r[i + 1..]);
+    }
+    return true, r;
+}
+
+// An @import's URL and media: `url(x) m`, `url("x") m` or `"x" m`.
+fn import_target(p: const u8[:]) -> const u8[:], const u8[:] {
+    var i: i64 = 0;
+    if p.len > 4 && (p[0] == 'u' || p[0] == 'U') && (p[1] == 'r' || p[1] == 'R') && (p[2] == 'l' || p[2] == 'L')
+       && p[3] == '(' {
+        let close = find(p, ")");
+        guard close > 4 else { return p[0..0], p[0..0]; }
+        var inner = trim(p[4..close]);
+        if inner.len >= 2 && (inner[0] == '"' || inner[0] == '\'') && inner[inner.len - 1] == inner[0] {
+            inner = inner[1..inner.len - 1];
+        }
+        return inner, trim(p[close + 1..]);
+    }
+    guard p.len >= 2 && (p[0] == '"' || p[0] == '\'') else { return p[0..0], p[0..0]; }
+    i = 1;
+    while i < p.len && p[i] != p[0] { if p[i] == '\\' { i += 1; } i += 1; }
+    guard i < p.len else { return p[0..0], p[0..0]; }
+    return p[1..i], trim(p[i + 1..]);
 }
 
 // Whether a media attribute includes the screen: "screen", "all", or a
@@ -2744,6 +3626,22 @@ fn for_screen(media: const u8[:]) -> bool {
     var m: u8[>..] = [];
     m.append(media);
     to_lower(m[..]);
-    let t = trim(m[..]);
-    return t.len == 0 || find(t, "screen") >= 0 || find(t, "all") >= 0 || (find(t, "print") < 0 && find(t, "speech") < 0);
+    guard trim(m[..]).len > 0 else { return true; }
+    // A list could be for the screen when one of its queries could: one of
+    // conditions alone, of all or screen, or `not` another type. Whether its
+    // conditions hold is the window's to say (set_media).
+    var could = false;
+    each_split(m[..], ',') {
+        var q = trim(it);
+        if starts_with(q, "only ") { q = trim(q[5..]); }
+        var negate = false;
+        if starts_with(q, "not ") { negate = true; q = trim(q[4..]); }
+        var e: i64 = 0;
+        while e < q.len && is_ident(q[e]) { e += 1; }
+        let kind = q[..e];
+        let screen = kind.len == 0 || kind == "all" || kind == "screen";
+        let more = trim(q[e..]).len > 0;
+        if (negate && (!screen || more)) || (!negate && screen) { could = true; }
+    };
+    return could;
 }

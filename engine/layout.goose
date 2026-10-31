@@ -460,6 +460,30 @@ fn layout_page(L: const Layout&, width: f32, height: f32) -> f32 {
         node_matrices(L, 0, identity(), mats);
     }
     if clips { clip_items(L, mats); }
+    // The page scrolls as far as what it draws reaches, as a browser's
+    // viewport scrolls its overflow: an <html> or <body> 100% high (a page
+    // that sizes itself to the window, as Wikipedia's does) holds less than
+    // its content. What a clip cuts reaches only as far as the clip, and what
+    // it cuts away not at all; a shadow doesn't count. Neither does what is
+    // in a fixed box, which stays where the window is, nor what a transform
+    // moves, which transformed_bottom counts where it is drawn.
+    var left_out: bool[>..] = [];      // by node, in document order: parents first
+    for n, k in L.d.nodes {
+        let p = n.parent;
+        var out = p >= 0 && left_out[p];
+        if n.kind == NODE_ELEMENT && L.styles[k].position == K_FIXED { out = true; }
+        if transformed && transforms(L, k as i32) { out = true; }
+        left_out.push(out);
+    }
+    for it in L.items {
+        let shadow = (it.kind == ITEM_RECT || it.kind == ITEM_BOX) && (it.font & BOX_SHADOW) != 0;
+        guard it.kind != ITEM_NONE && !shadow else { continue; }
+        guard it.node < 0 || !left_out[it.node] else { continue; }
+        var bottom = it.y + it.h;
+        if it.clip_w > 0.0 { bottom = min(bottom, it.clip_y + it.clip_h); }
+        if it.oclip_w > 0.0 { bottom = min(bottom, it.oclip_y + it.oclip_h); }
+        page_h = max(page_h, bottom);
+    }
     if transformed {
         transform_items(L, mats);
         transform_boxes(L, mats);
@@ -497,7 +521,7 @@ fn is_flex(L: const Layout&, n: i32) -> bool {
 fn is_atomic(L: const Layout&, n: i32) -> bool {
     guard L.d.nodes[n].kind == NODE_ELEMENT else { return false; }
     let d = L.styles[n].display;
-    return d == K_INLINE_BLOCK || d == K_INLINE_FLEX || (d == K_INLINE && L.styles[n].svg == 1);
+    return d == K_INLINE_BLOCK || d == K_INLINE_FLEX || (d == K_INLINE && replaced(L.styles[n]));
 }
 
 // An <svg>'s content box, w × h, sized from style s as a replaced element
@@ -534,8 +558,10 @@ fn svg_size_of(L: const Layout&, n: i32, s: const Style&, avail: f32, height: f3
     // A minimum beats a maximum.
     hi_w = max(hi_w, lo_w);
     hi_h = max(hi_h, lo_h);
-    let ratio = view_ratio(L.d, n);
+    let ratio = if s.svg == 3 { image_ratio(L.d, n) } else { view_ratio(L.d, n) };
     if w >= 0.0 && h >= 0.0 { return clamp(w, lo_w, hi_w), clamp(h, lo_h, hi_h); }
+    // An <img> whose size nothing says yet takes no room until it is decoded.
+    if s.svg == 3 && ratio <= 0.0 { return clamp(max(w, 0.0), lo_w, hi_w), clamp(max(h, 0.0), lo_h, hi_h); }
     if w >= 0.0 {
         let cw = clamp(w, lo_w, hi_w);
         return cw, clamp(if ratio > 0.0 { cw * ratio } else { 150.0 }, lo_h, hi_h);
@@ -555,6 +581,18 @@ fn svg_size_of(L: const Layout&, n: i32, s: const Style&, avail: f32, height: f3
         th = 300.0 * ratio;
     }
     return within(tw, th, lo_w, hi_w, lo_h, hi_h);
+}
+
+// An <img>'s ratio, height over width, from its width and height
+// attributes (HTML §15.4.3, as browsers map them); -1 without both.
+fn image_ratio(d: Doc, n: i32) -> f32 {
+    let wv, has_w = attr_value(d, n, "width");
+    let hv, has_h = attr_value(d, n, "height");
+    guard has_w && has_h else { return -1.0; }
+    let w, wok = parse_flt(trim(wv));
+    let h, hok = parse_flt(trim(hv));
+    guard wok && hok && w > 0.0 && h > 0.0 else { return -1.0; }
+    return (h / w) as f32;
 }
 
 // No maximum.
@@ -715,8 +753,9 @@ recursive fn layout_block(L: const Layout&, n: i32, x: f32, y: f32, avail: f32) 
         if max_height < 0.0 && s.max_height_pct >= 0.0 { max_height = cb_h * s.max_height_pct / 100.0; }
     }
     L.definite[n] = if height >= 0.0 { fit_height(s, 0.0, vt, height, min_height, max_height) } else { -1.0 };
-    // An <svg> is a replaced element: its size is its own, its content paths.
-    let svg = s.svg == 1;
+    // An <svg> or an <img> is a replaced element: its size is its own, and
+    // an <svg>'s content paths.
+    let svg = replaced(s);
     var svg_h: f32 = 0.0;
     var w: f32 = 0.0;
     if svg {
@@ -768,7 +807,9 @@ recursive fn layout_block(L: const Layout&, n: i32, x: f32, y: f32, avail: f32) 
     let h = vt + ch;
     box_paint(L, n, s, canvas, paint_at, bx, y, bw, h);
     if s.display == K_LIST_ITEM { paint_marker(L, n, bx + s.bl + s.pl, first); }
-    if svg { svg_items(L, n, bx + s.bl + s.pl, y + s.bt + s.pt, w, ch); }
+    // An <img> draws nothing of its own until it is decoded: its box and
+    // background show.
+    if svg && s.svg == 1 { svg_items(L, n, bx + s.bl + s.pl, y + s.bt + s.pt, w, ch); }
     L.boxes[n] = Rect { x: bx, y: y, w: bw, h: h };
     return h, first, mb;
 }
@@ -1487,7 +1528,7 @@ recursive fn place_atomic(L: const Layout&, line: Line&, n: i32) {
     let hz = s.bl + s.pl + s.pr + s.br;
     let inside: f32 = if s.border_box != 0 { hz } else { 0.0 };
     var w: f32 = 0.0;
-    if s.svg == 1 {
+    if replaced(s) {
         // An <svg> on a line is as wide as a block one would be in its place.
         let sw, sh = svg_size(L, n, s, line.width);
         w = sw;
@@ -1801,7 +1842,11 @@ fn clips_content(L: const Layout&, n: i32) -> bool {
 
 // Whether a styled element is a box that overflow and transforms apply to:
 // not an inline box, though an <svg> on a line is one, being replaced.
-fn is_box(s: const Style&) -> bool { return s.display != K_INLINE || s.svg == 1; }
+fn is_box(s: const Style&) -> bool { return s.display != K_INLINE || replaced(s); }
+
+// Whether an element is replaced, sized as CSS 2.2 §10.3.2 says: an <svg> in
+// HTML, or an <img>.
+fn replaced(s: const Style&) -> bool { return s.svg == 1 || s.svg == 3; }
 
 // Moves each relatively positioned element, and everything in it, by its
 // offsets (CSS 2.2 §9.4.3): the items they paint and their boxes.
@@ -1869,7 +1914,7 @@ recursive fn content_widths(L: const Layout&, n: i32) -> f32, f32 {
     let s .= L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;
     let inside: f32 = if s.border_box != 0 { 0.0 } else { hz };
-    if s.svg == 1 {
+    if replaced(s) {
         let sw, sh = svg_size(L, n, s, -1.0);
         return sw + hz, sw + hz;
     }
@@ -1892,7 +1937,7 @@ recursive fn content_widths(L: const Layout&, n: i32) -> f32, f32 {
 recursive fn inner_widths(L: const Layout&, n: i32) -> f32, f32 {
     let s .= L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;
-    if s.svg == 1 {
+    if replaced(s) {
         // What is in an <svg> is drawn to its size.
         let sw, sh = svg_size(L, n, s, -1.0);
         return sw + hz, sw + hz;
@@ -2674,7 +2719,7 @@ recursive fn size_item(L: const Layout&, i: i64, n: i32, row: bool, main_size: f
     else if s.basis_kind == 2 && main_size >= 0.0 { base = main_size * s.basis / 100.0 - inside; }
     else if s.basis_kind == K_AUTO { base = size; }
     // overflow doesn't make a replaced element a scroll container.
-    let auto_min = (if row { s.min_w_auto } else { s.min_h_auto }) != 0 && (s.clips == 0 || s.svg == 1);
+    let auto_min = (if row { s.min_w_auto } else { s.min_h_auto }) != 0 && (s.clips == 0 || replaced(s));
     var least: f32 = 0.0;
     var most: f32 = 0.0;
     if base < 0.0 || auto_min {

@@ -17,6 +17,7 @@ import engine.html;
 import engine.css;
 import engine.layout;
 import .tab;
+import .net;
 
 extern "tusk_platform" {
     fn tp_set_layer(layer: i32, items: const DItem[:], text: const u8[:], paths: const f32[:], scale: f32) -> i32;
@@ -27,17 +28,36 @@ struct UiFiles { css: u8[>..]&, sprite: u8[>..]&, rest: u8[>..]&, run: u8[>..]& 
 
 // What the interface shows that isn't a tab's: the window's size, where the
 // traffic lights end in its bar (0: none), which tab is shown, the dev panel
-// and its tab, the window's oil (MB), CPU (%) and frames a second, and
-// whether the boar is out running a load.
+// and its tab, the window's oil (MB), the Mac's memory in use and in all
+// (MB), the window's CPU and the whole Mac's (%, of all its cores), its
+// frames a second, whether the boar is out running a load, whether the tab
+// shown can go back and forward, and whether the address bar is being typed
+// in, where its caret is (a byte of UiText.edit) and whether all of it is
+// selected.
 struct Ui {
     w: f32, h: f32, lights: f32, cur: i64, dev: bool, dev_tab: i32,
-    oil: f32, cpu: f32, fps: i32, running: bool,
+    oil: f32, mac_used: f32, mac_total: f32, cpu: f32, mac_cpu: f32, fps: i32, running: bool,
+    back: bool, forward: bool, editing: bool, caret: i64, all: bool,
 }
 
-// What it reads of the main thread's strings: the pages' paths, one after
-// another, where each ends and where its file name starts; and the notes the
-// tabs' spans point into (Tab).
-struct UiText { paths: u8[>..]&, path_ends: i64[>..]&, names: i64[>..]&, notes: u8[>..]& }
+// What a click on the interface does: its elements' data-action.
+let ACT_NONE: i32 = 0;
+let ACT_BACK: i32 = 1;
+let ACT_FORWARD: i32 = 2;
+let ACT_RELOAD: i32 = 3;
+let ACT_ADDRESS: i32 = 4;
+
+fn action_of(name: const u8[:]) -> i32 {
+    if name == "back" { return ACT_BACK; }
+    if name == "forward" { return ACT_FORWARD; }
+    if name == "reload" { return ACT_RELOAD; }
+    if name == "address" { return ACT_ADDRESS; }
+    return ACT_NONE;
+}
+
+// What it reads of the main thread's strings: the notes the tabs' spans
+// point into (Tab), and the address bar's text while it is typed in.
+struct UiText { notes: u8[>..]&, edit: u8[>..]& }
 
 // The dev panel's tabs.
 let DEV_CONSOLE: i32 = 0;
@@ -50,7 +70,6 @@ let BAR_H: f32 = 40.0;           // the top bar
 let PANEL_H: f32 = 60.0;         // the bottom panel; it never grows
 let DEV_W: f32 = 360.0;          // the dev panel, beside the content
 let LOADER_H: f32 = 56.0;        // the loader, over the content's foot
-let BUDGET_MB: f32 = 1000.0;     // the oil the window may burn
 let DROP: const u8[:] = "M12 1C12 1 2 13 2 20a10 10 0 0 0 20 0C22 13 12 1 12 1Z";
 
 fn read_ui(F: UiFiles) -> bool {
@@ -93,23 +112,87 @@ fn icon(out: u8[>..]&, name: const u8[:]) {
     format(out, "<svg class=\"i\" aria-hidden=\"true\"><use href=\"#", name, "\"/></svg>");
 }
 
+// An icon that does `action` when clicked; dimmed, and doing nothing, when
+// it can't.
+fn action_icon(out: u8[>..]&, name: const u8[:], action: const u8[:], can: bool) {
+    format(out, "<svg class=\"i", if can { "" } else { " off" }, "\" aria-hidden=\"true\"");
+    if can { format(out, " data-action=\"", action, "\""); }
+    format(out, "><use href=\"#", name, "\"/></svg>");
+}
+
 fn drop_icon(out: u8[>..]&) {
     format(out, "<svg viewBox=\"0 0 24 31\" aria-hidden=\"true\"><path d=\"", DROP, "\"/></svg>");
 }
 
 fn note(T: UiText, at: i64, len: i64) -> const u8[:] { return T.notes[at..at + len]; }
-fn path_of(T: UiText, k: i64) -> const u8[:] { return T.paths[(if k == 0 { 0 } else { T.path_ends[k - 1] })..T.path_ends[k]]; }
-fn name_of(T: UiText, k: i64) -> const u8[:] { return T.paths[T.names[k]..T.path_ends[k]]; }
 
-// What a tab is called: its title, or else its file's name.
-fn title_of(t: Tab, T: UiText, k: i64) -> const u8[:] {
-    return if t.title_len > 0 { note(T, t.title_at, t.title_len) } else { name_of(T, k) };
+// How many things went wrong loading tab t's page: itself failing, and each
+// line of its log.
+fn errors_of(t: Tab, T: UiText) -> i64 {
+    var n: i64 = if t.failed { 1 } else { 0 };
+    for c in note(T, t.log_at, t.log_len) { if c == '\n' { n += 1; } }
+    return n;
 }
 
-// The board the pages are on: the folder the first one is in.
-fn board_of(T: UiText) -> const u8[:] {
-    let p = path_of(T, 0);
-    let end = T.names[0] - 1;
+// Where tab t is: its file's path, or its page's URL.
+fn loc_of(t: Tab, T: UiText) -> const u8[:] { return note(T, t.loc_at, t.loc_len); }
+
+// Where the host of web address `loc` starts and ends, its port included:
+// past "://" and any user's name and password, up to the path. For a file's
+// path, 0 and 0.
+fn host_span(loc: const u8[:]) -> i64, i64 {
+    let s = find(loc, "://");
+    guard s > 0 && is_web(loc) else { return 0, 0; }
+    var a = s + 3;
+    var b = a;
+    while b < loc.len && loc[b] != '/' && loc[b] != '?' && loc[b] != '#' {
+        if loc[b] == '@' { a = b + 1; }      // past a user's name and password
+        b += 1;
+    }
+    return a, b;
+}
+
+// Where the last step of `loc`'s path starts: past its last '/' before any
+// query or fragment. A file's path has neither: '?' and '#' are in its name.
+fn last_step(loc: const u8[:]) -> i64 {
+    var end = loc.len;
+    if is_web(loc) { for c, j in loc { if (c == '?' || c == '#') && j < end { end = j; break; } } }
+    var name: i64 = 0;
+    for j in 0..end { if loc[j] == '/' { name = j + 1; } }
+    return name;
+}
+
+// What tab t's page is called without a title: its file's name, or the last
+// step of its URL's path, or its host.
+fn name_of(t: Tab, T: UiText) -> const u8[:] {
+    let loc = loc_of(t, T);
+    let h0, h1 = host_span(loc);
+    let name = last_step(loc);
+    var end = loc.len;
+    if h1 > h0 { for c, j in loc { if (c == '?' || c == '#') && j >= name { end = j; break; } } }
+    if h1 > h0 && (name <= h1 || name >= end) { return loc[h0..h1]; }
+    return loc[name..end];
+}
+
+// Where tab t's page comes from, for its header: its host, or its file's name.
+fn site_of(t: Tab, T: UiText) -> const u8[:] {
+    let loc = loc_of(t, T);
+    let h0, h1 = host_span(loc);
+    return if h1 > h0 { loc[h0..h1] } else { name_of(t, T) };
+}
+
+// What a tab is called: its title, or else name_of.
+fn title_of(t: Tab, T: UiText) -> const u8[:] {
+    return if t.title_len > 0 { note(T, t.title_at, t.title_len) } else { name_of(t, T) };
+}
+
+// The board the pages are on: the folder the first one is in, or the host
+// of its page.
+fn board_of(tabs: const Tab[:], T: UiText) -> const u8[:] {
+    let p = loc_of(tabs[0], T);
+    let h0, h1 = host_span(p);
+    guard h1 <= h0 else { return p[h0..h1]; }
+    let end = last_step(p) - 1;
     var start: i64 = 0;
     guard end > 0 else { return "Pages"; }
     for j in 0..end { if p[j] == '/' { start = j + 1; } }
@@ -120,6 +203,7 @@ fn board_of(T: UiText) -> const u8[:] {
 
 // The interface's document for tabs `tabs`, onto `out`.
 fn ui_html(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, frames: const f32[:], dropped: i32, rebuild_ms: f32,
+           rows: const NetRow[:], urls: const u8[:],
            out: u8[>..]&) {
     out.append("<!doctype html><meta charset=\"utf-8\"><title>Tusk</title><style>");
     out.append(F.css);
@@ -133,42 +217,97 @@ fn ui_html(F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText, frames: const f32[:
     let t = tabs[U.cur];
     let cw = if U.dev { max(U.w - DEV_W, 0.0) } else { U.w };
     let ch = max(U.h - BAR_H - PANEL_H, 0.0);
-    bar(out, U, t, T);
+    bar(out, U, tabs, T);
     content(out, U, t, T, cw, ch);
-    if U.dev { dev_panel(out, U, tabs, T, cw, ch, frames, dropped, rebuild_ms); }
+    if U.dev { dev_panel(out, U, tabs, T, cw, ch, rows, urls, frames, dropped, rebuild_ms); }
     panel(out, F, U, tabs, T);
     out.append("</div>");
 }
 
 // The top bar: the board, back, forward, reload, the address; then board
 // view, the command bar and the dev panel's switch.
-fn bar(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
+fn bar(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText) {
+    let t = tabs[U.cur];
     // The design leaves the traffic lights up to 72 points; AppKit's own may
     // need more, and the plate, the arrows and the address make way.
     let shift = max(U.lights + 10.0 - 72.0, 0.0);
     out.append("<div class=\"bar\" data-drag><span class=\"plate\" data-nodrag style=\"left:");
     px(out, 72.0 + shift);
     out.append("\"><span class=\"bn\">");
-    esc(out, board_of(T));
+    esc(out, board_of(tabs, T));
     out.append("</span>");
     icon(out, "i-chev-r");
     out.append("</span><span class=\"nav\" data-nodrag style=\"left:");
     px(out, 168.0 + shift);
     out.append("\">");
-    icon(out, "i-chev-l");
-    icon(out, "i-chev-r");
-    icon(out, "i-reload");
+    action_icon(out, "i-chev-l", "back", U.back);
+    action_icon(out, "i-chev-r", "forward", U.forward);
+    action_icon(out, "i-reload", "reload", true);
     let url_w = max(U.w - 290.0 - shift - 190.0, 120.0);
-    out.append("</span><span class=\"url\" data-nodrag style=\"left:");
+    format(out, "</span><span class=\"url", if U.editing { " editing" } else { "" }, "\" data-nodrag data-action=\"address\" style=\"left:");
     px(out, 290.0 + shift);
     out.append("; width:");
     px(out, url_w);
-    out.append("\"><span class=\"env\">FILE</span><span class=\"u\"><i>file://</i>");
-    let p = path_of(T, U.cur);
-    let name = T.names[U.cur] - (if U.cur == 0 { 0 } else { T.path_ends[U.cur - 1] });
-    // A long path loses its start, from a folder on, so that the file's name
-    // shows: about 7.5 points a character, after the badge and the scheme.
-    let room = ((url_w - 120.0) / 7.5) as i64;
+    out.append("\">");
+    if U.editing { typing(out, T.edit[..], U.caret, U.all, ((url_w - 40.0) / 7.5) as i64); }
+    else { address(out, loc_of(t, T), ((url_w - 120.0) / 7.5) as i64); }
+    out.append("</span><span class=\"tools\" data-nodrag><span class=\"bv\">");
+    icon(out, "i-grid");
+    out.append("<kbd>⌘B</kbd></span><kbd>⌘K</kbd><span");
+    if U.dev { out.append(" class=\"on\""); }
+    out.append(">");
+    icon(out, "i-code");
+    out.append("</span></span></div>");
+}
+
+// Where a page is, in the bar, as `room` characters at most fit (about 7.5
+// points each, after the badge). The badge says what the address doesn't, so
+// the scheme isn't written again after it. A file: FILE, and its path, which
+// loses its start from a folder on so that its name shows. A web page: HTTPS
+// or HTTP, its host in bold, its port, and its path, which loses its end; on
+// this Mac, LOCAL, and then its scheme, which LOCAL doesn't say.
+fn address(out: u8[>..]&, p: const u8[:], room: i64) {
+    let h0, h1 = host_span(p);
+    if h1 > h0 {
+        var host_end = h1;
+        for j in h0..h1 { if p[j] == ':' { host_end = j; } }
+        if host_end < h1 && p[h1 - 1] == ']' { host_end = h1; }  // an IPv6 address, no port
+        let host = p[h0..host_end];
+        let local = host == "localhost" || host == "127.0.0.1" || host == "[::1]" || ends_with(host, ".localhost");
+        out.append("<span class=\"env\">");
+        if local { out.append("LOCAL"); }
+        else { for c in p[..find(p, "://")] { out.push(if c >= 'a' && c <= 'z' { c - 32 } else { c }); } }
+        out.append("</span><span class=\"u\">");
+        if local {
+            // The scheme alone: a user's name and password stay out of the bar.
+            out.append("<i>");
+            esc(out, p[..find(p, "://") + 3]);
+            out.append("</i>");
+        }
+        out.append("<b>");
+        esc(out, host);
+        out.append("</b>");
+        if host_end < h1 {
+            out.append("<em>");
+            esc(out, p[host_end..h1]);
+            out.append("</em>");
+        }
+        let rest = p[h1..];
+        let left = room - (h1 - h0);
+        if rest.len > left && left > 1 {
+            // Cut before a character, not inside one.
+            var cut = left - 1;
+            while cut > 0 && (rest[cut] & 0xC0) == 0x80 { cut -= 1; }
+            esc(out, rest[..cut]);
+            out.append("…");
+        } else {
+            esc(out, rest);
+        }
+        out.append("</span>");
+        return;
+    }
+    out.append("<span class=\"env\">FILE</span><span class=\"u\">");
+    let name = last_step(p);
     var from: i64 = 0;
     if p.len > room {
         from = min(p.len - room, name);
@@ -178,13 +317,30 @@ fn bar(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
     esc(out, p[from..name]);
     out.append("<b>");
     esc(out, p[name..]);
-    out.append("</b></span></span><span class=\"tools\" data-nodrag><span class=\"bv\">");
-    icon(out, "i-grid");
-    out.append("<kbd>⌘B</kbd></span><kbd>⌘K</kbd><span");
-    if U.dev { out.append(" class=\"on\""); }
-    out.append(">");
-    icon(out, "i-code");
-    out.append("</span></span></div>");
+    out.append("</b></span>");
+}
+
+// The address bar's text being typed: all of it selected, or a caret at byte
+// `caret`. When more than `room` characters, it shows the end up to the caret.
+fn typing(out: u8[>..]&, s: const u8[:], caret: i64, all: bool, room: i64) {
+    out.append("<span class=\"u\">");
+    var from: i64 = 0;
+    if s.len > room && room > 4 {
+        from = max(min(caret, s.len) - room + 2, 0);
+        while from < s.len && (s[from] & 0xC0) == 0x80 { from += 1; }
+        if from > 0 { out.append("…"); }
+    }
+    if all {
+        out.append("<mark>");
+        esc(out, s[from..]);
+        out.append("</mark>");
+    } else {
+        let c = max(min(caret, s.len), from);
+        esc(out, s[from..c]);
+        out.append("<i class=\"caret\"></i>");
+        esc(out, s[c..]);
+    }
+    out.append("</span>");
 }
 
 // The content: the page in focus, its header over its slot.
@@ -200,11 +356,12 @@ fn content(out: u8[>..]&, U: Ui, t: Tab, T: UiText, cw: f32, ch: f32) {
     out.append("\"><div class=\"pgh focus\"><span class=\"fv\">");
     icon(out, "i-globe");
     out.append("</span><b>");
-    esc(out, title_of(t, T, U.cur));
+    esc(out, title_of(t, T));
     out.append("</b><span class=\"host\">");
-    esc(out, name_of(T, U.cur));
+    esc(out, site_of(t, T));
     out.append("</span><span class=\"pgr\">");
-    if t.failed { out.append("<span class=\"sdot er\" aria-label=\"1 error\">1</span>"); }
+    let errors = errors_of(t, T);
+    if errors > 0 { format(out, "<span class=\"sdot er\" aria-label=\"", errors, if errors == 1 { " error" } else { " errors" }, "\">", errors, "</span>"); }
     else if t.ready { out.append("<span class=\"sdot ok\" aria-label=\"Loaded\"></span>"); }
     else { out.append("<span class=\"sdot run\" aria-label=\"Loading\"></span>"); }
     out.append("<span class=\"pga\">");
@@ -223,7 +380,7 @@ fn content(out: u8[>..]&, U: Ui, t: Tab, T: UiText, cw: f32, ch: f32) {
 }
 
 // The dev panel: the page's line, then its tabs.
-fn dev_panel(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText, cw: f32, ch: f32,
+fn dev_panel(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText, cw: f32, ch: f32, rows: const NetRow[:], urls: const u8[:],
              frames: const f32[:], dropped: i32, rebuild_ms: f32) {
     let t = tabs[U.cur];
     out.append("<aside class=\"devp\" style=\"left:");
@@ -231,28 +388,31 @@ fn dev_panel(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText, cw: f32, ch: f
     out.append("; height:");
     px(out, ch);
     out.append("\"><div class=\"dph\"><div class=\"ro\"><div class=\"r1\">");
-    page_line(out, t);
+    page_line(out, t, errors_of(t, T), rows);
     out.append("</div></div></div><div class=\"dpt\"><div class=\"dtabs\">");
     let names: const u8[:][5] = ["Console", "Network", "Elements", "Frames", "Oil"];
     for name, k in names {
         out.append(if k == U.dev_tab { "<span class=on>" } else { "<span>" });
         if k == DEV_OIL { drop_icon(out); }
         out.append(name);
-        if k == DEV_CONSOLE && t.failed { out.append("<em>1</em>"); }
+        if k == DEV_CONSOLE && errors_of(t, T) > 0 { format(out, "<em>", errors_of(t, T), "</em>"); }
         out.append("</span>");
     }
     out.append("</div>");
     if U.dev_tab == DEV_CONSOLE { console(out, U, t, T); }
-    else if U.dev_tab == DEV_NETWORK { network(out, U, t, T); }
+    else if U.dev_tab == DEV_NETWORK {
+        if rows.len > 0 { network_log(out, t, T, rows, urls); } else { network(out, U, t, T); }
+    }
     else if U.dev_tab == DEV_ELEMENTS { elements(out, t, T); }
     else if U.dev_tab == DEV_FRAMES { frame_graph(out, frames, dropped, rebuild_ms); }
     else { oil(out, U, tabs, T); }
     out.append("</div></aside>");
 }
 
-// The page's line: its status, requests, size, errors and load time. A file
-// is one request; its status is OK once read.
-fn page_line(out: u8[>..]&, t: Tab) {
+// The page's line: its status, requests, size, `errors` and load time. A
+// web page's requests and size are its log's (`rows`); a file is one
+// request, and its status is OK once read.
+fn page_line(out: u8[>..]&, t: Tab, errors: i64, rows: const NetRow[:]) {
     if t.failed {
         out.append("<span class=\"st er\">ERR</span><span><b>1</b> req</span><span><b>0.0</b> KB</span>");
         out.append("<span class=\"er\"><b>1</b> err</span>");
@@ -263,9 +423,18 @@ fn page_line(out: u8[>..]&, t: Tab) {
         out.append("</b> ms</span>");
         return;
     } else {
-        out.append("<span class=\"st ok\">OK</span><span><b>1</b> req</span><span><b>");
-        format_flt(out, t.info.bytes / 1000.0, 1);
-        out.append("</b> KB</span><span><b>0</b> err</span>");
+        // An HTTP error is a page too: it shows, with its status.
+        if t.status >= 400 { format(out, "<span class=\"st er\">", t.status, "</span>"); }
+        else { out.append("<span class=\"st ok\">OK</span>"); }
+        var bytes: i64 = t.info.bytes;
+        if rows.len > 0 {
+            bytes = 0;
+            for r in rows { bytes += r.bytes; }
+        }
+        format(out, "<span><b>", max(rows.len, 1), "</b> req</span><span><b>");
+        format_flt(out, bytes / 1000.0, 1);
+        out.append("</b> KB</span>");
+        format(out, if errors > 0 { "<span class=\"er\"><b>" } else { "<span><b>" }, errors, "</b> err</span>");
     }
     out.append("<span><b>");
     format(out, t.load_ms as i64);
@@ -279,13 +448,24 @@ fn console(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
         esc(out, note(T, t.why_at, t.why_len));
         out.append("</span><em>tusk</em></p>");
     } else if t.ready {
-        out.append("<p class=\"cl inf\"><span class=\"x\"></span><span class=\"msg\">Read ");
+        out.append("<p class=\"cl inf\"><span class=\"x\"></span><span class=\"msg\">");
+        out.append(if t.status > 0 { "Loaded " } else { "Read " });
         format_flt(out, t.info.bytes / 1000.0, 1);
         out.append(" KB; ");
         group(out, t.info.nodes);
         out.append(" nodes parsed, styled and laid out in ");
         format(out, t.load_ms as i64);
         out.append(" ms</span><em>tusk</em></p><p class=\"cl inf\"><span class=\"x\"></span><span class=\"msg\">Scripts don't run yet</span><em>tusk</em></p>");
+    }
+    // What went wrong loading it, a line each.
+    let log = note(T, t.log_at, t.log_len);
+    var from: i64 = 0;
+    for c, j in log {
+        guard c == '\n' else { continue; }
+        out.append("<p class=\"cl er\"><span class=\"x\">✕</span><span class=\"msg\">");
+        esc(out, log[from..j]);
+        out.append("</span><em>css</em></p>");
+        from = j + 1;
     }
     out.append("<p class=\"cl\"><span class=\"x pr\">›</span><i class=\"caret\"></i></p></div>");
 }
@@ -316,7 +496,7 @@ fn network(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
         out.append("</s>");
     }
     out.append("</span></div><div class=\"nr\"><span>");
-    esc(out, name_of(T, U.cur));
+    esc(out, name_of(t, T));
     out.append("</span><span>OK</span><span class=\"r\">");
     format(out, load as i64);
     out.append(" ms</span><span class=\"wfc\">");
@@ -325,11 +505,100 @@ fn network(out: u8[>..]&, U: Ui, t: Tab, T: UiText) {
     out.append("<b class=\"dom\" style=\"left:");
     format_flt(out, dom / load * 100.0, 2);
     out.append("%\"></b></span></div></div><div class=\"ndet\"><p><b>");
-    esc(out, name_of(T, U.cur));
+    esc(out, name_of(t, T));
     out.append("</b> · the document</p><ul class=\"tim\">");
     let phases: const u8[:][5] = ["Reading", "Parsing", "Styling", "Measuring text", "Layout"];
     let kinds: const u8[:][5] = ["w", "d", "d", "d", "d"];
     let times: f32[5] = [i.read, i.parse, i.style, i.measure, i.layout];
+    var most: f32 = 0.01;
+    for v in times { most = max(most, v); }
+    for name, k in phases {
+        format(out, "<li><span>", name, "</span><i class=\"", kinds[k], "\" style=\"width:");
+        format_flt(out, times[k] / most * 100.0, 0);
+        out.append("%\"></i><b>");
+        format_flt(out, times[k], 1);
+        out.append(" ms</b></li>");
+    }
+    out.append("</ul></div>");
+}
+
+// What a request is called in the Network tab: the last step of its URL's
+// path, or its host.
+fn row_name(url: const u8[:]) -> const u8[:] {
+    let h0, h1 = host_span(url);
+    let name = last_step(url);
+    var end = url.len;
+    for c, j in url { if (c == '?' || c == '#') && j >= name { end = j; break; } }
+    if name > h1 && name < end { return url[name..end]; }
+    return url[h0..h1];
+}
+
+let NET_ROWS_SHOWN: i64 = 30;
+
+// A web page's requests, as its log has them (platform/src/net.rs), on the
+// scale of the whole load: each with its status, its time and its phases,
+// connecting (look-up, TCP, TLS), waiting for the first byte and the
+// download; then the document's phases in detail, the network's and Tusk's
+// own.
+fn network_log(out: u8[>..]&, t: Tab, T: UiText, rows: const NetRow[:], urls: const u8[:]) {
+    let i = t.info;
+    var bytes: i64 = 0;
+    var end: f32 = 0.01;
+    for r in rows {
+        bytes += r.bytes;
+        end = max(end, r.start + r.total);
+    }
+    let ours = i.parse + i.style + i.measure + i.layout;
+    let load = max(max(t.load_ms, end + ours), 0.01);
+    out.append("<div class=\"nbar\"><span class=\"flt\">Filter</span><span class=\"sum\">");
+    format(out, rows.len, if rows.len == 1 { " req · " } else { " reqs · " });
+    format_flt(out, bytes / 1000.0, 1);
+    out.append(" KB · load ");
+    format(out, load as i64);
+    out.append(" ms</span></div><div class=\"nt\"><div class=\"nr hd\"><span>Name</span><span>Status</span><span class=\"r\">Time</span><span class=\"wfc ax\">");
+    for q in 4 {
+        out.append("<s style=\"left:");
+        format_flt(out, q * 25.0, 1);
+        out.append("%\">");
+        format(out, (load * q / 4.0) as i64);
+        out.append("</s>");
+    }
+    out.append("</span></div>");
+    for r, k in rows {
+        guard k < NET_ROWS_SHOWN else { break; }
+        let failed = r.error != 0 || r.status >= 400;
+        format(out, "<div class=\"nr", if failed { " er" } else { "" }, "\"><span>");
+        esc(out, row_name(urls[r.url_at..r.url_at + r.url_len]));
+        out.append("</span><span>");
+        if r.error != 0 { out.append("ERR"); } else { format(out, r.status); }
+        out.append("</span><span class=\"r\">");
+        if (r.flags & ROW_CACHED) != 0 { out.append("cache"); } else { format(out, r.total as i64, "ms"); }
+        out.append("</span><span class=\"wfc\">");
+        let setup = r.dns + r.connect + r.tls;
+        if setup > 0.0 { bar_at(out, "c", r.start, setup, load); }
+        bar_at(out, "w", r.start + setup, max(r.wait, load / 200.0), load);
+        bar_at(out, "d", r.start + setup + r.wait, max(r.download, load / 200.0), load);
+        out.append("</span></div>");
+    }
+    if rows.len > NET_ROWS_SHOWN { format(out, "<div class=\"nr\"><span>And ", rows.len - NET_ROWS_SHOWN, " more</span></div>"); }
+    // The document: the first request to end, before any of its sheets.
+    let d = rows[0];
+    out.append("</div><div class=\"ndet\"><p><b>");
+    esc(out, row_name(urls[d.url_at..d.url_at + d.url_len]));
+    out.append("</b> · ");
+    out.append(if d.proto == 3 { "HTTP/3" } else if d.proto == 2 { "HTTP/2" } else if d.proto == 1 { "HTTP/1.1" } else { "the document" });
+    if (d.flags & ROW_CACHED) != 0 { out.append(" · from the cache"); }
+    else if (d.flags & ROW_REUSED) != 0 { out.append(" · a connection already open"); }
+    if d.wire > 0 && d.wire != d.bytes {
+        out.append(" · ");
+        format_flt(out, d.wire / 1000.0, 1);
+        out.append(" KB over the wire");
+    }
+    out.append("</p><ul class=\"tim\">");
+    let phases: const u8[:][9] = ["Looking up", "Connecting", "TLS", "Waiting", "Downloading", "Parsing", "Styling",
+                                  "Measuring text", "Layout"];
+    let kinds: const u8[:][9] = ["c", "c", "c", "w", "d", "d", "d", "d", "d"];
+    let times: f32[9] = [d.dns, d.connect, d.tls, d.wait, d.download, i.parse, i.style, i.measure, i.layout];
     var most: f32 = 0.01;
     for v in times { most = max(most, v); }
     for name, k in phases {
@@ -422,21 +691,21 @@ fn frame_graph(out: u8[>..]&, frames: const f32[:], dropped: i32, rebuild_ms: f3
 
 // The window's oil, and what each page weighs.
 fn oil(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText) {
-    out.append("<div class=\"oilv\"><div class=\"oilh\"><span><b>");
-    format_flt(out, U.oil, 1);
-    out.append("</b> of 1,000 MB</span>");
-    gauge(out, U.oil);
+    out.append("<div class=\"oilv\"><div class=\"oilh\"><span>");
+    weights(out, U);
+    out.append("</span>");
+    gauge(out, U);
     out.append("</div><ul><li class=\"bd\"><b>");
-    esc(out, board_of(T));
+    esc(out, board_of(tabs, T));
     out.append("</b><small>in play</small><span class=\"v\">");
     format_flt(out, U.oil, 1);
     out.append(" MB</span><i style=\"width:");
-    format_flt(out, min(U.oil / BUDGET_MB * 100.0, 100.0), 1);
+    format_flt(out, min(U.oil / max(U.mac_total, 1.0) * 100.0, 100.0), 2);
     out.append("%\"></i></li>");
     for t, k in tabs {
         out.append("<li class=\"pgr\"><span>");
         icon(out, "i-globe");
-        esc(out, title_of(t, T, k));
+        esc(out, title_of(t, T));
         out.append("</span><span class=\"v\">");
         format_flt(out, t.info.bytes / 1000.0, 1);
         out.append(" KB of HTML</span></li>");
@@ -445,22 +714,51 @@ fn oil(out: u8[>..]&, U: Ui, tabs: const Tab[:], T: UiText) {
 }
 
 // Ten drops of 100 MB against the budget; the last fills to the level.
-fn gauge(out: u8[>..]&, mb: f32) {
-    let level = mb / BUDGET_MB * 10.0;
-    out.append("<span class=\"oilg\" role=\"img\" aria-label=\"Oil: ");
-    format_flt(out, mb, 1);
-    out.append(" of 1,000 MB\">");
+// The oil as ten drops, each a tenth of the Mac's memory, filled from the
+// left: with what the whole Mac uses, and over it, in the oil's colour, what
+// Tusk does.
+fn gauge(out: u8[>..]&, U: Ui) {
+    let total = max(U.mac_total, 1.0);
+    let mac = U.mac_used / total * 10.0;
+    let tusk = min(U.oil, U.mac_used) / total * 10.0;
+    out.append("<span class=\"oilg\" role=\"img\" aria-label=\"Oil: Tusk ");
+    format_flt(out, U.oil, 1);
+    out.append(" MB, the Mac ");
+    format_flt(out, U.mac_used / 1024.0, 1);
+    out.append(" of ");
+    format_flt(out, U.mac_total / 1024.0, 1);
+    out.append(" GB\">");
     for k in 10 {
-        let f = min(max(level - k, 0.0), 1.0);
         format(out, "<i><svg viewBox=\"0 0 24 31\"><path d=\"", DROP, "\"/></svg>");
-        if f > 0.0 {
-            out.append("<svg class=\"f\" viewBox=\"0 0 24 31\" style=\"clip-path:inset(");
-            format(out, ((1.0 - f) * 100.0) as i64);
-            format(out, "% 0 0 0)\"><path d=\"", DROP, "\"/></svg>");
-        }
+        fill(out, "m", min(max(mac - k, 0.0), 1.0));
+        fill(out, "f", min(max(tusk - k, 0.0), 1.0));
         out.append("</i>");
     }
     out.append("</span>");
+}
+
+// A drop filled to `f` (0 to 1) from the bottom, in class `kind`'s colour: a
+// box that tall at its foot, cutting a whole drop. A fill that isn't empty
+// shows at least a point, so that Tusk's few megabytes of a Mac's
+// gigabytes still show.
+fn fill(out: u8[>..]&, kind: const u8[:], f: f32) {
+    guard f > 0.0 else { return; }
+    format(out, "<b class=\"", kind, "\" style=\"height:");
+    format_flt(out, max(f * 100.0, 100.0 / 12.0), 1);
+    format(out, "%\"><svg viewBox=\"0 0 24 31\"><path d=\"", DROP, "\"/></svg></b>");
+}
+
+// What Tusk weighs, in MB, in the oil's colour; then what the whole Mac
+// uses of all it has, in GB.
+fn weights(out: u8[>..]&, U: Ui) {
+    out.append("<b class=\"t\">");
+    format_flt(out, U.oil, 1);
+    out.append("</b> MB · <b class=\"m\">");
+    format_flt(out, U.mac_used / 1024.0, 1);
+    out.append("</b> / ");
+    let gb = U.mac_total / 1024.0;
+    format_flt(out, gb, if gb == round(gb) { 0 } else { 1 });
+    out.append(" GB");
 }
 
 // The bottom panel: the boar's bay, the window's line, and the hand.
@@ -469,11 +767,14 @@ fn panel(out: u8[>..]&, F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText) {
     // He leaves his bay to run a load.
     if !U.running { out.append(F.rest); }
     out.append("</div><div class=\"ro\"><div class=\"r2\">");
-    gauge(out, U.oil);
-    out.append("<span><b>");
-    format_flt(out, U.oil, 1);
-    out.append("</b> / 1,000 MB</span><span class=\"k\">CPU</span><span><b>");
+    gauge(out, U);
+    out.append("<span>");
+    weights(out, U);
+    // The CPU as the oil is: Tusk's in its colour, then the whole Mac's.
+    out.append("</span><span class=\"k\">CPU</span><span><b class=\"t\">");
     format_flt(out, U.cpu, 1);
+    out.append("</b>% · <b class=\"m\">");
+    format_flt(out, U.mac_cpu, 1);
     out.append("</b>%</span><span><b>");
     format(out, U.fps);
     out.append(if U.fps == 0 { "</b> fps · idle</span>" } else { "</b> fps</span>" });
@@ -482,7 +783,7 @@ fn panel(out: u8[>..]&, F: UiFiles, U: Ui, tabs: const Tab[:], T: UiText) {
     var cards: u8[>..] = [];
     var ends: i64[>..] = [];
     cards.append("<div class=\"cd ghost\"><div class=\"nm\"><span class=\"bn\">");
-    esc(cards, board_of(T));
+    esc(cards, board_of(tabs, T));
     format(cards, "</span></div><small>In play · ", tabs.len, if tabs.len == 1 { " tab" } else { " tabs" }, "</small><kbd>⌘1</kbd></div>");
     ends.push(cards.len);
     cards.append("<div class=\"cd new\"><div class=\"nm\">");
@@ -594,10 +895,11 @@ fn fract(v: f32) -> f32 { return v - floor(v); }
 // Lays document `html` out `w` × `h` at `scale` into layer `layer`, and finds
 // its slot: the box of the element with data-slot (none: a width of 0); and
 // where a press drags the window: the boxes of the elements with data-drag
-// into `drag`, and of those with data-nodrag into `holes`, x, y, w, h each.
-// Returns what it took, in ms.
+// into `drag`, and of those with data-nodrag into `holes`, x, y, w, h each;
+// and what a click does: the box of each element with a data-action, then
+// its action (ACT_), into `actions`. Returns what it took, in ms.
 fn show_doc(html: const u8[:], w: f32, h: f32, scale: f32, layer: i32, slot: Rect&,
-            drag: f32[>..<]&, holes: f32[>..<]&) -> f32 {
+            drag: f32[>..<]&, holes: f32[>..<]&, actions: f32[>..<]&) -> f32 {
     let t0 = clock_ns();
     var nodes: Node[>..] = [];
     var attrs: Attr[>..] = [];
@@ -612,8 +914,9 @@ fn show_doc(html: const u8[:], w: f32, h: f32, scale: f32, layer: i32, slot: Rec
     var sel_attrs: AttrSel[>..] = [];
     var vars: Var[>..] = [];
     var var_bytes: u8[>..] = [];
+    var media: Media[>..] = [];
     let sh = Sheet { rules: rules, comps: comps, classes: classes, attrs: sel_attrs, decls: decls, bytes: sheet_bytes,
-                     vars: vars, var_bytes: var_bytes };
+                     vars: vars, var_bytes: var_bytes, media: media };
     load_sheets(d, sh);
     var styles: Style[>..] = [];
     compute_styles(d, sh, styles);
@@ -645,6 +948,11 @@ fn show_doc(html: const u8[:], w: f32, h: f32, scale: f32, layer: i32, slot: Rec
         let b = boxes[k];
         if dragged { drag.push(b.x); drag.push(b.y); drag.push(b.w); drag.push(b.h); }
         if hole { holes.push(b.x); holes.push(b.y); holes.push(b.w); holes.push(b.h); }
+        let av, acts = attr_value(d, k as i32, "data-action");
+        if acts && action_of(av) != ACT_NONE {
+            actions.push(b.x); actions.push(b.y); actions.push(b.w); actions.push(b.h);
+            actions.push(action_of(av));
+        }
     }
     let rc = tp_set_layer(layer, items[..], text[..], paths[..], scale);
     if rc != 0 {
@@ -652,4 +960,18 @@ fn show_doc(html: const u8[:], w: f32, h: f32, scale: f32, layer: i32, slot: Rec
         exit(1);
     }
     return ((clock_ns() - t0) / 1000000.0) as f32;
+}
+
+// What a click at x, y on the interface does: the action of the last
+// element of `actions` there (x, y, w, h and an ACT_ each), or ACT_NONE.
+fn action_at(actions: const f32[:], x: f32, y: f32) -> i32 {
+    var act = ACT_NONE;
+    var i: i64 = 0;
+    while i + 4 < actions.len {
+        if x >= actions[i] && x < actions[i] + actions[i + 2] && y >= actions[i + 1] && y < actions[i + 1] + actions[i + 3] {
+            act = actions[i + 4] as i32;
+        }
+        i += 5;
+    }
+    return act;
 }
