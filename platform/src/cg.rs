@@ -239,6 +239,37 @@ unsafe extern "C" {
     ) -> CFTypeRef;
     pub fn CGBitmapContextCreateImage(context: CFTypeRef) -> CFTypeRef;
     pub fn CGContextSetGrayFillColor(context: CFTypeRef, gray: f64, alpha: f64);
+    pub fn CGContextTranslateCTM(context: CFTypeRef, tx: f64, ty: f64);
+    pub fn CGContextScaleCTM(context: CFTypeRef, sx: f64, sy: f64);
+    pub fn CGContextAddPath(context: CFTypeRef, path: CFTypeRef);
+    pub fn CGContextFillPath(context: CFTypeRef);
+    pub fn CGContextEOFillPath(context: CFTypeRef);
+    pub fn CGContextClip(context: CFTypeRef);
+    pub fn CGPathCreateMutable() -> CFTypeRef;
+    pub fn CGPathMoveToPoint(path: CFTypeRef, m: *const c_void, x: f64, y: f64);
+    pub fn CGPathAddLineToPoint(path: CFTypeRef, m: *const c_void, x: f64, y: f64);
+    #[allow(clippy::too_many_arguments)]
+    pub fn CGPathAddCurveToPoint(
+        path: CFTypeRef,
+        m: *const c_void,
+        c1x: f64,
+        c1y: f64,
+        c2x: f64,
+        c2y: f64,
+        x: f64,
+        y: f64,
+    );
+    pub fn CGPathCloseSubpath(path: CFTypeRef);
+    pub fn CGPathIsEmpty(path: CFTypeRef) -> bool;
+    pub fn CGPathGetPathBoundingBox(path: CFTypeRef) -> CGRect;
+    pub fn CGPathCreateCopyByStrokingPath(
+        path: CFTypeRef,
+        m: *const c_void,
+        width: f64,
+        cap: i32,
+        join: i32,
+        miter_limit: f64,
+    ) -> CFTypeRef;
     pub fn CGContextSetAllowsAntialiasing(context: CFTypeRef, allows: bool);
     pub fn CGContextSetShouldAntialias(context: CFTypeRef, should: bool);
     pub fn CGContextSetAllowsFontSmoothing(context: CFTypeRef, allows: bool);

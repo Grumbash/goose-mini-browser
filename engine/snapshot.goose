@@ -25,7 +25,8 @@ fn snapshot(L: Layout, width: f32, height: f32, out: u8[>..]&) -> i32 {
     var body: i32 = -1;
     for n, i in L.d.nodes {
         guard n.kind == NODE_ELEMENT else { continue; }
-        if title.len == 0 && node_name(L.d, i as i32) == "title" { inline_text(L, i as i32, title); }
+        // The document's title, not an <svg>'s.
+        if title.len == 0 && node_name(L.d, i as i32) == "title" && L.styles[i].svg == 0 { inline_text(L, i as i32, title); }
         if body < 0 && node_name(L.d, i as i32) == "body" { body = i as i32; }
     }
     out.append("- page ");
@@ -75,6 +76,7 @@ fn role_of(d: Doc, n: i32) -> const u8[:] {
 // A block: one entry if it means something or holds text directly, then the
 // blocks inside it, and the links and images in its text.
 recursive fn snap_block(L: Layout, n: i32, depth: i32, out: u8[>..]&) -> i32 {
+    if L.styles[n].svg == 1 { return snap_svg(L, n, depth, out); }
     guard L.styles[n].display != K_NONE else { return 0; }
     let role = role_of(L.d, n);
     let texty = has_inline_text(L, n);
@@ -115,6 +117,7 @@ recursive fn snap_block(L: Layout, n: i32, depth: i32, out: u8[>..]&) -> i32 {
 // Inline content: links and images get entries of their own (their text is
 // already in their block's); other inline elements are looked through.
 recursive fn snap_inline(L: Layout, n: i32, depth: i32, out: u8[>..]&) -> i32 {
+    if L.styles[n].svg == 1 { return snap_svg(L, n, depth, out); }
     if is_element(L.d, n, "img") {
         // Images aren't drawn until M2, so an image has a name but no box yet.
         let alt, has = attr_value(L.d, n, "alt");
@@ -138,6 +141,42 @@ recursive fn snap_inline(L: Layout, n: i32, depth: i32, out: u8[>..]&) -> i32 {
         c = L.d.nodes[c].next;
     }
     return entries;
+}
+
+// An <svg> is an image, named by its aria-label or its <title>; one that is
+// aria-hidden, or has no name, gets no entry. What is inside it is drawing,
+// not text.
+fn snap_svg(L: Layout, n: i32, depth: i32, out: u8[>..]&) -> i32 {
+    var name: u8[>..] = [];
+    svg_name(L, n, name);
+    guard name.len > 0 else { return 0; }
+    begin_entry(L, n, depth, "img", name[..], true, out);
+    format(out, " [ref=n", n, "]");
+    write_box(L, n, out);
+    out.push('\n');
+    return 1;
+}
+
+// The name of <svg> n, onto `out`: its aria-label, else its first <title>'s
+// text; none when it is hidden or aria-hidden. Its <desc> describes it, and
+// its <text> is drawing.
+recursive fn svg_name(L: Layout, n: i32, out: u8[>..]&) {
+    guard L.styles[n].display != K_NONE;
+    let hidden, is_hidden = attr_value(L.d, n, "aria-hidden");
+    guard !is_hidden || hidden != "true";
+    let label, has_label = attr_value(L.d, n, "aria-label");
+    if has_label && trim(label).len > 0 {
+        out.append(trim(label));
+        return;
+    }
+    var c = L.d.nodes[n].first;
+    while c >= 0 {
+        if is_element(L.d, c, "title") {
+            all_text(L, c, out);
+            return;
+        }
+        c = L.d.nodes[c].next;
+    }
 }
 
 // A link's entry, named by its text (the blocks inside it too), else by the
@@ -219,7 +258,7 @@ recursive fn has_text(L: Layout, n: i32) -> bool {
         for ch in node_text(L.d, n) { if !is_ws(ch) { return true; } }
         return false;
     }
-    guard node.kind == NODE_ELEMENT && L.styles[n].display != K_NONE && !is_block_level(L, n) else { return false; }
+    guard node.kind == NODE_ELEMENT && L.styles[n].display != K_NONE && !is_block_level(L, n) && L.styles[n].svg == 0 else { return false; }
     var c = node.first;
     while c >= 0 {
         if has_text(L, c) { return true; }
@@ -254,7 +293,7 @@ recursive fn collect_text(L: Layout, n: i32, out: u8[>..]&) {
                 else if nbsp || ch == 9 { out.push(' '); }
                 else if ch >= 32 { out.push(ch); }
             }
-        } else if node.kind == NODE_ELEMENT && L.styles[c].display != K_NONE && !is_block_level(L, c) {
+        } else if node.kind == NODE_ELEMENT && L.styles[c].display != K_NONE && !is_block_level(L, c) && L.styles[c].svg == 0 {
             if is_element(L.d, c, "br") { space(out); }
             else {
                 if out.len > 0 && (is_element(L.d, c, "td") || is_element(L.d, c, "th") || is_element(L.d, c, "li")) {
@@ -278,6 +317,10 @@ recursive fn all_text(L: Layout, n: i32, out: u8[>..]&) {
             for ch in node_text(L.d, c) {
                 if is_ws(ch) { space(out); } else if ch >= 32 { out.push(ch); }
             }
+        } else if node.kind == NODE_ELEMENT && L.styles[c].svg == 1 {
+            // An <svg> adds its name, not the text drawn in it.
+            space(out);
+            svg_name(L, c, out);
         } else if node.kind == NODE_ELEMENT && L.styles[c].display != K_NONE {
             if is_block_level(L, c) { space(out); }
             all_text(L, c, out);

@@ -15,12 +15,14 @@ import std;
 import math;
 import .dom;
 import .css;
+import .vector;
 
 // Display item kinds, as the compositor numbers them (platform/src/compositor.rs).
 let ITEM_NONE: i32 = 0;          // dropped: cut away by a clip or an ellipsis
 let ITEM_RECT: i32 = 1;
 let ITEM_TEXT: i32 = 2;
 let ITEM_BOX: i32 = 3;
+let ITEM_PATH: i32 = 4;          // an SVG shape, filled or stroked (see vector.goose)
 
 // A box item's border style.
 let BORDER_SOLID: i32 = 0;
@@ -36,7 +38,9 @@ let BORDER_DASHED: i32 = 1;
 // (m_a … m_f, as CSS's matrix() takes them, points to points; all 0: none),
 // and its clip one that takes its points to the clip's (c_a … c_f; all 0:
 // they are the same). A second clip (oclip_w above 0) cuts it square on the
-// page, after its transform.
+// page, after its transform. A path item draws a span of the layout's path
+// data, in points from its corner: its text and text_len say where, its font
+// is its PATH_ flags, and its size its stroke's width (0: it is filled).
 struct DItem {
     kind: i32,
     x: f32, y: f32, w: f32, h: f32,
@@ -93,6 +97,8 @@ struct Layout {
     flex: FlexItem[>..<]&,   // the items of the flex containers being laid out, one above another
     atoms: i32[>..<]&,       // the inline-blocks on the lines being laid out, see place_atomic
     measured: Measured[>..]&, // per node, what measure_sized last found
+    paths: f32[>..<]&,       // the path data of SVG's path items, see vector.goose; shrinks as items do
+    ids: i32[>..]&,          // the elements with an id, by id, for SVG's <use>; empty until an <svg> is drawn
 }
 
 // What measure_sized found for a node: its border-box height and first
@@ -174,7 +180,7 @@ recursive fn measure_children(L: Layout, n: i32) {
         let node = L.d.nodes[c];
         if node.kind == NODE_TEXT {
             add_text_run(L, c);
-        } else if node.kind == NODE_ELEMENT && L.styles[c].display != K_NONE {
+        } else if node.kind == NODE_ELEMENT && L.styles[c].display != K_NONE && L.styles[c].svg != 2 {
             let s = L.styles[c];
             if s.display == K_LIST_ITEM {
                 add_marker_run(L, c, ordinal);
@@ -182,7 +188,7 @@ recursive fn measure_children(L: Layout, n: i32) {
             } else if s.ellipsis != 0 && s.clips != 0 && s.display != K_INLINE {
                 add_ellipsis_run(L, c);
             }
-            measure_children(L, c);
+            if s.svg == 0 { measure_children(L, c); }
         }
         c = node.next;
     }
@@ -427,7 +433,7 @@ fn layout_page(L: Layout, width: f32, height: f32) -> f32 {
         guard L.d.nodes[n].kind == NODE_ELEMENT && s.display != K_NONE else { continue; }
         if s.position != K_STATIC { positioned = true; }
         if s.position == K_RELATIVE { relative = true; }
-        if s.clips != 0 && s.display != K_INLINE { clips = true; }
+        if s.clips != 0 && is_box(s) { clips = true; }
         if transforms(L, n as i32) { transformed = true; }
     }
     if positioned {
@@ -480,7 +486,105 @@ fn is_flex(L: Layout, n: i32) -> bool {
 fn is_atomic(L: Layout, n: i32) -> bool {
     guard L.d.nodes[n].kind == NODE_ELEMENT else { return false; }
     let d = L.styles[n].display;
-    return d == K_INLINE_BLOCK || d == K_INLINE_FLEX;
+    return d == K_INLINE_BLOCK || d == K_INLINE_FLEX || (d == K_INLINE && L.styles[n].svg == 1);
+}
+
+// An <svg>'s content box, w × h, sized from style s as a replaced element
+// whose ratio is its viewBox's (CSS 2.2 §10.3.2, §10.4, §10.6.2): its width
+// and height, its attributes among them; one that is auto from the other
+// through the ratio, else 300 or 150; both auto, as wide as `avail` less its
+// margins, borders and padding, or, when `avail` is -1 (its own size, for
+// shrink-to-fit), fitted inside 300 × 150; 300 × 150 without a ratio. Then
+// within its minimum and maximum width and height, at the same ratio when
+// both were auto.
+fn svg_size(L: Layout, n: i32, s: Style, avail: f32) -> f32, f32 {
+    let hz = s.bl + s.pl + s.pr + s.br;
+    let vt = s.bt + s.pt + s.pb + s.bb;
+    let in_w: f32 = if s.border_box != 0 { hz } else { 0.0 };
+    let in_h: f32 = if s.border_box != 0 { vt } else { 0.0 };
+    var w: f32 = -1.0;
+    if s.width >= 0.0 { w = max(s.width - in_w, 0.0); }
+    else if s.width_pct >= 0.0 && avail >= 0.0 { w = max(avail * s.width_pct / 100.0 - in_w, 0.0); }
+    var h: f32 = -1.0;
+    if s.height >= 0.0 { h = max(s.height - in_h, 0.0); }
+    var lo_w = max(s.min_width - in_w, 0.0);
+    if s.min_width_pct >= 0.0 { lo_w = if avail >= 0.0 { max(avail * s.min_width_pct / 100.0 - in_w, 0.0) } else { 0.0 }; }
+    var hi_w: f32 = NO_LIMIT;
+    if s.max_width >= 0.0 { hi_w = max(s.max_width - in_w, 0.0); }
+    else if s.max_width_pct >= 0.0 && avail >= 0.0 { hi_w = max(avail * s.max_width_pct / 100.0 - in_w, 0.0); }
+    let lo_h = max(s.min_height - in_h, 0.0);
+    var hi_h: f32 = NO_LIMIT;
+    if s.max_height >= 0.0 { hi_h = max(s.max_height - in_h, 0.0); }
+    // A minimum beats a maximum.
+    hi_w = max(hi_w, lo_w);
+    hi_h = max(hi_h, lo_h);
+    let ratio = view_ratio(L.d, n);
+    if w >= 0.0 && h >= 0.0 { return clamp(w, lo_w, hi_w), clamp(h, lo_h, hi_h); }
+    if w >= 0.0 {
+        let cw = clamp(w, lo_w, hi_w);
+        return cw, clamp(if ratio > 0.0 { cw * ratio } else { 150.0 }, lo_h, hi_h);
+    }
+    if h >= 0.0 {
+        let ch = clamp(h, lo_h, hi_h);
+        return clamp(if ratio > 0.0 { ch / ratio } else { 300.0 }, lo_w, hi_w), ch;
+    }
+    guard ratio > 0.0 else { return clamp(300.0, lo_w, hi_w), clamp(150.0, lo_h, hi_h); }
+    var tw: f32 = 150.0 / ratio;
+    var th: f32 = 150.0;
+    if avail >= 0.0 {
+        tw = max(avail - s.ml - s.mr - hz, 0.0);
+        th = tw * ratio;
+    } else if ratio <= 0.5 {
+        tw = 300.0;
+        th = 300.0 * ratio;
+    }
+    return within(tw, th, lo_w, hi_w, lo_h, hi_h);
+}
+
+// No maximum.
+let NO_LIMIT: f32 = 1.0e30;
+
+// A replaced element's width and height, w × h with both auto, within their
+// limits, keeping their ratio where the limits let it (CSS 2.2 §10.4's
+// table).
+fn within(w: f32, h: f32, lo_w: f32, hi_w: f32, lo_h: f32, hi_h: f32) -> f32, f32 {
+    guard w > 0.0 && h > 0.0 else { return clamp(w, lo_w, hi_w), clamp(h, lo_h, hi_h); }
+    let over_w = w > hi_w;
+    let under_w = w < lo_w;
+    let over_h = h > hi_h;
+    let under_h = h < lo_h;
+    if over_w && over_h {
+        if hi_w / w <= hi_h / h { return hi_w, max(lo_h, hi_w * h / w); }
+        return max(lo_w, hi_h * w / h), hi_h;
+    }
+    if under_w && under_h {
+        if lo_w / w <= lo_h / h { return min(hi_w, lo_h * w / h), lo_h; }
+        return lo_w, min(hi_h, lo_w * h / w);
+    }
+    if under_w && over_h { return lo_w, hi_h; }
+    if over_w && under_h { return hi_w, lo_h; }
+    if over_w { return hi_w, max(hi_w * h / w, lo_h); }
+    if under_w { return lo_w, min(lo_w * h / w, hi_h); }
+    if over_h { return max(hi_h * w / h, lo_w), hi_h; }
+    if under_h { return min(lo_h * w / h, hi_w), lo_h; }
+    return w, h;
+}
+
+// The paths inside <svg> n, whose content box is w × h at (x, y): items that
+// paint them, in order, their data in L.paths.
+fn svg_items(L: Layout, n: i32, x: f32, y: f32, w: f32, h: f32) {
+    var painted: Painted[>..<] = [];
+    if L.ids.len == 0 { index_ids(L.d, L.ids); }
+    draw_svg(L.d, L.styles, L.ids, n, x, y, w, h, L.paths, painted);
+    for p in painted {
+        var it = rect_item(n, p.x, p.y, p.w, p.h, p.color);
+        it.kind = ITEM_PATH;
+        it.text = p.start;
+        it.text_len = p.len;
+        it.font = p.flags;
+        it.size = p.stroke;
+        L.items.push(it);
+    }
 }
 
 // A block-level element in the flow, which stacks below the one before.
@@ -574,9 +678,19 @@ recursive fn is_empty_block(L: Layout, n: i32) -> bool {
 // its first baseline (-1 if it has no lines) and its bottom margin after
 // collapsing with its last child's.
 recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32, f32, f32 {
-    let s = L.styles[n];
+    var s = L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;        // across, besides the content
     let vt = s.bt + s.pt + s.pb + s.bb;        // down, besides the content
+    // An <svg> is a replaced element: its size is its own, its content paths.
+    let svg = s.svg == 1;
+    var svg_h: f32 = 0.0;
+    if svg {
+        // Its size, limits and percentages applied, is its box's.
+        let sw, sh = svg_size(L, n, s, avail);
+        s.width = sw + (if s.border_box != 0 { hz } else { 0.0 });
+        s.width_pct = -1.0;
+        svg_h = sh;
+    }
     let w = content_width(s, avail, hz);
     var ml = s.ml;
     let room = avail - w - hz;
@@ -597,7 +711,9 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
     var inner: f32 = 0.0;
     var first: f32 = -1.0;
     var trailing: f32 = 0.0;
-    if is_flex(L, n) {
+    if svg {
+        inner = svg_h;
+    } else if is_flex(L, n) {
         // A height it has makes its items' room definite; percentages wait.
         var fh: f32 = -1.0;
         if s.height >= 0.0 { fh = content_height(s, 0.0, vt); }
@@ -618,6 +734,7 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
     let h = vt + ch;
     box_paint(L, n, ps, paint_at, bx, y, bw, h);
     if s.display == K_LIST_ITEM { paint_marker(L, n, bx + s.bl + s.pl, first); }
+    if svg { svg_items(L, n, bx + s.bl + s.pl, y + s.bt + s.pt, w, ch); }
     L.boxes[n] = Rect { x: bx, y: y, w: bw, h: h };
     return h, first, mb;
 }
@@ -1308,15 +1425,21 @@ recursive fn place_atomic(L: Layout, line: Line&, n: i32) {
     let hz = s.bl + s.pl + s.pr + s.br;
     let inside: f32 = if s.border_box != 0 { hz } else { 0.0 };
     var w: f32 = 0.0;
-    if s.width >= 0.0 { w = s.width - inside; }
-    else if s.width_pct >= 0.0 { w = line.width * s.width_pct / 100.0 - inside; }
-    else {
-        let least, most = content_widths(L, n);
-        w = min(max(least, line.width - s.ml - s.mr), most) - hz;
+    if s.svg == 1 {
+        // An <svg> on a line is as wide as a block one would be in its place.
+        let sw, sh = svg_size(L, n, s, line.width);
+        w = sw;
+    } else {
+        if s.width >= 0.0 { w = s.width - inside; }
+        else if s.width_pct >= 0.0 { w = line.width * s.width_pct / 100.0 - inside; }
+        else {
+            let least, most = content_widths(L, n);
+            w = min(max(least, line.width - s.ml - s.mr), most) - hz;
+        }
+        if s.max_width >= 0.0 { w = min(w, s.max_width - inside); }
+        else if s.max_width_pct >= 0.0 { w = min(w, line.width * s.max_width_pct / 100.0 - inside); }
+        w = max(max(w, (if s.min_width_pct >= 0.0 { line.width * s.min_width_pct / 100.0 } else { s.min_width }) - inside), 0.0);
     }
-    if s.max_width >= 0.0 { w = min(w, s.max_width - inside); }
-    else if s.max_width_pct >= 0.0 { w = min(w, line.width * s.max_width_pct / 100.0 - inside); }
-    w = max(max(w, (if s.min_width_pct >= 0.0 { line.width * s.min_width_pct / 100.0 } else { s.min_width }) - inside), 0.0);
     let outer = s.ml + w + hz + s.mr;
     let wraps = s.ws == K_NORMAL || s.ws == K_PRE_WRAP;
     if wraps && line.content && line.x + outer > line.width + 0.01 { close_line(L, line, false); }
@@ -1404,7 +1527,7 @@ fn static_position(L: Layout, n: i32, x: f32, y: f32) { L.boxes[n] = Rect { x: x
 recursive fn place_positioned(L: Layout, n: i32, width: f32, height: f32) {
     var c = L.d.nodes[n].first;
     while c >= 0 {
-        if L.d.nodes[c].kind == NODE_ELEMENT && L.styles[c].display != K_NONE {
+        if L.d.nodes[c].kind == NODE_ELEMENT && L.styles[c].display != K_NONE && L.styles[c].svg != 2 {
             if is_out(L, c) { place_box(L, c, width, height); }
             place_positioned(L, c, width, height);
         }
@@ -1593,8 +1716,12 @@ fn clip_parent(L: Layout, e: i32) -> i32 {
 // Whether element n cuts what is in it: its overflow isn't visible, and it
 // holds blocks (overflow doesn't apply to inline boxes).
 fn clips_content(L: Layout, n: i32) -> bool {
-    return L.styles[n].clips != 0 && L.styles[n].display != K_INLINE;
+    return L.styles[n].clips != 0 && is_box(L.styles[n]);
 }
+
+// Whether a styled element is a box that overflow and transforms apply to:
+// not an inline box, though an <svg> on a line is one, being replaced.
+fn is_box(s: Style) -> bool { return s.display != K_INLINE || s.svg == 1; }
 
 // Moves each relatively positioned element, and everything in it, by its
 // offsets (CSS 2.2 §9.4.3): the items they paint and their boxes.
@@ -1662,6 +1789,10 @@ recursive fn content_widths(L: Layout, n: i32) -> f32, f32 {
     let s = L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;
     let inside: f32 = if s.border_box != 0 { 0.0 } else { hz };
+    if s.svg == 1 {
+        let sw, sh = svg_size(L, n, s, -1.0);
+        return sw + hz, sw + hz;
+    }
     if s.width >= 0.0 {
         let w = s.width + inside;
         return w, w;
@@ -1681,6 +1812,11 @@ recursive fn content_widths(L: Layout, n: i32) -> f32, f32 {
 recursive fn inner_widths(L: Layout, n: i32) -> f32, f32 {
     let s = L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;
+    if s.svg == 1 {
+        // What is in an <svg> is drawn to its size.
+        let sw, sh = svg_size(L, n, s, -1.0);
+        return sw + hz, sw + hz;
+    }
     var p = Widths { min: 0.0, max: 0.0, line: 0.0, word: 0.0, space: 0.0, start: true };
     if is_flex(L, n) {
         flex_widths(L, n, p);
@@ -1834,7 +1970,7 @@ fn z_index(L: Layout, e: i32) -> i32 {
 // Whether a styled element starts a stacking context of its own: a
 // positioned one with a z-index, a fixed one, and a transformed one.
 fn stacks(s: Style) -> bool {
-    return s.position == K_FIXED || (s.position != K_STATIC && s.z_auto == 0) || (s.xf_count > 0 && s.display != K_INLINE);
+    return s.position == K_FIXED || (s.position != K_STATIC && s.z_auto == 0) || (s.xf_count > 0 && is_box(s));
 }
 
 fn emit_own(P: Paint, n: i32) {
@@ -1872,7 +2008,7 @@ recursive fn paint_context(L: Layout, P: Paint, n: i32) {
 recursive fn gather(L: Layout, P: Paint, n: i32) {
     var c = L.d.nodes[n].first;
     while c >= 0 {
-        if L.d.nodes[c].kind == NODE_ELEMENT && L.styles[c].display != K_NONE {
+        if L.d.nodes[c].kind == NODE_ELEMENT && L.styles[c].display != K_NONE && L.styles[c].svg != 2 {
             let s = L.styles[c];
             if s.position != K_STATIC || stacks(s) { P.scratch.push(c); }
             if !stacks(s) { gather(L, P, c); }
@@ -1958,7 +2094,7 @@ fn clip_items(L: Layout, mats: Mat[>..]&) {
         var oy1: f32 = 1000000000.0;
         var outer = false;
         var e = it.node;
-        var own = it.kind == ITEM_TEXT && L.d.nodes[e].kind == NODE_ELEMENT;
+        var own = (it.kind == ITEM_TEXT && L.d.nodes[e].kind == NODE_ELEMENT) || it.kind == ITEM_PATH;
         loop {
             let up = if own { e } else { clip_parent(L, e) };
             own = false;
@@ -2457,7 +2593,8 @@ recursive fn size_item(L: Layout, i: i64, n: i32, row: bool, main_size: f32, cro
     if s.basis_kind == 1 { base = s.basis - inside; }
     else if s.basis_kind == 2 && main_size >= 0.0 { base = main_size * s.basis / 100.0 - inside; }
     else if s.basis_kind == K_AUTO { base = size; }
-    let auto_min = (if row { s.min_w_auto } else { s.min_h_auto }) != 0 && s.clips == 0;
+    // overflow doesn't make a replaced element a scroll container.
+    let auto_min = (if row { s.min_w_auto } else { s.min_h_auto }) != 0 && (s.clips == 0 || s.svg == 1);
     var least: f32 = 0.0;
     var most: f32 = 0.0;
     if base < 0.0 || auto_min {
@@ -2590,9 +2727,11 @@ recursive fn measure_sized(L: Layout, c: i32, w: f32, h: f32) -> f32, f32 {
     let known = L.measured[c];
     if known.w == w && known.h == h { return known.height, known.baseline; }
     let mark = L.items.len;
+    let path_mark = L.paths.len;
     let lo, hi = height_limits(L.styles[c]);
     let bh, b = layout_sized(L, c, 0.0, 0.0, w, h, lo, hi);
     L.items.resize(mark);
+    L.paths.resize(path_mark);
     clear_boxes(L, c);
     L.measured[c] = Measured { w: w, h: h, height: bh, baseline: b };
     return bh, b;
@@ -2709,7 +2848,7 @@ fn is_axis_aligned(m: Mat) -> bool { return abs(m.b) < 0.000001 && abs(m.c) < 0.
 fn transforms(L: Layout, n: i32) -> bool {
     guard L.d.nodes[n].kind == NODE_ELEMENT else { return false; }
     let s = L.styles[n];
-    return s.xf_count > 0 && s.display != K_INLINE && s.display != K_NONE;
+    return s.xf_count > 0 && is_box(s) && s.display != K_NONE;
 }
 
 // Element n's transform about its origin, in page points: its functions in
