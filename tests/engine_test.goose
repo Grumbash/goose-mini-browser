@@ -840,6 +840,24 @@ fn test_transforms() {
     check("transforms reach down the page", layout_probe(far, 400.0, PROBE_PAGE), "2030.0");
 }
 
+fn test_heights() {
+    // A percentage height counts in a parent whose height is definite: set,
+    // the first screen's, or an absolute box's; with an auto one it is auto.
+    let pcts = """
+        <style>html, body { height: 100%; margin: 0; padding: 0; max-width: none } div { background: #000 }</style>
+        <div style="height: 200px"><div id=a style="height: 50%"></div></div><div><div id=b style="height: 50%"></div></div>
+        <div id=c style="height: 25%"></div>
+        <div style="height: 100px; padding: 10px"><div id=d style="height: 100%"></div></div>
+        <div style="position: absolute; left: 0; top: 0; width: 10px; height: 300px"><div id=e style="height: 10%"></div></div>
+        <div style="height: 80px"><div id=f style="min-height: 50%; height: 10px"></div></div>
+        """;
+    check("percentage heights", layout_probe(pcts, 400.0, PROBE_GEOMETRY),
+          "a x 0.0 y 0.0 w 400.0 h 100.0\nb x 0.0 y 200.0 w 400.0 h 0.0\nc x 0.0 y 200.0 w 400.0 h 150.0\nd x 10.0 y 360.0 w 380.0 h 100.0\ne x 0.0 y 0.0 w 10.0 h 30.0\nf x 0.0 y 470.0 w 400.0 h 40.0\n");
+    // So does an <svg>'s, its width following through its viewBox.
+    check("an svg's percentage height", layout_probe("""<style>body { margin: 0; padding: 0; max-width: none }</style><div style="height: 100px"><svg id=s viewBox="0 0 2 1" style="display: block; height: 50%"></svg></div>""", 400.0, PROBE_GEOMETRY),
+          "s x 0.0 y 0.0 w 100.0 h 50.0\n");
+}
+
 fn test_svg() {
     // Inside <svg>, /> closes a tag; outside, an HTML element isn't void for it.
     check("svg tags that close themselves", tree_of("""<svg><path d="M0 0"/><circle r="1"/><g><rect/></g></svg><div/>x"""),
@@ -1369,9 +1387,10 @@ fn layout_probe(src: const u8[:], width: f32, probe: i32) -> u8[>..] {
     var measured: Measured[>..] = [];
     var paths: f32[>..<] = [];
     var ids: i32[>..] = [];
+    var definite: f32[>..] = [];
     let L = Layout { d: d, styles: styles, text: text, carets: carets, runs: runs, run_of: run_of,
                      fonts: fonts, boxes: boxes, items: items, flex: flex, atoms: atoms,
-                     measured: measured, paths: paths, ids: ids };
+                     measured: measured, paths: paths, ids: ids, definite: definite };
     measure(L);
     let page_h = layout_page(L, width, 600.0);
 
@@ -1814,6 +1833,7 @@ fn main() {
     test_transforms();
     test_fonts();
     test_svg();
+    test_heights();
     test_layout();
     test_snapshot();
     test_page();

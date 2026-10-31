@@ -99,6 +99,7 @@ struct Layout {
     measured: Measured[>..]&, // per node, what measure_sized last found
     paths: f32[>..<]&,       // the path data of SVG's path items, see vector.goose; shrinks as items do
     ids: i32[>..]&,          // the elements with an id, by id, for SVG's <use>; empty until an <svg> is drawn
+    definite: f32[>..]&,     // per node: its content box's height while it is laid out, when that is known; -1 when not
 }
 
 // What measure_sized found for a node: its border-box height and first
@@ -422,6 +423,9 @@ fn roman_char(out: u8[>..]&, ch: u8, upper: bool) { out.push(if upper { ch - 32 
 // `height` at the top of the page.
 fn layout_page(L: Layout, width: f32, height: f32) -> f32 {
     while L.boxes.len < L.d.nodes.len { L.boxes.push(Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }); }
+    while L.definite.len < L.d.nodes.len { L.definite.push(-1.0); }
+    // The first screen is the root's containing block, its height definite.
+    L.definite[0] = height;
     let h, first, trailing = layout_children(L, 0, 0.0, 0.0, width, false);
     inline_boxes(L, 0);
     var page_h = h + trailing;
@@ -654,13 +658,16 @@ recursive fn top_margin(L: Layout, n: i32) -> f32 {
     return m;
 }
 
-// A block with nothing in it: no border or padding, and only blank content
-// or empty blocks. Its margins collapse through it (CSS 2.2 §8.3.1). A list
-// item isn't one: it still shows its marker.
+// A block with nothing in it: no border or padding, no height, a percentage
+// of a parent's definite one included, and only blank content or empty
+// blocks. Its margins collapse through it (CSS 2.2 §8.3.1). A list item
+// isn't one: it still shows its marker.
 recursive fn is_empty_block(L: Layout, n: i32) -> bool {
     let s = L.styles[n];
+    let up = L.d.nodes[n].parent;
+    let sized = up >= 0 && L.definite[up] > 0.0 && (s.height_pct > 0.0 || s.min_height_pct > 0.0);
     guard s.display == K_BLOCK && s.bt == 0.0 && s.pt == 0.0 && s.pb == 0.0 && s.bb == 0.0
-          && s.height <= 0.0 && s.min_height <= 0.0 && !keeps_margins(L, n) else { return false; }
+          && s.height <= 0.0 && s.min_height <= 0.0 && !sized && !keeps_margins(L, n) else { return false; }
     var c = L.d.nodes[n].first;
     while c >= 0 {
         if flow_block(L, c) {
@@ -681,6 +688,16 @@ recursive fn layout_block(L: Layout, n: i32, x: f32, y: f32, avail: f32) -> f32,
     var s = L.styles[n];
     let hz = s.bl + s.pl + s.pr + s.br;        // across, besides the content
     let vt = s.bt + s.pt + s.pb + s.bb;        // down, besides the content
+    // A percentage height counts in the parent's content height when that is
+    // definite (CSS 2.2 §10.5), and is auto otherwise; so do its limits.
+    let up = L.d.nodes[n].parent;
+    let cb_h: f32 = if up >= 0 { L.definite[up] } else { -1.0 };
+    if cb_h >= 0.0 {
+        if s.height < 0.0 && s.height_pct >= 0.0 { s.height = cb_h * s.height_pct / 100.0; }
+        if s.min_height_pct >= 0.0 { s.min_height = cb_h * s.min_height_pct / 100.0; }
+        if s.max_height < 0.0 && s.max_height_pct >= 0.0 { s.max_height = cb_h * s.max_height_pct / 100.0; }
+    }
+    L.definite[n] = if s.height >= 0.0 { content_height(s, 0.0, vt) } else { -1.0 };
     // An <svg> is a replaced element: its size is its own, its content paths.
     let svg = s.svg == 1;
     var svg_h: f32 = 0.0;
